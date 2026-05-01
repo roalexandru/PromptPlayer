@@ -55,7 +55,9 @@ pub fn parse_file(path: &Path) -> Result<Prompt, ParseError> {
 }
 
 pub fn parse_str(raw: &str, path: &Path) -> Result<Prompt, ParseError> {
-    let stripped = raw.strip_prefix("---\n").or_else(|| raw.strip_prefix("---\r\n"));
+    let stripped = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"));
     let Some(rest) = stripped else {
         return Err(ParseError::MissingFrontmatter {
             path: path.to_path_buf(),
@@ -149,8 +151,12 @@ pub fn serialize(prompt: &Prompt) -> Result<String, serde_yaml::Error> {
         #[serde(skip_serializing_if = "is_true")]
         enabled: bool,
     }
-    fn is_zero(v: &i32) -> bool { *v == 0 }
-    fn is_true(v: &bool) -> bool { *v }
+    fn is_zero(v: &i32) -> bool {
+        *v == 0
+    }
+    fn is_true(v: &bool) -> bool {
+        *v
+    }
     fn is_default_overrides(v: &crate::typer::TypingOverrides) -> bool {
         v.iki_median_ms.is_none()
             && v.typo_rate.is_none()

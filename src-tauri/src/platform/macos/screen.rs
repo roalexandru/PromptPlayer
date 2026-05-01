@@ -42,10 +42,14 @@ fn cursor_screen_visible_frame() -> Option<NSRect> {
 /// between the top of the screen and the top of the window (Spotlight uses
 /// ~0.30). Does NOT show or activate.
 pub fn position_centered_on_cursor(window: &tauri::WebviewWindow, top_padding_fraction: f64) {
-    let Ok(ns_window_ptr) = window.ns_window() else { return };
+    let Ok(ns_window_ptr) = window.ns_window() else {
+        return;
+    };
     unsafe {
         let ns_window: id = ns_window_ptr as id;
-        let Some(vf) = cursor_screen_visible_frame() else { return };
+        let Some(vf) = cursor_screen_visible_frame() else {
+            return;
+        };
         let win_frame: NSRect = msg_send![ns_window, frame];
         let x = vf.origin.x + (vf.size.width - win_frame.size.width) / 2.0;
         let y_top_pad = vf.size.height * top_padding_fraction;
@@ -59,6 +63,8 @@ pub fn position_centered_on_cursor(window: &tauri::WebviewWindow, top_padding_fr
 /// `NSEvent.mouseLocation` and `NSScreen.screens` return stale data when
 /// called from a background thread.
 pub fn position_picker_on_cursor_screen(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("picker") else { return };
+    let Some(window) = app.get_webview_window("picker") else {
+        return;
+    };
     position_centered_on_cursor(&window, 0.30);
 }

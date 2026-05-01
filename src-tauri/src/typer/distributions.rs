@@ -25,18 +25,18 @@ pub const IKI_MAX_MS: f64 = 3000.0;
 // and paragraph structure that prompt bodies actually have, so they ended up
 // crowding the typing budget. New values keep the *shape* of the distributions
 // (log-normal for word/sentence, normal for paragraph) but with shorter means.
-pub const WORD_PAUSE_MU: f64 = 5.2;          // median ~180 ms (was ~300 ms)
+pub const WORD_PAUSE_MU: f64 = 5.2; // median ~180 ms (was ~300 ms)
 pub const WORD_PAUSE_SIGMA: f64 = 0.4;
-pub const SENTENCE_PAUSE_MU: f64 = 6.4;      // median ~600 ms (was ~1100 ms)
+pub const SENTENCE_PAUSE_MU: f64 = 6.4; // median ~600 ms (was ~1100 ms)
 pub const SENTENCE_PAUSE_SIGMA: f64 = 0.5;
 
 pub const PARAGRAPH_PAUSE_MEAN: f64 = 1500.0; // was 2500 ms
 pub const PARAGRAPH_PAUSE_STDDEV: f64 = 500.0;
 
-pub const PRE_TYPING_MEAN: f64 = 800.0;       // was 1500 ms
+pub const PRE_TYPING_MEAN: f64 = 800.0; // was 1500 ms
 pub const PRE_TYPING_STDDEV: f64 = 250.0;
 
-pub const PRE_SUBMIT_MEAN: f64 = 1000.0;      // was 1800 ms
+pub const PRE_SUBMIT_MEAN: f64 = 1000.0; // was 1800 ms
 pub const PRE_SUBMIT_STDDEV: f64 = 350.0;
 
 pub const TYPO_NOTICED_MEAN: f64 = 350.0;
@@ -52,7 +52,9 @@ pub fn sample_iki<R: Rng + ?Sized>(rng: &mut R) -> f64 {
     } else {
         (IKI_FLUENT_MU, IKI_FLUENT_SIGMA)
     };
-    let raw = LogNormal::new(mu, sigma).expect("valid lognormal").sample(rng);
+    let raw = LogNormal::new(mu, sigma)
+        .expect("valid lognormal")
+        .sample(rng);
     raw.clamp(IKI_MIN_MS, IKI_MAX_MS)
 }
 
@@ -123,8 +125,8 @@ pub fn jitter<R: Rng + ?Sized>(rng: &mut R) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_chacha::ChaCha8Rng;
     use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
 
     fn median(mut samples: Vec<f64>) -> f64 {
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -157,7 +159,9 @@ mod tests {
     #[test]
     fn word_pause_median_around_180ms() {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let samples: Vec<f64> = (0..10_000).map(|_| sample_word_pause(&mut rng, 1.0)).collect();
+        let samples: Vec<f64> = (0..10_000)
+            .map(|_| sample_word_pause(&mut rng, 1.0))
+            .collect();
         let m = median(samples);
         assert!((150.0..=220.0).contains(&m), "word pause median {}", m);
     }
@@ -165,7 +169,9 @@ mod tests {
     #[test]
     fn sentence_pause_median_around_600ms() {
         let mut rng = ChaCha8Rng::seed_from_u64(2);
-        let samples: Vec<f64> = (0..10_000).map(|_| sample_sentence_pause(&mut rng, 1.0)).collect();
+        let samples: Vec<f64> = (0..10_000)
+            .map(|_| sample_sentence_pause(&mut rng, 1.0))
+            .collect();
         let m = median(samples);
         assert!((500.0..=720.0).contains(&m), "sentence pause median {}", m);
     }

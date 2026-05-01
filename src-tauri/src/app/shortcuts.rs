@@ -1,10 +1,11 @@
 //! Global shortcut registration.
 //!
 //! Three permanent shortcuts:
-//! - **Arm/disarm**: ⌘⇧P — toggles the global "armed" flag.
-//! - **Command palette**: ⌥⌘\\ — Spotlight-style picker.
-//! - **Kill-switch**: ⌘⇧Esc — abort current playback (§2.7).
-//! - **Panic-reset**: ⌘⇧R — release modifiers, force-disarm, hide picker.
+//! - **Arm/disarm**: ⌘⇧P (mac) / Ctrl+Shift+P (Windows) — toggles armed.
+//! - **Command palette**: ⌥⌘\\ (mac) / Ctrl+Alt+\\ (Windows) — Spotlight-style picker.
+//! - **Kill-switch**: ⌘⇧Esc (mac) / Ctrl+Alt+Shift+K (Windows) — abort playback.
+//!   Windows reserves Ctrl+Shift+Esc for Task Manager, so we shift to a free combo.
+//! - **Panic-reset**: ⌘⇧R (mac) / Ctrl+Alt+Shift+R (Windows) — release modifiers, force-disarm.
 //!
 //! Plus per-prompt hotkeys defined in `.pp.md` frontmatter, which are
 //! re-registered on hot-reload via `rebuild_prompt_hotkeys`.
@@ -17,19 +18,39 @@ use std::str::FromStr;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
+/// Primary modifier — Cmd on macOS, Ctrl on Windows. Using `SUPER` directly
+/// on Windows would map to the Win key, which collides with the OS-reserved
+/// Win+Shift+P (projection menu) and other system globals.
+#[cfg(target_os = "macos")]
+const PRIMARY: Modifiers = Modifiers::SUPER;
+#[cfg(not(target_os = "macos"))]
+const PRIMARY: Modifiers = Modifiers::CONTROL;
+
 pub fn register(
     app: &mut tauri::App,
     ctx: AppContext,
     fire: FireService,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let shortcut_arm = Shortcut::new(Some(Modifiers::SHIFT | Modifiers::SUPER), Code::KeyP);
-    // ⌥⌘\ — free on stock macOS; not used by Finder, Safari, or major IDEs.
-    let shortcut_picker = Shortcut::new(
-        Some(Modifiers::ALT | Modifiers::SUPER),
-        Code::Backslash,
+    let shortcut_arm = Shortcut::new(Some(Modifiers::SHIFT | PRIMARY), Code::KeyP);
+    // ⌥⌘\ on mac, Ctrl+Alt+\ on Windows — free on stock OS, not used by major IDEs.
+    let shortcut_picker = Shortcut::new(Some(Modifiers::ALT | PRIMARY), Code::Backslash);
+    // Kill: ⌘⇧Esc on mac. Windows reserves Ctrl+Shift+Esc for Task Manager,
+    // so we use Ctrl+Alt+Shift+K instead.
+    #[cfg(target_os = "macos")]
+    let shortcut_kill = Shortcut::new(Some(Modifiers::SHIFT | PRIMARY), Code::Escape);
+    #[cfg(not(target_os = "macos"))]
+    let shortcut_kill = Shortcut::new(
+        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT),
+        Code::KeyK,
     );
-    let shortcut_kill = Shortcut::new(Some(Modifiers::SHIFT | Modifiers::SUPER), Code::Escape);
-    let shortcut_panic = Shortcut::new(Some(Modifiers::SHIFT | Modifiers::SUPER), Code::KeyR);
+    // Panic: ⌘⇧R on mac, Ctrl+Alt+Shift+R on Windows (avoids browser reload conflict).
+    #[cfg(target_os = "macos")]
+    let shortcut_panic = Shortcut::new(Some(Modifiers::SHIFT | PRIMARY), Code::KeyR);
+    #[cfg(not(target_os = "macos"))]
+    let shortcut_panic = Shortcut::new(
+        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT),
+        Code::KeyR,
+    );
 
     let app_handle = app.handle().clone();
     let ctx_for_handler = ctx.clone();
@@ -81,10 +102,23 @@ pub fn register(
     )?;
 
     let gs = app.global_shortcut();
-    gs.register(shortcut_arm)?;
-    gs.register(shortcut_picker)?;
-    gs.register(shortcut_kill)?;
-    gs.register(shortcut_panic)?;
+    // Register globals with a soft-fail: on Windows, RegisterHotKey rejects
+    // already-claimed combos (e.g. an installed app owns the same chord). Log
+    // and continue so a single conflict doesn't kill the others.
+    for (sc, label) in [
+        (shortcut_arm, "arm/disarm"),
+        (shortcut_picker, "command palette"),
+        (shortcut_kill, "kill-switch"),
+        (shortcut_panic, "panic-reset"),
+    ] {
+        if let Err(e) = gs.register(sc) {
+            tracing::warn!(
+                "global shortcut '{}' failed to register: {} — likely claimed by another app",
+                label,
+                e
+            );
+        }
+    }
     Ok(())
 }
 
@@ -104,6 +138,8 @@ fn summon_picker(app: &AppHandle, ctx: &AppContext) {
         );
         #[cfg(target_os = "macos")]
         crate::platform::macos::position_picker_on_cursor_screen(&app_for_main);
+        #[cfg(target_os = "windows")]
+        crate::platform::windows::position_picker_on_cursor_screen(&app_for_main);
         crate::commands::picker::show_picker_window(&app_for_main);
         telemetry::send(&app_for_main, TelemetryEvent::PickerOpened);
     });
@@ -156,4 +192,3 @@ pub fn refresh_tray_popup(app: &AppHandle) {
         let _ = window.emit("tray-popup-show", ());
     }
 }
-

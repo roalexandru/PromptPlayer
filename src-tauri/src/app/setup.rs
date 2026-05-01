@@ -16,6 +16,8 @@ use tauri::{AppHandle, Manager};
 
 #[cfg(target_os = "macos")]
 use crate::platform::macos::OutsideClickMonitor;
+#[cfg(target_os = "windows")]
+use crate::platform::windows::OutsideClickMonitor;
 
 /// Build and run the Tauri application. Called once from `main.rs`.
 pub fn run() {
@@ -24,9 +26,8 @@ pub fn run() {
     let ctx = AppContext::new();
 
     // Phase 5: load prompts from the library directory (with hot reload).
-    let library_root = library::default_library_root().unwrap_or_else(|| {
-        std::env::current_dir().unwrap().join("prompts-examples")
-    });
+    let library_root = library::default_library_root()
+        .unwrap_or_else(|| std::env::current_dir().unwrap().join("prompts-examples"));
     if let Err(e) = std::fs::create_dir_all(&library_root) {
         tracing::warn!("could not create library dir {:?}: {}", library_root, e);
     }
@@ -39,9 +40,8 @@ pub fn run() {
             // Bootstrap from the bundled `prompts-examples` resource on
             // first run. We try the bundled resource first; falling back
             // to the CWD-relative path (dev convenience).
-            let bootstrap = first_run_bundled_examples().unwrap_or_else(|| {
-                std::env::current_dir().unwrap().join("prompts-examples")
-            });
+            let bootstrap = first_run_bundled_examples()
+                .unwrap_or_else(|| std::env::current_dir().unwrap().join("prompts-examples"));
             if bootstrap != library_root && bootstrap.exists() {
                 let (l2, _) = library::load_all(&bootstrap);
                 ctx.prompts.replace_all(l2);
@@ -111,10 +111,7 @@ pub fn run() {
                         shortcuts::rebuild_prompt_hotkeys(&h, &ctx2);
                         shortcuts::refresh_tray_popup(&h);
                     }
-                    tracing::info!(
-                        "library hot-reloaded — {} prompt(s)",
-                        ctx2.prompts.len()
-                    );
+                    tracing::info!("library hot-reloaded — {} prompt(s)", ctx2.prompts.len());
                 }
             })
             .expect("spawn watch thread");
@@ -140,13 +137,12 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(
-            tauri_plugin_aptabase::Builder::new(crate::telemetry::APTABASE_KEY).build(),
-        );
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_aptabase::Builder::new(crate::telemetry::APTABASE_KEY).build());
 
     // Per-state managed handles.
     builder = builder.manage(ctx.state.clone()).manage(ctx.clone());
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         builder = builder.manage(OutsideClickMonitor::shared());
     }
@@ -378,8 +374,9 @@ fn apply_window_chrome(app: &tauri::App) {
         if let Some(w) = app.get_webview_window(label) {
             #[cfg(target_os = "macos")]
             apply_macos_chrome(label, &w);
-            // No-op on Windows for now.
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "windows")]
+            apply_windows_chrome(label, &w);
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let _ = (label, w);
         }
     }
@@ -387,7 +384,9 @@ fn apply_window_chrome(app: &tauri::App) {
 
 #[cfg(target_os = "macos")]
 fn apply_macos_chrome(label: &str, w: &tauri::WebviewWindow) {
-    use crate::platform::macos::{configure_picker_window, configure_popover_window, make_window_space_neutral};
+    use crate::platform::macos::{
+        configure_picker_window, configure_popover_window, make_window_space_neutral,
+    };
     use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
     match label {
         "picker" => {
@@ -411,6 +410,32 @@ fn apply_macos_chrome(label: &str, w: &tauri::WebviewWindow) {
         "library" | "settings" => {
             make_window_space_neutral(w);
         }
+        _ => {}
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_chrome(label: &str, w: &tauri::WebviewWindow) {
+    use crate::platform::windows::{configure_picker_window, configure_popover_window};
+    use window_vibrancy::{apply_acrylic, apply_mica};
+    match label {
+        "picker" => {
+            // Try Mica first (Win11). Fall back to Acrylic on Win10 / older.
+            // Both produce a translucent vibrancy similar to NSVisualEffectView's
+            // HudWindow material; loss of either is purely cosmetic.
+            if apply_mica(w, Some(true)).is_err() {
+                let _ = apply_acrylic(w, Some((18, 18, 22, 160)));
+            }
+            configure_picker_window(w);
+        }
+        "tray-popup" => {
+            if apply_mica(w, Some(true)).is_err() {
+                let _ = apply_acrylic(w, Some((18, 18, 22, 160)));
+            }
+            configure_popover_window(w);
+        }
+        // Library / settings — no chrome, no vibrancy. CSS backdrop-filter
+        // gives inner panels glass in the webview.
         _ => {}
     }
 }

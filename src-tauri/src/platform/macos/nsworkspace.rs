@@ -35,7 +35,10 @@ pub fn frontmost_app() -> FrontmostApp {
         };
         FrontmostApp {
             bundle_id: app.bundleIdentifier().map(|s| s.to_string()),
-            executable_path: app.executableURL().and_then(|url| url.path()).map(|s| s.to_string()),
+            executable_path: app
+                .executableURL()
+                .and_then(|url| url.path())
+                .map(|s| s.to_string()),
             pid: Some(app.processIdentifier()),
         }
     }
@@ -49,7 +52,9 @@ pub fn activate_pid(pid: i32) -> bool {
         let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
             return false;
         };
-        app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps)
+        app.activateWithOptions(
+            NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps,
+        )
     }
 }
 

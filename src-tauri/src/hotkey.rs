@@ -62,7 +62,9 @@ pub fn normalize(input: &str) -> String {
                 // the first char so user-typed `f1` becomes `F1`.
                 let mut chars = other.chars();
                 match chars.next() {
-                    Some(c) => format!("{}{}", c.to_uppercase().collect::<String>(), chars.as_str()),
+                    Some(c) => {
+                        format!("{}{}", c.to_uppercase().collect::<String>(), chars.as_str())
+                    }
                     None => other.into(),
                 }
             }
@@ -123,8 +125,8 @@ mod tests {
     fn output_passes_tauri_shortcut_parser() {
         // The actual contract: whatever `normalize` produces must be
         // parseable by Tauri's `Shortcut::from_str`.
-        use tauri_plugin_global_shortcut::Shortcut;
         use std::str::FromStr;
+        use tauri_plugin_global_shortcut::Shortcut;
         for input in [
             "cmd+shift+P",
             "alt+cmd+\\",

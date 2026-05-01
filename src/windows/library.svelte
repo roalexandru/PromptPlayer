@@ -2,8 +2,11 @@
   import { onMount } from "svelte";
   import { ipc, type Prompt, type ProfileKind } from "$lib/ipc";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { IS_MAC } from "$lib/platform";
   import CadencePreview from "$lib/components/CadencePreview.svelte";
   import HotkeyRecorder from "$lib/components/HotkeyRecorder.svelte";
+
+  const NEW_HINT = IS_MAC ? "⌘N" : "Ctrl+N";
 
   let prompts: Prompt[] = $state([]);
   let selectedId = $state<string | null>(null);
@@ -207,7 +210,7 @@
       <span class="brand-name">Prompt Player</span>
     </div>
     <div class="topbar-actions">
-      <button class="ghost" onclick={createNew} title="New prompt (⌘N)">
+      <button class="ghost" onclick={createNew} title={`New prompt (${NEW_HINT})`}>
         + New
       </button>
       <button class="arm-btn" class:armed onclick={toggleArmed} title="Global enable/disable">

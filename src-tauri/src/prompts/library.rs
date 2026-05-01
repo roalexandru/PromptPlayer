@@ -133,11 +133,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         let p = nested.join("hello.pp.md");
         let mut f = std::fs::File::create(&p).unwrap();
-        write!(
-            f,
-            "---\nname: Hello\ntriggers: [hi]\n---\nbody"
-        )
-        .unwrap();
+        write!(f, "---\nname: Hello\ntriggers: [hi]\n---\nbody").unwrap();
         let (prompts, errors) = load_all(dir.path());
         assert!(errors.is_empty(), "{:?}", errors);
         assert_eq!(prompts.len(), 1);

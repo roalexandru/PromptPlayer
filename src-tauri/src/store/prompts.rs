@@ -158,7 +158,8 @@ impl PromptStore {
 
     /// Helper for IPC handlers — returns a Prompt or AppError.
     pub fn require(&self, id: &str) -> AppResult<Prompt> {
-        self.find(id).ok_or_else(|| AppError::PromptNotFound(id.to_string()))
+        self.find(id)
+            .ok_or_else(|| AppError::PromptNotFound(id.to_string()))
     }
 }
 

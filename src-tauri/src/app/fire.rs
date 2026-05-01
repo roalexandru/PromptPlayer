@@ -27,9 +27,7 @@ use crate::prompts::placeholders::{expand, PlaceholderContext};
 use crate::prompts::Prompt;
 use crate::rdp::RdpMode;
 use crate::scopes;
-use crate::telemetry::{
-    self, CancelReason, CharBucket, PromptMode, TargetAppKind, TelemetryEvent,
-};
+use crate::telemetry::{self, CancelReason, CharBucket, PromptMode, TargetAppKind, TelemetryEvent};
 use crate::typer::{play, schedule, Injector, Key, ScheduleOptions};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -109,7 +107,13 @@ impl FireService {
             tracing::warn!("picked prompt {} not found", picked_id);
             return;
         };
-        self.spawn_fire(prompt, Some(typed_form), PromptMode::Stealth, foreground, None);
+        self.spawn_fire(
+            prompt,
+            Some(typed_form),
+            PromptMode::Stealth,
+            foreground,
+            None,
+        );
     }
 
     /// Fire a prompt selected from the picker. Mode controls modifier-on-Enter
@@ -132,7 +136,9 @@ impl FireService {
 
     /// Fire from a per-prompt global hotkey. No commit-char, no typed form.
     pub fn fire_from_hotkey(&self, prompt_id: &str) {
-        let Some(prompt) = self.ctx.prompts.find(prompt_id) else { return };
+        let Some(prompt) = self.ctx.prompts.find(prompt_id) else {
+            return;
+        };
         if !prompt.enabled {
             return;
         }
@@ -269,7 +275,10 @@ fn run_fire_pipeline(
     if rdp_mode == RdpMode::HostSide {
         tracing::info!(
             "rdp host-side mode active for {:?}",
-            foreground.bundle_id.as_deref().or(foreground.executable.as_deref())
+            foreground
+                .bundle_id
+                .as_deref()
+                .or(foreground.executable.as_deref())
         );
         telemetry::send(&app, TelemetryEvent::RdpDetected);
     }
@@ -363,8 +372,8 @@ fn run_fire_pipeline(
         let pct = if body_chars == 0 {
             0
         } else {
-            (body_chars.saturating_sub(remaining_chars(&scheduled)) * 100 / body_chars)
-                .min(100) as u8
+            (body_chars.saturating_sub(remaining_chars(&scheduled)) * 100 / body_chars).min(100)
+                as u8
         };
         telemetry::send(
             &app,
@@ -417,4 +426,3 @@ fn remaining_chars(_schedule: &[crate::typer::ScheduledKey]) -> usize {
     // what's reported, not exact counts.
     0
 }
-

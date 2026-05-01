@@ -11,6 +11,8 @@ pub mod panel;
 pub mod screen;
 
 pub use activation::{activate_app, order_panel_front_no_activate};
-pub use monitor::{install_outside_click_monitor, remove_outside_click_monitor, OutsideClickMonitor};
+pub use monitor::{
+    install_outside_click_monitor, remove_outside_click_monitor, OutsideClickMonitor,
+};
 pub use panel::{configure_picker_window, configure_popover_window, make_window_space_neutral};
-pub use screen::{position_picker_on_cursor_screen, position_centered_on_cursor};
+pub use screen::{position_centered_on_cursor, position_picker_on_cursor_screen};

@@ -100,7 +100,10 @@ impl MatchIndex {
     /// — they're disambiguated at fire time by scope (§4). Same `prompt_id`
     /// inserted twice errors.
     pub fn insert(&mut self, entry: TriggerEntry) -> Result<(), DuplicateError> {
-        let bucket = self.by_canonical.entry(entry.canonical.clone()).or_default();
+        let bucket = self
+            .by_canonical
+            .entry(entry.canonical.clone())
+            .or_default();
         if bucket
             .iter()
             .any(|e| e.commit_char == entry.commit_char && e.prompt_id == entry.prompt_id)
@@ -243,7 +246,9 @@ pub fn match_buffer_all(
         for w in 0..k - 1 {
             let prev_word_first_char = entries[words[w].0]; // word[w] is later in time; first char in buffer order
             let next_word_last_char = entries[words[w + 1].1 - 1]; // word[w+1] is earlier word; its last char preceded the gap
-            let gap = prev_word_first_char.at.duration_since(next_word_last_char.at);
+            let gap = prev_word_first_char
+                .at
+                .duration_since(next_word_last_char.at);
             if gap > MULTI_WORD_RESET {
                 stale = true;
                 break;

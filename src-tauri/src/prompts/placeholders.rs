@@ -362,7 +362,10 @@ fn apply_transform(value: &str, spec: &str) -> String {
                         }
                         // group like "1:/upcase"
                         let (idx, modifier) = if let Some(colon) = group.find(':') {
-                            (group[..colon].to_string(), Some(group[colon + 2..].to_string()))
+                            (
+                                group[..colon].to_string(),
+                                Some(group[colon + 2..].to_string()),
+                            )
                         } else {
                             (group, None)
                         };
@@ -424,7 +427,10 @@ fn capitalize(s: &str) -> String {
 }
 
 fn camel_case(s: &str) -> String {
-    let words: Vec<&str> = s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let words: Vec<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
     let mut out = String::new();
     for (i, w) in words.iter().enumerate() {
         if i == 0 {
@@ -437,7 +443,10 @@ fn camel_case(s: &str) -> String {
 }
 
 fn pascal_case(s: &str) -> String {
-    let words: Vec<&str> = s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let words: Vec<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
     let mut out = String::new();
     for w in words {
         out.push_str(&capitalize(&w.to_lowercase()));
@@ -491,7 +500,10 @@ mod tests {
 
     #[test]
     fn choice_renders_first_option() {
-        let e = expand("style: ${1|aggressive,conservative|}", &PlaceholderContext::default());
+        let e = expand(
+            "style: ${1|aggressive,conservative|}",
+            &PlaceholderContext::default(),
+        );
         assert_eq!(e.text, "style: aggressive");
         assert_eq!(e.unfilled_stops, vec!["1"]);
     }

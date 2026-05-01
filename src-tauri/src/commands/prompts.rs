@@ -24,7 +24,11 @@ pub fn library_root() -> IpcResult<String> {
 #[tauri::command]
 #[specta::specta]
 pub fn save_prompt(prompt: Prompt, store: tauri::State<'_, PromptStore>) -> IpcResult<String> {
-    into_ipc(store.save(&prompt).map(|p| p.to_string_lossy().into_owned()))
+    into_ipc(
+        store
+            .save(&prompt)
+            .map(|p| p.to_string_lossy().into_owned()),
+    )
 }
 
 #[tauri::command]

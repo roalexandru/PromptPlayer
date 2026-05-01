@@ -13,6 +13,8 @@ use tauri::{AppHandle, Manager, WebviewWindow, WindowEvent};
 
 #[cfg(target_os = "macos")]
 use crate::platform::macos::OutsideClickMonitor;
+#[cfg(target_os = "windows")]
+use crate::platform::windows::OutsideClickMonitor;
 
 pub fn install(app: &tauri::App) {
     for label in ["library", "picker", "settings", "tray-popup"] {
@@ -35,6 +37,10 @@ fn install_window_handlers(app: AppHandle, label: &str, window: WebviewWindow) {
             #[cfg(target_os = "macos")]
             if let Some(monitor) = app.try_state::<Arc<OutsideClickMonitor>>() {
                 crate::platform::macos::remove_outside_click_monitor(monitor.inner());
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(monitor) = app.try_state::<Arc<OutsideClickMonitor>>() {
+                crate::platform::windows::remove_outside_click_monitor(monitor.inner());
             }
         }
         WindowEvent::Focused(false) if label_owned == "picker" => {

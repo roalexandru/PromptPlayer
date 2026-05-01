@@ -1,2 +1,18 @@
-//! Windows-specific window-chrome surface. (No-op stubs today — Win32 panel
-//! plumbing for the picker/tray-popup will live here when we add it.)
+//! Windows window-chrome / Win32 panel surface — mirrors the macOS module's
+//! public API so call sites can be cfg-driven without per-platform branches.
+//!
+//! All `unsafe` Win32 calls live behind these submodules.
+
+pub mod activation;
+pub mod monitor;
+pub mod panel;
+pub mod screen;
+pub mod taskbar;
+
+pub use activation::{activate_app, order_panel_front_no_activate};
+pub use monitor::{
+    install_outside_click_monitor, remove_outside_click_monitor, OutsideClickMonitor,
+};
+pub use panel::{configure_picker_window, configure_popover_window, make_window_space_neutral};
+pub use screen::{position_centered_on_cursor, position_picker_on_cursor_screen};
+pub use taskbar::{taskbar_edge, TaskbarEdge};

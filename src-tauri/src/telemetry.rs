@@ -62,11 +62,11 @@ pub enum PromptMode {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CharBucket {
-    Tiny,    // <30
-    Small,   // 30..100
-    Medium,  // 100..500
-    Large,   // 500..2000
-    Huge,    // >=2000
+    Tiny,   // <30
+    Small,  // 30..100
+    Medium, // 100..500
+    Large,  // 500..2000
+    Huge,   // >=2000
 }
 
 impl CharBucket {
@@ -155,9 +155,11 @@ pub fn send(app: &tauri::AppHandle, event: TelemetryEvent) {
 fn forward_to_aptabase(app: &tauri::AppHandle, name: &str, props: Value) {
     use tauri_plugin_aptabase::EventTracker;
     let props_opt = match props {
-        Value::Object(_) | Value::Array(_) | Value::String(_) | Value::Number(_) | Value::Bool(_) => {
-            Some(props)
-        }
+        Value::Object(_)
+        | Value::Array(_)
+        | Value::String(_)
+        | Value::Number(_)
+        | Value::Bool(_) => Some(props),
         Value::Null => None,
     };
     if let Err(e) = app.track_event(name, props_opt) {

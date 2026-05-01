@@ -130,44 +130,36 @@ mod tests {
     fn chain_applies_in_order() {
         let s = apply_chain(
             "<think>x</think>  Hello  ",
-            &["strip-thinking-blocks".into(), "trim".into(), "lowercase".into()],
+            &[
+                "strip-thinking-blocks".into(),
+                "trim".into(),
+                "lowercase".into(),
+            ],
         );
         assert_eq!(s, "hello");
     }
 
     #[test]
     fn regex_replace_with_global() {
-        let s = apply_chain(
-            "foo bar foo",
-            &["regex-replace: s/foo/baz/g".into()],
-        );
+        let s = apply_chain("foo bar foo", &["regex-replace: s/foo/baz/g".into()]);
         assert_eq!(s, "baz bar baz");
     }
 
     #[test]
     fn regex_replace_first_only_without_g() {
-        let s = apply_chain(
-            "foo bar foo",
-            &["regex-replace: s/foo/baz/".into()],
-        );
+        let s = apply_chain("foo bar foo", &["regex-replace: s/foo/baz/".into()]);
         assert_eq!(s, "baz bar foo");
     }
 
     #[test]
     fn regex_replace_case_insensitive_flag() {
-        let s = apply_chain(
-            "Foo FOO",
-            &["regex-replace: s/foo/baz/gi".into()],
-        );
+        let s = apply_chain("Foo FOO", &["regex-replace: s/foo/baz/gi".into()]);
         assert_eq!(s, "baz baz");
     }
 
     #[test]
     fn regex_replace_invalid_pattern_is_passthrough() {
-        let s = apply_chain(
-            "abc",
-            &["regex-replace: s/[/X/g".into()],
-        );
+        let s = apply_chain("abc", &["regex-replace: s/[/X/g".into()]);
         assert_eq!(s, "abc");
     }
 
@@ -179,7 +171,10 @@ mod tests {
 
     #[test]
     fn capitalize_first_char_only() {
-        assert_eq!(apply_chain("hello world", &["capitalize".into()]), "Hello world");
+        assert_eq!(
+            apply_chain("hello world", &["capitalize".into()]),
+            "Hello world"
+        );
         assert_eq!(apply_chain("", &["capitalize".into()]), "");
     }
 

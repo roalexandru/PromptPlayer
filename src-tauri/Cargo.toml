@@ -29,6 +29,7 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-os = "2"
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -86,6 +87,10 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 crossbeam-channel = "0.5"
 sys-locale = "0.3"
+# Window vibrancy: macOS NSVisualEffectView, Windows Mica/Acrylic. The crate
+# is cross-platform; OS-specific calls (`apply_vibrancy`, `apply_mica`,
+# `apply_acrylic`) live behind cfg gates at each call site.
+window-vibrancy = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"
@@ -120,7 +125,6 @@ objc2-app-kit = { version = "0.2", features = [
     "libc",
 ] }
 block2 = "0.5"
-window-vibrancy = "0.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rdev = { version = "0.5", features = ["unstable_grab"] }
@@ -131,6 +135,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
     "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
 ] }
 
 [features]

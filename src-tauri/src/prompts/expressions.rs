@@ -49,7 +49,11 @@ pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
     // Inject built-ins as JS globals via property registration.
     let now = Local::now();
     inject_global(&mut context, "__now_iso__", &now.to_rfc3339());
-    inject_global(&mut context, "__today__", &now.format("%Y-%m-%d").to_string());
+    inject_global(
+        &mut context,
+        "__today__",
+        &now.format("%Y-%m-%d").to_string(),
+    );
     inject_global(
         &mut context,
         "__clipboard__",

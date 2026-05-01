@@ -68,6 +68,10 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
     if !deps.app_state.is_armed() {
         return HookDecision::Pass;
     }
+    // Secure-Input gate is mac-only — Windows has no equivalent system API
+    // for detecting password-field focus. On Windows we just rely on the
+    // user not typing into a password field while armed.
+    #[cfg(target_os = "macos")]
     if crate::secure_input::is_active() {
         return HookDecision::Pass;
     }
@@ -118,8 +122,7 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
         if !candidates.is_empty() {
             let typed_form = candidates[0].typed_form.clone();
             let trigger_chars = candidates[0].trigger_chars;
-            let candidate_ids: Vec<String> =
-                candidates.into_iter().map(|m| m.prompt_id).collect();
+            let candidate_ids: Vec<String> = candidates.into_iter().map(|m| m.prompt_id).collect();
             deps.matcher.pop_last_chars(trigger_chars);
             (deps.on_fire)(candidate_ids, typed_form);
             return HookDecision::Suppress;
@@ -254,8 +257,7 @@ mod tests {
     use crate::matcher::TriggerEntry;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn make_deps_default(
-    ) -> (Arc<MatcherState>, Arc<UndoLog>, Arc<AppState>) {
+    fn make_deps_default() -> (Arc<MatcherState>, Arc<UndoLog>, Arc<AppState>) {
         (
             MatcherState::shared(),
             Arc::new(UndoLog::new()),
@@ -269,10 +271,9 @@ mod tests {
     ) {
         let count = Arc::new(AtomicUsize::new(0));
         let count2 = count.clone();
-        let cb: Arc<dyn Fn(Vec<String>, String) + Send + Sync> =
-            Arc::new(move |_ids, _form| {
-                count2.fetch_add(1, Ordering::Relaxed);
-            });
+        let cb: Arc<dyn Fn(Vec<String>, String) + Send + Sync> = Arc::new(move |_ids, _form| {
+            count2.fetch_add(1, Ordering::Relaxed);
+        });
         (cb, count)
     }
 
@@ -354,7 +355,10 @@ mod tests {
             assert!(matches!(d, HookDecision::Pass));
         }
         let d = process_event(&ke('>'), &deps);
-        assert!(matches!(d, HookDecision::Suppress), "commit char must be suppressed when trigger matches");
+        assert!(
+            matches!(d, HookDecision::Suppress),
+            "commit char must be suppressed when trigger matches"
+        );
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
@@ -384,8 +388,7 @@ mod tests {
         app_state.set_armed(true);
         let undo_count = Arc::new(AtomicUsize::new(0));
         let undo_count2 = undo_count.clone();
-        let on_fire: Arc<dyn Fn(Vec<String>, String) + Send + Sync> =
-            Arc::new(|_, _| {});
+        let on_fire: Arc<dyn Fn(Vec<String>, String) + Send + Sync> = Arc::new(|_, _| {});
         let on_undo: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             undo_count2.fetch_add(1, Ordering::Relaxed);
         });
@@ -432,9 +435,7 @@ mod tests {
         for _ in 0..3 {
             process_event(&modifier_event, &deps);
         }
-        assert!(!app_state
-            .begin_playback()
-            .load(Ordering::Relaxed));
+        assert!(!app_state.begin_playback().load(Ordering::Relaxed));
         // (begin_playback returns the cancel flag fresh, so we test that
         // it's not pre-set.)
     }

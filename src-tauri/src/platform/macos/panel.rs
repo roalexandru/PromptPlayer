@@ -85,7 +85,9 @@ pub fn configure_popover_window(window: &tauri::WebviewWindow) {
 }
 
 fn apply_options(window: &tauri::WebviewWindow, opts: &PanelOptions) {
-    let Ok(ns_window_ptr) = window.ns_window() else { return };
+    let Ok(ns_window_ptr) = window.ns_window() else {
+        return;
+    };
     unsafe {
         let ns_window: id = ns_window_ptr as id;
 
@@ -101,7 +103,8 @@ fn apply_options(window: &tauri::WebviewWindow, opts: &PanelOptions) {
 
         // Enable nonactivating-panel style mask.
         let current_mask: u64 = msg_send![ns_window, styleMask];
-        let _: () = msg_send![ns_window, setStyleMask: current_mask | STYLE_MASK_NONACTIVATING_PANEL];
+        let _: () =
+            msg_send![ns_window, setStyleMask: current_mask | STYLE_MASK_NONACTIVATING_PANEL];
 
         let _: () = msg_send![ns_window, setCollectionBehavior: opts.collection_behavior];
         let _: () = msg_send![ns_window, setLevel: opts.level];
@@ -133,7 +136,9 @@ fn apply_options(window: &tauri::WebviewWindow, opts: &PanelOptions) {
 /// macOS doesn't switch the user back to whatever Space these windows live
 /// on.
 pub fn make_window_space_neutral(window: &tauri::WebviewWindow) {
-    let Ok(ns_window_ptr) = window.ns_window() else { return };
+    let Ok(ns_window_ptr) = window.ns_window() else {
+        return;
+    };
     unsafe {
         let ns_window: id = ns_window_ptr as id;
         let collection: u64 = COLLECTION_CAN_JOIN_ALL_SPACES | COLLECTION_FULL_SCREEN_AUXILIARY;
@@ -213,7 +218,13 @@ mod tests {
 
     #[test]
     fn flags_distinct() {
-        assert_ne!(COLLECTION_CAN_JOIN_ALL_SPACES, COLLECTION_MOVE_TO_ACTIVE_SPACE);
-        assert_ne!(STYLE_MASK_NONACTIVATING_PANEL, COLLECTION_CAN_JOIN_ALL_SPACES);
+        assert_ne!(
+            COLLECTION_CAN_JOIN_ALL_SPACES,
+            COLLECTION_MOVE_TO_ACTIVE_SPACE
+        );
+        assert_ne!(
+            STYLE_MASK_NONACTIVATING_PANEL,
+            COLLECTION_CAN_JOIN_ALL_SPACES
+        );
     }
 }

@@ -169,7 +169,10 @@ mod tests {
         let mutated = vec![p("zeta", "Zeta thing", "")];
         idx.rebuild_if_stale(7, &mutated);
         let hits = idx.query("zeta", 5);
-        assert!(hits.is_empty(), "stale rebuild must not pick up new prompts");
+        assert!(
+            hits.is_empty(),
+            "stale rebuild must not pick up new prompts"
+        );
     }
 
     #[test]

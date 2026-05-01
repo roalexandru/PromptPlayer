@@ -120,33 +120,53 @@ mod tests {
     #[test]
     fn play_completes_short_schedule() {
         let text = "Hi there";
-        let profile = Profile { typos_enabled: false, pre_submit_pause_enabled: false, ..Profile::SALES_ENGINEER };
+        let profile = Profile {
+            typos_enabled: false,
+            pre_submit_pause_enabled: false,
+            ..Profile::SALES_ENGINEER
+        };
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         // Disable pre-typing pause so the test is fast.
-        let opts = ScheduleOptions { rdp_mode: false, include_pre_typing_pause: false };
+        let opts = ScheduleOptions {
+            rdp_mode: false,
+            include_pre_typing_pause: false,
+        };
         let s = schedule(text, &profile, &opts, &mut rng);
         let mut inj = RecordingInjector::default();
         let cancel = Arc::new(AtomicBool::new(false));
         // Truncate to quick playback by clamping all times to <50ms.
         let fast: Vec<_> = s
             .iter()
-            .map(|k| ScheduledKey { absolute_time_ms: 0, ..*k })
+            .map(|k| ScheduledKey {
+                absolute_time_ms: 0,
+                ..*k
+            })
             .collect();
         let ok = play(&fast, &mut inj, cancel);
         assert!(ok);
-        let chars: String = inj.events.iter().filter_map(|e| match e {
-            Key::Char(c) => Some(*c),
-            _ => None,
-        }).collect();
+        let chars: String = inj
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Key::Char(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
         assert_eq!(chars, text);
     }
 
     #[test]
     fn cancel_releases_modifiers() {
         let text = "abcdefghij";
-        let profile = Profile { typos_enabled: false, ..Profile::SALES_ENGINEER };
+        let profile = Profile {
+            typos_enabled: false,
+            ..Profile::SALES_ENGINEER
+        };
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let opts = ScheduleOptions { rdp_mode: false, include_pre_typing_pause: false };
+        let opts = ScheduleOptions {
+            rdp_mode: false,
+            include_pre_typing_pause: false,
+        };
         let mut s = schedule(text, &profile, &opts, &mut rng);
         // Push out times to give cancel a chance to land.
         for (i, k) in s.iter_mut().enumerate() {
@@ -162,6 +182,9 @@ mod tests {
         let ok = play(&s, &mut inj, cancel);
         handle.join().unwrap();
         assert!(!ok);
-        assert!(inj.modifier_releases >= 1, "release_all_modifiers must run on cancel");
+        assert!(
+            inj.modifier_releases >= 1,
+            "release_all_modifiers must run on cancel"
+        );
     }
 }

@@ -71,7 +71,9 @@ async fn main() -> Result<()> {
 fn secret_path() -> PathBuf {
     if cfg!(windows) {
         let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-        PathBuf::from(base).join("PromptPlayer-GuestHelper").join("secret")
+        PathBuf::from(base)
+            .join("PromptPlayer-GuestHelper")
+            .join("secret")
     } else {
         // Cross-compile sanity. On non-Windows hosts (CI builds) write to a temp.
         std::env::temp_dir().join("prompt-player-guest-helper-secret")
@@ -101,7 +103,11 @@ fn load_or_init_secret(path: &PathBuf) -> Result<String> {
         // Lock down ACLs to current user only.
         let _ = std::process::Command::new("icacls")
             .arg(path)
-            .args(["/inheritance:r", "/grant:r", &format!("{}:F", whoami_user())])
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                &format!("{}:F", whoami_user()),
+            ])
             .status();
     }
     Ok(secret)
@@ -141,10 +147,7 @@ async fn handle(stream: TcpStream, expected_secret: &str) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("read message")?;
+    reader.read_line(&mut line).await.context("read message")?;
     let msg: ClientMessage = serde_json::from_str(&line).context("parse json")?;
     if msg.secret != expected_secret {
         let reply = ServerReply {
@@ -156,7 +159,10 @@ async fn handle(stream: TcpStream, expected_secret: &str) -> Result<()> {
         return Err(anyhow!("auth mismatch"));
     }
     play_schedule(msg.schedule).await?;
-    let reply = ServerReply { ok: true, error: None };
+    let reply = ServerReply {
+        ok: true,
+        error: None,
+    };
     let s = serde_json::to_string(&reply)?;
     w.write_all(s.as_bytes()).await?;
     Ok(())

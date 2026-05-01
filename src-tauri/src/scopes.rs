@@ -53,14 +53,15 @@ fn capture_macos() -> ForegroundContext {
 fn capture_windows() -> ForegroundContext {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
     };
     unsafe {
         let hwnd = GetForegroundWindow();
-        if hwnd.0 == 0 {
+        if hwnd.0.is_null() {
             return ForegroundContext::default();
         }
         let mut title = [0u16; 512];
@@ -77,7 +78,12 @@ fn capture_windows() -> ForegroundContext {
             .and_then(|h| {
                 let mut buf = [0u16; 1024];
                 let mut sz = buf.len() as u32;
-                let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_FORMAT::default(), &mut buf, &mut sz);
+                // QueryFullProcessImageNameW takes a PWSTR (windows-rs newtype)
+                // — wrap the buffer pointer rather than passing the array
+                // reference, which doesn't deref to PWSTR.
+                let pwstr = windows::core::PWSTR(buf.as_mut_ptr());
+                let ok =
+                    QueryFullProcessImageNameW(h, PROCESS_NAME_FORMAT::default(), pwstr, &mut sz);
                 if ok.is_ok() && sz > 0 {
                     Some(String::from_utf16_lossy(&buf[..sz as usize]))
                 } else {
@@ -112,9 +118,7 @@ pub fn pick_best(prompts: &[crate::prompts::Prompt], ctx: &ForegroundContext) ->
             continue;
         }
         let spec = p.scope.as_ref().map(|s| s.specificity()).unwrap_or(0) as i64;
-        if p.priority > best_priority
-            || (p.priority == best_priority && spec > best_specificity)
-        {
+        if p.priority > best_priority || (p.priority == best_priority && spec > best_specificity) {
             best = Some(p);
             best_priority = p.priority;
             best_specificity = spec;

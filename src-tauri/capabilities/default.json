@@ -14,6 +14,7 @@
     "global-shortcut:default",
     "dialog:default",
     "autostart:default",
-    "aptabase:allow-track-event"
+    "aptabase:allow-track-event",
+    "os:default"
   ]
 }

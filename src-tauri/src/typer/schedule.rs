@@ -9,12 +9,13 @@
 //! absolute time. Drift stays bounded; profile statistics actually match.
 
 use crate::typer::distributions::{
-    self, jitter, sample_burst_iki, sample_iki, sample_paragraph_pause,
-    sample_pre_submit_pause, sample_pre_typing_pause, sample_sentence_pause,
-    sample_typo_noticed_pause, sample_word_pause,
+    self, jitter, sample_burst_iki, sample_iki, sample_paragraph_pause, sample_pre_submit_pause,
+    sample_pre_typing_pause, sample_sentence_pause, sample_typo_noticed_pause, sample_word_pause,
 };
 use crate::typer::profiles::Profile;
-use crate::typer::typos::{adjacent_qwerty, sample_kind, sample_latency, should_inject_typo, TypoKind};
+use crate::typer::typos::{
+    adjacent_qwerty, sample_kind, sample_latency, should_inject_typo, TypoKind,
+};
 use rand::Rng;
 use serde::Serialize;
 
@@ -258,7 +259,11 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
         TypoKind::Substitution => {
             let wrong = adjacent_qwerty(target, rng);
             // Emit wrong char in place of target.
-            let iki = if in_burst { sample_burst_iki(rng) } else { sample_iki(rng) };
+            let iki = if in_burst {
+                sample_burst_iki(rng)
+            } else {
+                sample_iki(rng)
+            };
             *cursor += apply_iki_adjustments(iki, profile, options, rng);
             keys.push(ScheduledKey {
                 key: Key::Char(wrong),
@@ -266,14 +271,26 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
                 is_correction: false,
                 is_burst: in_burst,
             });
-            update_burst_state(target, burst_remaining, words_since_last_burst, next_burst_at_words, rng);
+            update_burst_state(
+                target,
+                burst_remaining,
+                words_since_last_burst,
+                next_burst_at_words,
+                rng,
+            );
             *text_pos += 1;
 
             // Type `latency` more correct chars naturally.
             for _ in 0..latency {
-                if *text_pos >= chars.len() { break; }
+                if *text_pos >= chars.len() {
+                    break;
+                }
                 let in_b = *burst_remaining > 0;
-                let iki = if in_b { sample_burst_iki(rng) } else { sample_iki(rng) };
+                let iki = if in_b {
+                    sample_burst_iki(rng)
+                } else {
+                    sample_iki(rng)
+                };
                 *cursor += apply_iki_adjustments(iki, profile, options, rng);
                 let c = chars[*text_pos];
                 keys.push(ScheduledKey {
@@ -282,7 +299,13 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
                     is_correction: false,
                     is_burst: in_b,
                 });
-                update_burst_state(c, burst_remaining, words_since_last_burst, next_burst_at_words, rng);
+                update_burst_state(
+                    c,
+                    burst_remaining,
+                    words_since_last_burst,
+                    next_burst_at_words,
+                    rng,
+                );
                 *text_pos += 1;
             }
 
@@ -304,7 +327,11 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
             let retype_start = text_pos.saturating_sub(latency + 1);
             for j in retype_start..*text_pos {
                 let in_b = *burst_remaining > 0;
-                let iki = if in_b { sample_burst_iki(rng) } else { sample_iki(rng) };
+                let iki = if in_b {
+                    sample_burst_iki(rng)
+                } else {
+                    sample_iki(rng)
+                };
                 *cursor += apply_iki_adjustments(iki, profile, options, rng);
                 keys.push(ScheduledKey {
                     key: Key::Char(chars[j]),
@@ -318,7 +345,11 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
             // Swap chars[pos] and chars[pos+1]: type chars[pos+1] first, then chars[pos].
             if *text_pos + 1 >= chars.len() {
                 // Fall back to a plain emit.
-                let iki = if in_burst { sample_burst_iki(rng) } else { sample_iki(rng) };
+                let iki = if in_burst {
+                    sample_burst_iki(rng)
+                } else {
+                    sample_iki(rng)
+                };
                 *cursor += apply_iki_adjustments(iki, profile, options, rng);
                 keys.push(ScheduledKey {
                     key: Key::Char(target),
@@ -326,7 +357,13 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
                     is_correction: false,
                     is_burst: in_burst,
                 });
-                update_burst_state(target, burst_remaining, words_since_last_burst, next_burst_at_words, rng);
+                update_burst_state(
+                    target,
+                    burst_remaining,
+                    words_since_last_burst,
+                    next_burst_at_words,
+                    rng,
+                );
                 *text_pos += 1;
                 return;
             }
@@ -334,7 +371,11 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
             // Emit swapped pair.
             for &c in &[next, target] {
                 let in_b = *burst_remaining > 0;
-                let iki = if in_b { sample_burst_iki(rng) } else { sample_iki(rng) };
+                let iki = if in_b {
+                    sample_burst_iki(rng)
+                } else {
+                    sample_iki(rng)
+                };
                 *cursor += apply_iki_adjustments(iki, profile, options, rng);
                 keys.push(ScheduledKey {
                     key: Key::Char(c),
@@ -342,15 +383,27 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
                     is_correction: false,
                     is_burst: in_b,
                 });
-                update_burst_state(c, burst_remaining, words_since_last_burst, next_burst_at_words, rng);
+                update_burst_state(
+                    c,
+                    burst_remaining,
+                    words_since_last_burst,
+                    next_burst_at_words,
+                    rng,
+                );
             }
             *text_pos += 2;
 
             // Latency, notice, backspace 2, retype correctly.
             for _ in 0..latency {
-                if *text_pos >= chars.len() { break; }
+                if *text_pos >= chars.len() {
+                    break;
+                }
                 let in_b = *burst_remaining > 0;
-                let iki = if in_b { sample_burst_iki(rng) } else { sample_iki(rng) };
+                let iki = if in_b {
+                    sample_burst_iki(rng)
+                } else {
+                    sample_iki(rng)
+                };
                 *cursor += apply_iki_adjustments(iki, profile, options, rng);
                 let c = chars[*text_pos];
                 keys.push(ScheduledKey {
@@ -359,7 +412,13 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
                     is_correction: false,
                     is_burst: in_b,
                 });
-                update_burst_state(c, burst_remaining, words_since_last_burst, next_burst_at_words, rng);
+                update_burst_state(
+                    c,
+                    burst_remaining,
+                    words_since_last_burst,
+                    next_burst_at_words,
+                    rng,
+                );
                 *text_pos += 1;
             }
 
@@ -378,7 +437,11 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
             let retype_start = text_pos.saturating_sub(latency + 2);
             for j in retype_start..*text_pos {
                 let in_b = *burst_remaining > 0;
-                let iki = if in_b { sample_burst_iki(rng) } else { sample_iki(rng) };
+                let iki = if in_b {
+                    sample_burst_iki(rng)
+                } else {
+                    sample_iki(rng)
+                };
                 *cursor += apply_iki_adjustments(iki, profile, options, rng);
                 keys.push(ScheduledKey {
                     key: Key::Char(chars[j]),
@@ -393,9 +456,15 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
             *text_pos += 1;
             // Type `latency` more correct chars naturally.
             for _ in 0..latency {
-                if *text_pos >= chars.len() { break; }
+                if *text_pos >= chars.len() {
+                    break;
+                }
                 let in_b = *burst_remaining > 0;
-                let iki = if in_b { sample_burst_iki(rng) } else { sample_iki(rng) };
+                let iki = if in_b {
+                    sample_burst_iki(rng)
+                } else {
+                    sample_iki(rng)
+                };
                 *cursor += apply_iki_adjustments(iki, profile, options, rng);
                 let c = chars[*text_pos];
                 keys.push(ScheduledKey {
@@ -404,7 +473,13 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
                     is_correction: false,
                     is_burst: in_b,
                 });
-                update_burst_state(c, burst_remaining, words_since_last_burst, next_burst_at_words, rng);
+                update_burst_state(
+                    c,
+                    burst_remaining,
+                    words_since_last_burst,
+                    next_burst_at_words,
+                    rng,
+                );
                 *text_pos += 1;
             }
 
@@ -425,7 +500,11 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
             let retype_start = text_pos.saturating_sub(latency + 1);
             for j in retype_start..*text_pos {
                 let in_b = *burst_remaining > 0;
-                let iki = if in_b { sample_burst_iki(rng) } else { sample_iki(rng) };
+                let iki = if in_b {
+                    sample_burst_iki(rng)
+                } else {
+                    sample_iki(rng)
+                };
                 *cursor += apply_iki_adjustments(iki, profile, options, rng);
                 keys.push(ScheduledKey {
                     key: Key::Char(chars[j]),
@@ -492,8 +571,24 @@ mod tests {
         let text = "Build me a React component that displays a list of users with avatars and online status.";
         let mut profile = Profile::SALES_ENGINEER;
         profile.typos_enabled = false;
-        let normal = schedule(text, &profile, &ScheduleOptions { rdp_mode: false, include_pre_typing_pause: false }, &mut det_rng());
-        let rdp = schedule(text, &profile, &ScheduleOptions { rdp_mode: true, include_pre_typing_pause: false }, &mut det_rng());
+        let normal = schedule(
+            text,
+            &profile,
+            &ScheduleOptions {
+                rdp_mode: false,
+                include_pre_typing_pause: false,
+            },
+            &mut det_rng(),
+        );
+        let rdp = schedule(
+            text,
+            &profile,
+            &ScheduleOptions {
+                rdp_mode: true,
+                include_pre_typing_pause: false,
+            },
+            &mut det_rng(),
+        );
         let normal_end = normal.last().unwrap().absolute_time_ms;
         let rdp_end = rdp.last().unwrap().absolute_time_ms;
         assert!(
@@ -508,11 +603,35 @@ mod tests {
     fn pre_typing_pause_when_enabled() {
         let mut profile = Profile::SALES_ENGINEER;
         profile.typos_enabled = false;
-        let with = schedule("hello world this is text", &profile, &ScheduleOptions { rdp_mode: false, include_pre_typing_pause: true }, &mut det_rng());
-        let without = schedule("hello world this is text", &profile, &ScheduleOptions { rdp_mode: false, include_pre_typing_pause: false }, &mut det_rng());
+        let with = schedule(
+            "hello world this is text",
+            &profile,
+            &ScheduleOptions {
+                rdp_mode: false,
+                include_pre_typing_pause: true,
+            },
+            &mut det_rng(),
+        );
+        let without = schedule(
+            "hello world this is text",
+            &profile,
+            &ScheduleOptions {
+                rdp_mode: false,
+                include_pre_typing_pause: false,
+            },
+            &mut det_rng(),
+        );
         // First key with pre-typing should be ≥ ~700ms; without should be small (a single IKI).
-        assert!(with[0].absolute_time_ms > 700, "pre-typing pause expected; got {}", with[0].absolute_time_ms);
-        assert!(without[0].absolute_time_ms < 700, "no pre-typing pause expected; got {}", without[0].absolute_time_ms);
+        assert!(
+            with[0].absolute_time_ms > 700,
+            "pre-typing pause expected; got {}",
+            with[0].absolute_time_ms
+        );
+        assert!(
+            without[0].absolute_time_ms < 700,
+            "no pre-typing pause expected; got {}",
+            without[0].absolute_time_ms
+        );
     }
 
     #[test]
@@ -533,7 +652,12 @@ mod tests {
         let mut profile = Profile::SALES_ENGINEER;
         profile.typos_enabled = false;
         profile.send_final_enter = true;
-        let s = schedule("hello world", &profile, &ScheduleOptions::default(), &mut det_rng());
+        let s = schedule(
+            "hello world",
+            &profile,
+            &ScheduleOptions::default(),
+            &mut det_rng(),
+        );
         assert!(matches!(s.last().unwrap().key, Key::Enter));
     }
 }

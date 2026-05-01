@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
   import { ipc, type Prompt } from "$lib/ipc";
+  import { IS_MAC } from "$lib/platform";
 
   let armed = $state(false);
   let prompts = $state<Prompt[]>([]);
@@ -128,20 +129,24 @@
     });
     // Native bridge: macOS NSEvent monitor in Rust feeds us cursor positions
     // (x, y in CSS px relative to the popover window) since WKWebView in a
-    // non-activating NSPanel drops mouse-moved events.
-    unlistenMouseMove = await listen<[number, number]>(
-      "tray-popup-mousemove",
-      (e) => {
-        const [x, y] = e.payload;
-        lastClientX = x;
-        lastClientY = y;
-        if (x < 0 || y < 0) {
-          hoverKey = null;
-          return;
-        }
-        hoverKey = pickKeyAt(x, y);
-      },
-    );
+    // non-activating NSPanel drops mouse-moved events. WebView2 on Windows
+    // dispatches mouse-move natively, so the bridge is never installed and
+    // we skip subscribing to avoid a no-op IPC listener.
+    if (IS_MAC) {
+      unlistenMouseMove = await listen<[number, number]>(
+        "tray-popup-mousemove",
+        (e) => {
+          const [x, y] = e.payload;
+          lastClientX = x;
+          lastClientY = y;
+          if (x < 0 || y < 0) {
+            hoverKey = null;
+            return;
+          }
+          hoverKey = pickKeyAt(x, y);
+        },
+      );
+    }
   });
 
   onDestroy(() => {

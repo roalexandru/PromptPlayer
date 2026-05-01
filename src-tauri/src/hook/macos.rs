@@ -10,7 +10,9 @@
 
 use core_foundation::base::TCFType;
 use core_foundation::mach_port::CFMachPortRef;
-use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop, CFRunLoopRun, CFRunLoopSourceRef};
+use core_foundation::runloop::{
+    kCFRunLoopCommonModes, CFRunLoop, CFRunLoopRun, CFRunLoopSourceRef,
+};
 use core_graphics::event::{
     CGEvent, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
 };
@@ -106,14 +108,11 @@ fn run_tap_thread(handler: EventHandler) {
         )
     };
     if tap_port.is_null() {
-        tracing::error!(
-            "CGEventTapCreate returned null — Accessibility permission likely missing"
-        );
+        tracing::error!("CGEventTapCreate returned null — Accessibility permission likely missing");
         return;
     }
 
-    let runloop_source =
-        unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), tap_port, 0) };
+    let runloop_source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), tap_port, 0) };
 
     let current_loop = CFRunLoop::get_current();
     unsafe {
@@ -141,9 +140,7 @@ extern "C" fn tap_callback(
     user_info: *mut c_void,
 ) -> *mut c_void {
     // Re-enable on auto-disable.
-    if etype == KCG_EVENT_TAP_DISABLED_BY_TIMEOUT
-        || etype == KCG_EVENT_TAP_DISABLED_BY_USER_INPUT
-    {
+    if etype == KCG_EVENT_TAP_DISABLED_BY_TIMEOUT || etype == KCG_EVENT_TAP_DISABLED_BY_USER_INPUT {
         // We can't re-enable from within the callback safely; log and return.
         tracing::warn!("CGEventTap disabled by system (etype={:#x})", etype);
         return event;
@@ -155,9 +152,8 @@ extern "C" fn tap_callback(
     // Suppress our own injected keystrokes — when the typer fires, its events
     // would otherwise bounce back through the tap and look like the user typing,
     // which then cancels playback at the §2.6 3-keystroke threshold.
-    let source_pid = unsafe {
-        CGEventGetIntegerValueField(event, KCG_EVENT_SOURCE_UNIX_PROCESS_ID)
-    } as u32;
+    let source_pid =
+        unsafe { CGEventGetIntegerValueField(event, KCG_EVENT_SOURCE_UNIX_PROCESS_ID) } as u32;
     let our_pid = std::process::id();
     if source_pid == our_pid {
         return event;
@@ -169,18 +165,12 @@ extern "C" fn tap_callback(
     let mut buf = [0u16; 8];
     let mut len: u64 = 0;
     unsafe {
-        CGEventKeyboardGetUnicodeString(
-            event,
-            buf.len() as u64,
-            &mut len,
-            buf.as_mut_ptr(),
-        );
+        CGEventKeyboardGetUnicodeString(event, buf.len() as u64, &mut len, buf.as_mut_ptr());
     }
     let s = String::from_utf16_lossy(&buf[..len as usize]);
     let typed: Option<char> = s.chars().find(|c| !c.is_control());
 
-    let keycode =
-        unsafe { CGEventGetIntegerValueField(event, KCG_KEYBOARD_EVENT_KEYCODE) } as u16;
+    let keycode = unsafe { CGEventGetIntegerValueField(event, KCG_KEYBOARD_EVENT_KEYCODE) } as u16;
     let is_backspace = keycode == KEY_CODE_DELETE;
 
     tracing::debug!(

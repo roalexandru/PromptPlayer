@@ -6,11 +6,39 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel in-flight runs for the same ref when a new commit lands. Keeps PR
+# feedback fast and avoids burning a Mac runner on a stale revision.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  # Fail fast if version numbers in package.json, tauri.conf.json, and
+  # Cargo.toml have drifted out of sync — these MUST match for the release
+  # workflow to publish a coherent artifact set.
+  version-consistency:
+    name: version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify package.json / tauri.conf.json / Cargo.toml versions match
+        shell: bash
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          tauri=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          cargo=$(grep -m1 '^version' Cargo.toml | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
+          echo "package.json:     $pkg"
+          echo "tauri.conf.json:  $tauri"
+          echo "Cargo.toml:       $cargo"
+          if [ "$pkg" != "$tauri" ] || [ "$pkg" != "$cargo" ]; then
+            echo "::error::version mismatch — bump all three to the same value"
+            exit 1
+          fi
+
   rust:
     name: rust (${{ matrix.os }})
     strategy:
@@ -25,12 +53,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Install Linux deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -68,4 +90,9 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm check
+      - name: Type check
+        run: pnpm typecheck
+      - name: Unit tests (Vitest)
+        run: pnpm test
+      - name: Production build
+        run: pnpm build

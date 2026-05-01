@@ -16,6 +16,8 @@ pub fn picker_open(app: AppHandle, ctx: tauri::State<'_, AppContext>) -> IpcResu
         .rebuild_if_stale(ctx.prompts.generation(), &ctx.prompts.read());
     #[cfg(target_os = "macos")]
     crate::platform::macos::position_picker_on_cursor_screen(&app);
+    #[cfg(target_os = "windows")]
+    crate::platform::windows::position_picker_on_cursor_screen(&app);
     show_picker_window(&app);
     telemetry::send(&app, TelemetryEvent::PickerOpened);
     Ok(())

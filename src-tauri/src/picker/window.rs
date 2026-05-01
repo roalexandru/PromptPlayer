@@ -7,7 +7,7 @@
 //! drivers to render this window as black/missing. Toggle in settings ("Show
 //! during screen sharing") for rehearsal mode (Phase 13).
 
-use tauri::{Manager, WebviewWindow};
+use tauri::WebviewWindow;
 
 #[cfg(target_os = "macos")]
 mod plat {
@@ -46,9 +46,14 @@ mod plat {
 
     pub fn set_screen_capture_exclusion(window: &WebviewWindow, hide: bool) -> Result<(), String> {
         let hwnd = HWND(window.hwnd().map_err(|e| format!("hwnd: {}", e))?.0 as _);
-        let affinity = if hide { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+        let affinity = if hide {
+            WDA_EXCLUDEFROMCAPTURE
+        } else {
+            WDA_NONE
+        };
         unsafe {
-            SetWindowDisplayAffinity(hwnd, affinity).map_err(|e| format!("SetWindowDisplayAffinity: {}", e))?;
+            SetWindowDisplayAffinity(hwnd, affinity)
+                .map_err(|e| format!("SetWindowDisplayAffinity: {}", e))?;
         }
         Ok(())
     }
@@ -78,7 +83,9 @@ pub fn prepare_picker(app: &tauri::AppHandle, hide_from_capture: bool) -> Result
     if let Some(w) = app.get_webview_window("picker") {
         #[cfg(target_os = "macos")]
         crate::platform::macos::position_centered_on_cursor(&w, 0.30);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        crate::platform::windows::position_centered_on_cursor(&w, 0.30);
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = w.center();
         apply_screen_capture_exclusion(&w, hide_from_capture)?;
     }

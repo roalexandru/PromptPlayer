@@ -4,6 +4,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { ipc, type Prompt } from "$lib/ipc";
+  import { IS_MAC } from "$lib/platform";
 
   type Hit = { prompt_id: string; score: number; highlights: number[] };
 
@@ -95,13 +96,18 @@
     }
     if (e.key === "Enter") {
       e.preventDefault();
+      // Primary modifier for "run": Cmd on Mac, Ctrl on Windows. Win key
+      // (e.metaKey on Windows) intentionally not accepted — that's the OS,
+      // not the user's "run this" intent.
+      const primary = IS_MAC ? e.metaKey : e.ctrlKey;
       if (e.shiftKey) pick("fast");
       else if (e.altKey) pick("paste");
-      else if (e.metaKey || e.ctrlKey) pick("run");
+      else if (primary) pick("run");
       else pick("human");
       return;
     }
-    if (e.key >= "1" && e.key <= "9" && (e.metaKey || e.ctrlKey)) {
+    const primaryDigit = IS_MAC ? e.metaKey : e.ctrlKey;
+    if (e.key >= "1" && e.key <= "9" && primaryDigit) {
       e.preventDefault();
       const idx = parseInt(e.key) - 1;
       if (idx < hits.length) {
@@ -241,9 +247,15 @@
   <footer>
     <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
     <span><kbd>↵</kbd> type</span>
-    <span><kbd>⇧↵</kbd> fast</span>
-    <span><kbd>⌥↵</kbd> paste</span>
-    <span><kbd>⌘↵</kbd> run</span>
+    {#if IS_MAC}
+      <span><kbd>⇧↵</kbd> fast</span>
+      <span><kbd>⌥↵</kbd> paste</span>
+      <span><kbd>⌘↵</kbd> run</span>
+    {:else}
+      <span><kbd>Shift+↵</kbd> fast</span>
+      <span><kbd>Alt+↵</kbd> paste</span>
+      <span><kbd>Ctrl+↵</kbd> run</span>
+    {/if}
     <span class="grow"></span>
     <span><kbd>esc</kbd></span>
   </footer>

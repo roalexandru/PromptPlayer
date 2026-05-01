@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Prompt } from "$lib/ipc";
+  import { IS_MAC, prettyMod as platPrettyMod } from "$lib/platform";
 
   let {
     value = $bindable<string | null>(),
@@ -18,18 +19,14 @@
   let pendingKey = $state<string | null>(null);
   let inputEl = $state<HTMLDivElement | null>(null);
 
-  // Reserved Prompt Player + macOS system shortcuts.
-  const RESERVED: Record<string, string> = {
-    // Prompt Player globals
+  // Reserved Prompt Player globals + per-OS system shortcuts. Selected at
+  // module-eval time from `IS_MAC` so we can do an O(1) lookup against the
+  // normalized hotkey string and surface a precise "claimed by …" message.
+  const RESERVED_MAC: Record<string, string> = {
     "cmd+shift+p": "Prompt Player arm/disarm",
-    "cmd+shift+v": "Prompt Player picker",
+    "alt+cmd+\\": "Prompt Player picker",
     "cmd+shift+escape": "Prompt Player kill-switch",
     "cmd+shift+r": "Prompt Player panic reset",
-    "ctrl+shift+p": "Prompt Player arm/disarm",
-    "ctrl+shift+v": "Prompt Player picker",
-    "ctrl+shift+escape": "Prompt Player kill-switch",
-    "ctrl+shift+r": "Prompt Player panic reset",
-    // Standard macOS app shortcuts
     "cmd+h": "macOS — Hide app",
     "cmd+alt+h": "macOS — Hide Others",
     "cmd+shift+h": "macOS — Show home folder",
@@ -43,7 +40,6 @@
     "cmd+t": "macOS — New tab",
     "cmd+shift+t": "macOS — Reopen last",
     "cmd+,": "macOS — Preferences",
-    // macOS system shortcuts
     "cmd+space": "macOS — Spotlight",
     "cmd+alt+space": "macOS — Finder search",
     "cmd+tab": "macOS — App switcher",
@@ -59,7 +55,6 @@
     "cmd+alt+d": "macOS — Toggle Dock",
     "f11": "macOS — Show desktop",
     "f12": "macOS — Show dashboard",
-    // Common edit shortcuts users probably want left alone
     "cmd+x": "macOS — Cut",
     "cmd+c": "macOS — Copy",
     "cmd+v": "macOS — Paste",
@@ -71,13 +66,64 @@
     "cmd+p": "macOS — Print",
   };
 
+  const RESERVED_WIN: Record<string, string> = {
+    "ctrl+shift+p": "Prompt Player arm/disarm",
+    "ctrl+alt+\\": "Prompt Player picker",
+    "ctrl+alt+shift+k": "Prompt Player kill-switch",
+    "ctrl+alt+shift+r": "Prompt Player panic reset",
+    "ctrl+esc": "Windows — Start menu",
+    "ctrl+shift+escape": "Windows — Task Manager",
+    "alt+f4": "Windows — Close window",
+    "alt+tab": "Windows — App switcher",
+    "alt+shift+tab": "Windows — App switcher reverse",
+    "win+l": "Windows — Lock",
+    "win+d": "Windows — Show desktop",
+    "win+e": "Windows — File Explorer",
+    "win+r": "Windows — Run",
+    "win+s": "Windows — Search",
+    "win+i": "Windows — Settings",
+    "win+a": "Windows — Action Center",
+    "win+x": "Windows — Power user menu",
+    "win+tab": "Windows — Task View",
+    "win+left": "Windows — Snap left",
+    "win+right": "Windows — Snap right",
+    "win+up": "Windows — Snap up",
+    "win+down": "Windows — Snap down",
+    "win+plus": "Windows — Magnifier in",
+    "win+minus": "Windows — Magnifier out",
+    "win+shift+s": "Windows — Snip & Sketch",
+    "ctrl+x": "Windows — Cut",
+    "ctrl+c": "Windows — Copy",
+    "ctrl+v": "Windows — Paste",
+    "ctrl+z": "Windows — Undo",
+    "ctrl+y": "Windows — Redo",
+    "ctrl+a": "Windows — Select all",
+    "ctrl+s": "Windows — Save",
+    "ctrl+f": "Windows — Find",
+    "ctrl+p": "Windows — Print",
+    "ctrl+n": "Windows — New",
+    "ctrl+t": "Windows — New tab",
+    "ctrl+w": "Windows — Close tab",
+    "ctrl+,": "Windows — Preferences",
+  };
+
+  const RESERVED: Record<string, string> = IS_MAC ? RESERVED_MAC : RESERVED_WIN;
+
   function normalize(s: string): string {
     return s
       .toLowerCase()
       .split(/[+\-\s]+/)
       .filter((p) => p.length > 0)
       .map((p) => {
-        if (p === "command" || p === "meta" || p === "super") return "cmd";
+        // On Mac we collapse super/win/meta to "cmd" (single primary key).
+        // On Windows we keep "win" distinct from "ctrl" so reserved-list
+        // collisions match correctly (Win+L vs Ctrl+L).
+        if (IS_MAC) {
+          if (p === "command" || p === "meta" || p === "super" || p === "win" || p === "windows") return "cmd";
+        } else {
+          if (p === "super" || p === "windows") return "win";
+          if (p === "command" || p === "meta" || p === "cmd") return "ctrl";
+        }
         if (p === "control") return "ctrl";
         if (p === "option" || p === "opt") return "alt";
         if (p === "return") return "enter";
@@ -97,14 +143,20 @@
     return owner ? `Already bound to "${owner.name}"` : null;
   });
 
+  const MOD_TOKENS = IS_MAC
+    ? ["cmd", "ctrl", "alt", "shift"]
+    : ["ctrl", "alt", "shift", "win"];
+
   let invalid = $derived.by(() => {
     if (!value) return null;
     const parts = normalize(value).split("+");
-    const hasMod = parts.some((p) => ["cmd", "ctrl", "alt", "shift"].includes(p));
-    const keys = parts.filter(
-      (p) => !["cmd", "ctrl", "alt", "shift"].includes(p),
-    );
-    if (!hasMod) return "Needs at least one modifier (⌘, ⌃, ⌥, ⇧)";
+    const hasMod = parts.some((p) => MOD_TOKENS.includes(p));
+    const keys = parts.filter((p) => !MOD_TOKENS.includes(p));
+    if (!hasMod) {
+      return IS_MAC
+        ? "Needs at least one modifier (⌘, ⌃, ⌥, ⇧)"
+        : "Needs at least one modifier (Ctrl, Alt, Shift, Win)";
+    }
     if (keys.length === 0) return "Needs a key beyond modifiers";
     // Reject non-ASCII / dead-key characters (˙, etc) that the OS hotkey
     // parser can't handle.
@@ -131,7 +183,9 @@
     if (pendingKey && pendingMods.size > 0) {
       const parts = Array.from(pendingMods);
       parts.sort((a, b) => {
-        const order = ["cmd", "ctrl", "alt", "shift"];
+        const order = IS_MAC
+          ? ["cmd", "ctrl", "alt", "shift"]
+          : ["ctrl", "alt", "shift", "win"];
         return order.indexOf(a) - order.indexOf(b);
       });
       parts.push(pendingKey);
@@ -158,7 +212,8 @@
     }
 
     const mods = new Set<string>();
-    if (e.metaKey) mods.add("cmd");
+    // On Mac, the Meta key is Cmd. On Windows, the Meta key is the Win key.
+    if (e.metaKey) mods.add(IS_MAC ? "cmd" : "win");
     if (e.ctrlKey) mods.add("ctrl");
     if (e.altKey) mods.add("alt");
     if (e.shiftKey) mods.add("shift");
@@ -215,7 +270,7 @@
   }
 
   function prettyMod(m: string): string {
-    return { cmd: "⌘", ctrl: "⌃", alt: "⌥", shift: "⇧" }[m] || m;
+    return platPrettyMod(m);
   }
   function prettyKey(k: string): string {
     if (k === "space") return "Space";
@@ -230,19 +285,21 @@
   }
 
   function prettyDisplay(): string[] {
+    const order = IS_MAC
+      ? ["cmd", "ctrl", "alt", "shift"]
+      : ["ctrl", "alt", "shift", "win"];
     if (recording) {
-      const mods = Array.from(pendingMods).sort((a, b) => {
-        const order = ["cmd", "ctrl", "alt", "shift"];
-        return order.indexOf(a) - order.indexOf(b);
-      });
+      const mods = Array.from(pendingMods).sort(
+        (a, b) => order.indexOf(a) - order.indexOf(b),
+      );
       const out = mods.map(prettyMod);
       if (pendingKey) out.push(prettyKey(pendingKey));
       return out;
     }
     if (!value) return [];
     const parts = normalize(value).split("+");
-    const mods = parts.filter((p) => ["cmd", "ctrl", "alt", "shift"].includes(p));
-    const key = parts.find((p) => !["cmd", "ctrl", "alt", "shift"].includes(p));
+    const mods = parts.filter((p) => MOD_TOKENS.includes(p));
+    const key = parts.find((p) => !MOD_TOKENS.includes(p));
     const out = mods.map(prettyMod);
     if (key) out.push(prettyKey(key));
     return out;
@@ -300,15 +357,29 @@
 {:else if value}
   <small class="hint">Press Rebind to change. Esc to cancel during recording.</small>
 {:else if recording}
-  <small class="hint">
-    Press a combo. If nothing captures, macOS is intercepting it — try a
-    different key (avoid ⌘H, ⌘Q, ⌘W, ⌘⇧H, ⌘Space).
-  </small>
+  {#if IS_MAC}
+    <small class="hint">
+      Press a combo. If nothing captures, macOS is intercepting it — try a
+      different key (avoid ⌘H, ⌘Q, ⌘W, ⌘⇧H, ⌘Space).
+    </small>
+  {:else}
+    <small class="hint">
+      Press a combo. If nothing captures, Windows is intercepting it — try a
+      different key (avoid Ctrl+L, Alt+F4, Win+anything).
+    </small>
+  {/if}
 {:else}
-  <small class="hint">
-    Click <strong>Set shortcut</strong> and press your combo. Try things like
-    <kbd>⌘⇧1</kbd>, <kbd>⌃⌥1</kbd>, or <kbd>⌥F1</kbd>.
-  </small>
+  {#if IS_MAC}
+    <small class="hint">
+      Click <strong>Set shortcut</strong> and press your combo. Try things like
+      <kbd>⌘⇧1</kbd>, <kbd>⌃⌥1</kbd>, or <kbd>⌥F1</kbd>.
+    </small>
+  {:else}
+    <small class="hint">
+      Click <strong>Set shortcut</strong> and press your combo. Try things like
+      <kbd>Ctrl+Shift+1</kbd>, <kbd>Ctrl+Alt+1</kbd>, or <kbd>Alt+F1</kbd>.
+    </small>
+  {/if}
 {/if}
 
 <style>
