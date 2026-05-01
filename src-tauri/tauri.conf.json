@@ -1,0 +1,92 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Prompt Player",
+  "version": "0.1.0",
+  "identifier": "com.roalexandru.promptplayer",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "library",
+        "title": "Prompt Player",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 480,
+        "visible": false,
+        "transparent": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "url": "index.html"
+      },
+      {
+        "label": "picker",
+        "title": "Prompt Player Picker",
+        "width": 620,
+        "height": 420,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "resizable": false,
+        "shadow": true,
+        "focus": true,
+        "url": "picker.html"
+      },
+      {
+        "label": "settings",
+        "title": "Prompt Player Settings",
+        "width": 640,
+        "height": 720,
+        "visible": false,
+        "url": "settings.html"
+      },
+      {
+        "label": "tray-popup",
+        "title": "Prompt Player",
+        "width": 300,
+        "height": 420,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "resizable": false,
+        "shadow": true,
+        "focus": true,
+        "url": "tray-popup.html"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "msi"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png"
+    ],
+    "category": "Productivity",
+    "shortDescription": "Stealth keyboard utility for live demos",
+    "longDescription": "Prompt Player is a stealth keyboard utility for live demos. Type a trigger word + > and the app silently continues typing the rest of a stored prompt with statistically realistic human cadence.",
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "entitlements": "entitlements.plist"
+    },
+    "windows": {
+      "wix": {
+        "language": ["en-US"]
+      }
+    }
+  }
+}

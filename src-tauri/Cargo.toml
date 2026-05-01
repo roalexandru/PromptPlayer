@@ -1,0 +1,107 @@
+[package]
+name = "prompt-player"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stealth keyboard utility for live demos"
+default-run = "prompt-player"
+
+[lib]
+name = "prompt_player"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "prompt-player"
+path = "src/main.rs"
+
+[[bin]]
+name = "typing-engine-cli"
+path = "src/bin/typing_engine_cli.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-dialog = "2"
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+rand_chacha = { workspace = true }
+
+# keystroke synthesis
+enigo = "0.2"
+# keyboard listening with suppression — using rdev as cross-platform fallback,
+# with native CGEventTap / SetWindowsHookEx behind platform modules
+rdev = { version = "0.5", features = ["unstable_grab"] }
+
+# expressions sandbox
+boa_engine = "0.19"
+
+# fuzzy search
+nucleo-matcher = "0.3"
+
+# telemetry
+tauri-plugin-aptabase = "1"
+sysinfo = "0.31"
+
+# markdown
+pulldown-cmark = "0.12"
+
+# encrypted local state
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+# file watching
+notify = "6"
+
+# async runtime
+tokio = { version = "1", features = ["full"] }
+
+# misc
+once_cell = "1"
+parking_lot = "0.12"
+regex = "1"
+phf = { version = "0.11", features = ["macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+crossbeam-channel = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"
+cocoa = "0.26"
+objc = "0.2"
+block = "0.1"
+window-vibrancy = "0.5"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+]
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[dev-dependencies]
+tempfile = "3"

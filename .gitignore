@@ -1,0 +1,40 @@
+# Rust
+/target/
+/src-tauri/target/
+/guest-helper/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node
+node_modules/
+dist/
+.svelte-kit/
+.vite/
+
+# Tauri
+src-tauri/gen/
+src-tauri/WixTools*/
+
+# macOS
+.DS_Store
+*.swp
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Build outputs
+/release/
+*.dmg
+*.msi
+*.app
+
+# Local config
+.env
+.env.local
+
+# Claude Code session state
+.claude/
+.claude.json
+CLAUDE.local.md

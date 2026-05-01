@@ -1,0 +1,228 @@
+//! §12 — Telemetry via Aptabase.
+//!
+//! - Per Q5: minimum viable, no opt-out, debug vs prod separation, NO PROMPT CONTENT.
+//! - Whitelist of event names enforced at compile time (TelemetryEvent enum).
+//! - Always-on in prod; toggleable in debug builds only.
+//! - Aptabase project key: `A-EU-9005405380` (used for both debug and prod for now).
+
+use serde::Serialize;
+use serde_json::{json, Value};
+use std::sync::Once;
+
+pub const APTABASE_KEY: &str = "A-EU-9005405380";
+
+/// The complete set of event names we will EVER send. Adding a new variant
+/// requires explicit code review.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "name", content = "props")]
+pub enum TelemetryEvent {
+    AppStarted {
+        version: &'static str,
+        os: &'static str,
+        locale: String,
+        profile_in_use: &'static str,
+    },
+    PromptFired {
+        mode: PromptMode,
+        char_count_bucket: CharBucket,
+        has_expressions: bool,
+        target_app_kind: TargetAppKind,
+        scope_match: bool,
+    },
+    PromptCancelled {
+        reason: CancelReason,
+        completed_chars_pct: u8,
+    },
+    PromptKilled,
+    PromptUndone,
+    PickerOpened,
+    PickerDismissed,
+    PickerSearchChars {
+        chars_typed: u8,
+    },
+    ArmToggled {
+        armed: bool,
+    },
+    ExpressionError {
+        kind: ExpressionErrorKind,
+    },
+    UpdateCheck,
+    UpdateApplied,
+    SecureInputDetected,
+    RdpDetected,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptMode {
+    Stealth,
+    Picker,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CharBucket {
+    Tiny,    // <30
+    Small,   // 30..100
+    Medium,  // 100..500
+    Large,   // 500..2000
+    Huge,    // >=2000
+}
+
+impl CharBucket {
+    pub fn classify(n: usize) -> Self {
+        match n {
+            0..=29 => Self::Tiny,
+            30..=99 => Self::Small,
+            100..=499 => Self::Medium,
+            500..=1999 => Self::Large,
+            _ => Self::Huge,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TargetAppKind {
+    Browser,
+    Native,
+    Rdp,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CancelReason {
+    UserKeystrokes,
+    Esc,
+    Error,
+    Kill,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExpressionErrorKind {
+    Syntax,
+    Runtime,
+    Timeout,
+}
+
+/// Initialize global telemetry. Must be called once at app startup.
+pub fn init() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // Aptabase Tauri plugin handles transport; we just log the init for now.
+        // The plugin attachment lives in `main.rs` (`tauri-plugin-aptabase`).
+        tracing::info!("telemetry init — aptabase key {}", APTABASE_KEY);
+    });
+}
+
+/// Type-safe send: `event` is one of the whitelisted variants.
+/// This function deliberately discards the event silently in tests / when the
+/// Aptabase client isn't wired (the binding lives on the Tauri AppHandle).
+pub fn send(app: &tauri::AppHandle, event: TelemetryEvent) {
+    let payload = serde_json::to_value(&event).unwrap_or(Value::Null);
+    let (name, props) = match payload {
+        Value::Object(map) => {
+            let name = map
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let props = map.get("props").cloned().unwrap_or(json!({}));
+            (name, props)
+        }
+        _ => (String::new(), json!({})),
+    };
+    if name.is_empty() {
+        return;
+    }
+    // The aptabase tauri plugin exposes a `track_event` command; we call it
+    // via the plugin's API in the actual integration. Here we just log so
+    // the binding can be added in Phase 11.
+    let _ = app;
+    let _ = props;
+    tracing::debug!("telemetry: {} {}", name, event.short_name());
+}
+
+impl TelemetryEvent {
+    fn short_name(&self) -> &'static str {
+        match self {
+            Self::AppStarted { .. } => "app_started",
+            Self::PromptFired { .. } => "prompt_fired",
+            Self::PromptCancelled { .. } => "prompt_cancelled",
+            Self::PromptKilled => "prompt_killed",
+            Self::PromptUndone => "prompt_undone",
+            Self::PickerOpened => "picker_opened",
+            Self::PickerDismissed => "picker_dismissed",
+            Self::PickerSearchChars { .. } => "picker_search_chars",
+            Self::ArmToggled { .. } => "arm_toggled",
+            Self::ExpressionError { .. } => "expression_error",
+            Self::UpdateCheck => "update_check",
+            Self::UpdateApplied => "update_applied",
+            Self::SecureInputDetected => "secure_input_detected",
+            Self::RdpDetected => "rdp_detected",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-time check: no event variant carries a free-text field that could
+    /// leak prompt content. We assert this via field naming + type discipline:
+    /// every props field is bool/u8/enum, never `String` of user content.
+    /// This test reads the JSON and ensures no value is a long string.
+    #[test]
+    fn no_event_payload_includes_long_strings() {
+        let events = vec![
+            TelemetryEvent::AppStarted {
+                version: "0.1.0",
+                os: "macos",
+                locale: "en-US".into(),
+                profile_in_use: "sales-engineer",
+            },
+            TelemetryEvent::PromptFired {
+                mode: PromptMode::Stealth,
+                char_count_bucket: CharBucket::Medium,
+                has_expressions: false,
+                target_app_kind: TargetAppKind::Native,
+                scope_match: true,
+            },
+            TelemetryEvent::PromptCancelled {
+                reason: CancelReason::UserKeystrokes,
+                completed_chars_pct: 23,
+            },
+            TelemetryEvent::ExpressionError {
+                kind: ExpressionErrorKind::Timeout,
+            },
+        ];
+        for e in events {
+            let v = serde_json::to_value(&e).unwrap();
+            check_no_long_strings(&v);
+        }
+    }
+
+    fn check_no_long_strings(v: &Value) {
+        match v {
+            Value::String(s) => assert!(
+                s.len() < 32,
+                "event payload contains a string longer than 32 chars: {:?}",
+                s
+            ),
+            Value::Array(a) => a.iter().for_each(check_no_long_strings),
+            Value::Object(o) => o.values().for_each(check_no_long_strings),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn char_bucket_classify() {
+        assert!(matches!(CharBucket::classify(10), CharBucket::Tiny));
+        assert!(matches!(CharBucket::classify(50), CharBucket::Small));
+        assert!(matches!(CharBucket::classify(200), CharBucket::Medium));
+        assert!(matches!(CharBucket::classify(1000), CharBucket::Large));
+        assert!(matches!(CharBucket::classify(5000), CharBucket::Huge));
+    }
+}

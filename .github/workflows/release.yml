@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.platform.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: macos-universal, os: macos-latest, target: universal-apple-darwin, args: "--target universal-apple-darwin" }
+          - { name: windows-x64, os: windows-latest, target: x86_64-pc-windows-msvc, args: "" }
+    runs-on: ${{ matrix.platform.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            src-tauri
+            guest-helper
+
+      - name: Install pnpm deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Bundle ID smoke test (locked at com.roalexandru.promptplayer)
+        shell: bash
+        run: grep -q '"identifier": "com.roalexandru.promptplayer"' src-tauri/tauri.conf.json
+
+      # Build the app. Signing/notarization is intentionally absent — produces
+      # unsigned .dmg / .msi until you provision Apple Developer ID and
+      # Windows EV certificate. README documents the one-time bypass.
+      - name: Build (Tauri)
+        run: pnpm tauri build ${{ matrix.platform.args }}
+
+      - name: Upload macOS artifact
+        if: matrix.platform.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PromptPlayer-${{ matrix.platform.name }}
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+      - name: Upload Windows artifact
+        if: matrix.platform.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PromptPlayer-${{ matrix.platform.name }}
+          path: src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+      # When the repo is connected to GitHub and the tag push is a real release,
+      # this step uploads the artifacts to the GitHub Release. Until then it is
+      # skipped because no Release exists; toggle by pushing a `v*` tag.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/msi/*.msi
+          fail_on_unmatched_files: false
+          draft: true
