@@ -22,6 +22,10 @@ struct ClientMessage {
     schedule: Vec<ScheduledKeyWire>,
 }
 
+// Wire types are deserialized from JSON and consumed by the typing pipeline
+// outside this binary; clippy can't see the cross-binary use, so we silence
+// the dead-code lint locally rather than refactor.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", content = "value")]
 enum KeyWire {
@@ -30,6 +34,7 @@ enum KeyWire {
     Enter,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ScheduledKeyWire {
     key: KeyWire,

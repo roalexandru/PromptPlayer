@@ -76,7 +76,6 @@ fn restore_to(pid: u64) -> bool {
 
 #[cfg(target_os = "windows")]
 fn capture_foreground() -> ForegroundSnapshot {
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
     unsafe {
         let hwnd = GetForegroundWindow();

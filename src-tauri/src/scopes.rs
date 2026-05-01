@@ -51,7 +51,6 @@ fn capture_macos() -> ForegroundContext {
 
 #[cfg(target_os = "windows")]
 fn capture_windows() -> ForegroundContext {
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
         PROCESS_QUERY_LIMITED_INFORMATION,
