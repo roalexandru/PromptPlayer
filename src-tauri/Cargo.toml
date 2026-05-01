@@ -16,9 +16,9 @@ path = "src/lib.rs"
 name = "prompt-player"
 path = "src/main.rs"
 
-[[bin]]
-name = "typing-engine-cli"
-path = "src/bin/typing_engine_cli.rs"
+# `typing-engine-cli` lives in its own workspace crate (../typing-engine-cli)
+# so tauri-bundler doesn't try to copy it into the .app/.msi during release
+# builds. The universal-apple-darwin lipo step only fuses the main binary.
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

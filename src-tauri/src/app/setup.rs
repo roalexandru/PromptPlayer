@@ -140,8 +140,15 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_aptabase::Builder::new(crate::telemetry::APTABASE_KEY).build());
 
-    // Per-state managed handles.
-    builder = builder.manage(ctx.state.clone()).manage(ctx.clone());
+    // Per-state managed handles. Each typed `tauri::State<'_, T>` IPC
+    // parameter needs its T registered here, otherwise Tauri panics with
+    // "state not managed for field". AppContext also references most of
+    // these via Arc, so we manage them independently for the commands
+    // that take a narrow handle (PromptStore, AppState).
+    builder = builder
+        .manage(ctx.state.clone())
+        .manage(ctx.prompts.clone())
+        .manage(ctx.clone());
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         builder = builder.manage(OutsideClickMonitor::shared());

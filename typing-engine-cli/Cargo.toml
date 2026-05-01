@@ -1,0 +1,24 @@
+[package]
+name = "typing-engine-cli"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI test harness for prompt-player's typing engine"
+
+[[bin]]
+name = "typing-engine-cli"
+path = "src/main.rs"
+
+[dependencies]
+# We depend on the prompt-player library by package name + path. Keeping it
+# out of src-tauri's [[bin]] section means tauri-bundler doesn't try to copy
+# this CLI into the .app/.msi (it would otherwise look for a binary that
+# the universal-apple-darwin lipo step doesn't produce).
+prompt-player = { path = "../src-tauri" }
+
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
