@@ -48,6 +48,12 @@ jobs:
       - name: Frontend unit tests
         run: pnpm test
 
+      # tauri::generate_context!() reads frontendDist (../dist) at compile
+      # time and panics if the directory is missing. Build the frontend
+      # before cargo so the lib compiles for `cargo test`.
+      - name: Frontend production build
+        run: pnpm build
+
       - name: Rust workspace tests
         run: cargo test --workspace
 
