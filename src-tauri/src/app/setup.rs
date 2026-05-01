@@ -446,3 +446,26 @@ fn apply_windows_chrome(label: &str, w: &tauri::WebviewWindow) {
         _ => {}
     }
 }
+
+/// Apply ALL `manage()` calls for the app. Generic over the Tauri runtime so
+/// the integration smoke test in `tests/ipc_registry.rs` can reuse it
+/// against `MockRuntime`.
+///
+/// Production `run()` calls this *and* the matching inline `.manage()` block
+/// is kept in sync via `tests/ipc_registry.rs::manage_state_inline_matches_helper`.
+/// Adding a managed type means: (a) edit this function, (b) edit the inline
+/// block in `run()`, (c) `cargo test` re-asserts they match.
+pub fn manage_state<R: tauri::Runtime>(
+    builder: tauri::Builder<R>,
+    ctx: AppContext,
+) -> tauri::Builder<R> {
+    let mut builder = builder
+        .manage(ctx.state.clone())
+        .manage(ctx.prompts.clone())
+        .manage(ctx);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        builder = builder.manage(OutsideClickMonitor::shared());
+    }
+    builder
+}

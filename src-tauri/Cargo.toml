@@ -144,3 +144,10 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
 tempfile = "3"
+tauri = { version = "2", features = [
+    "macos-private-api",
+    "tray-icon",
+    "image-png",
+    "test",
+] }
+http = "1"

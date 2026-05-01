@@ -1,34 +1,31 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { ipc, type Prompt } from "$lib/ipc";
+  import { ipc, type Prompt, type SearchHit } from "$lib/ipc";
   import { IS_MAC } from "$lib/platform";
 
-  type Hit = { prompt_id: string; score: number; highlights: number[] };
-
   let q = $state("");
-  let hits: Hit[] = $state([]);
+  let hits: SearchHit[] = $state([]);
   let prompts = $state<Map<string, Prompt>>(new Map());
   let selected = $state(0);
   let inputEl = $state<HTMLInputElement | null>(null);
   let listEl = $state<HTMLUListElement | null>(null);
 
   async function loadPrompts() {
-    const all = await invoke<Prompt[]>("ipc_list_prompts");
+    const all = await ipc.listPrompts();
     prompts = new Map(all.map((p) => [p.id, p]));
   }
 
   async function search() {
-    hits = await invoke<Hit[]>("ipc_picker_search", { q, limit: 50 });
+    hits = await ipc.pickerSearch(q, 50);
     selected = 0;
   }
 
   async function pick(mode: "human" | "fast" | "paste" | "run") {
     const hit = hits[selected];
     if (!hit) return;
-    await invoke("ipc_picker_select", { promptId: hit.prompt_id, mode });
+    await ipc.pickerSelect(hit.prompt_id, mode);
   }
 
   async function dismiss() {

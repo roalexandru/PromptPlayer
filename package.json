@@ -12,6 +12,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "lint:ipc": "bash scripts/lint-ipc.sh",
     "tauri": "tauri"
   },
   "dependencies": {
