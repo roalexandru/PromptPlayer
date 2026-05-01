@@ -60,6 +60,12 @@ jobs:
   build:
     name: build (${{ matrix.platform.name }})
     needs: test
+    # tauri-action creates / updates a GitHub Release and uploads the
+    # DMG/MSI assets. That requires write access to repository contents
+    # — without this the API call fails with
+    # "Resource not accessible by integration".
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
