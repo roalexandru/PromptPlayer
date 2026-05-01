@@ -68,8 +68,11 @@ tauri-specta = { version = "=2.0.0-rc.20", features = ["derive", "typescript"] }
 # markdown
 pulldown-cmark = "0.12"
 
-# encrypted local state
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+# encrypted local state — not yet wired up; previously declared as
+# rusqlite + bundled-sqlcipher-vendored-openssl, but no source code uses
+# it. Kept the comment as a placeholder for the planned usage-history
+# store. Re-add when actually needed; meanwhile, dropping it removes a
+# 3-5 min OpenSSL-from-source build on cold caches.
 
 # file watching
 notify = "6"
