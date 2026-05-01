@@ -49,6 +49,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Tell Microsoft Defender to skip Cargo's churn directories on Windows.
+      # Saves ~25% on the rust step wall-clock by avoiding per-file scans on
+      # the ~100k temporary artifacts cargo writes during a build.
+      - name: Disable Defender scan on build dirs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\target"
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\src-tauri\target"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\node_modules"
+
       # tauri::generate_context!() (called from app/setup.rs) reads
       # frontendDist at compile time and panics if `dist/` is missing.
       # Build the frontend before running cargo so clippy/check/test see
@@ -111,6 +123,9 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: IPC lint (no raw invoke() outside `$lib/ipc`)
+        shell: bash
+        run: bash scripts/lint-ipc.sh
       - name: Type check
         run: pnpm typecheck
       - name: Unit tests (Vitest)

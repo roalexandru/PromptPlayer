@@ -83,6 +83,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Tell Microsoft Defender to skip Cargo's churn directories on Windows.
+      # Defender real-time scan adds ~25% overhead to every file write/open;
+      # Cargo writes ~100k small files per build. Runner is ephemeral, so the
+      # exclusion is gone when the job ends.
+      - name: Disable Defender scan on build dirs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\target"
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\src-tauri\target"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\node_modules"
+
       - uses: pnpm/action-setup@v4
         with:
           version: 9

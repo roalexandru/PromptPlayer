@@ -23,8 +23,14 @@ rand_chacha = "0.3"
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+# `lto = "thin"` parallelizes link-time optimization across crates; `lto = true`
+# (= "fat") forces a single-threaded LTO pass, which roughly doubles Windows
+# link wall-clock for ~5% runtime gain. Thin LTO + 16 codegen-units gives us
+# nearly the same runtime perf at meaningfully faster builds — important
+# because the typing pipeline is gated on perf-sensitive crates (typer/
+# distributions, schedule), not on whole-program inlining of the IPC layer.
+lto = "thin"
+codegen-units = 16
 strip = true
 panic = "abort"
 
