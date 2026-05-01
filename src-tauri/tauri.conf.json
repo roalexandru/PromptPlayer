@@ -76,6 +76,10 @@
       "icons/128x128.png",
       "icons/128x128@2x.png"
     ],
+    "resources": [
+      "../prompts-examples/*.pp.md",
+      "../prompts-examples/README.md"
+    ],
     "category": "Productivity",
     "shortDescription": "Stealth keyboard utility for live demos",
     "longDescription": "Prompt Player is a stealth keyboard utility for live demos. Type a trigger word + > and the app silently continues typing the rest of a stored prompt with statistically realistic human cadence.",

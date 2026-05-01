@@ -74,67 +74,13 @@ pub fn apply_screen_capture_exclusion(window: &WebviewWindow, hide: bool) -> Res
 /// picker on the wrong display when the user is on a secondary monitor or
 /// inside a fullscreen app on another space.
 pub fn prepare_picker(app: &tauri::AppHandle, hide_from_capture: bool) -> Result<(), String> {
+    use tauri::Manager;
     if let Some(w) = app.get_webview_window("picker") {
-        center_on_active_screen(&w);
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::position_centered_on_cursor(&w, 0.30);
+        #[cfg(not(target_os = "macos"))]
+        let _ = w.center();
         apply_screen_capture_exclusion(&w, hide_from_capture)?;
     }
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn center_on_active_screen(window: &tauri::WebviewWindow) {
-    use cocoa::base::{id, nil};
-    use cocoa::foundation::{NSPoint, NSRect};
-    use objc::{class, msg_send, sel, sel_impl};
-
-    let Ok(ns_window_ptr) = window.ns_window() else { return; };
-
-    unsafe {
-        let ns_window: id = ns_window_ptr as id;
-        // Window's current frame in AppKit coords (points, bottom-left origin).
-        let win_frame: NSRect = msg_send![ns_window, frame];
-
-        // NSEvent.mouseLocation returns the cursor in screen coordinates
-        // (origin bottom-left of the *primary* screen, points). Walk
-        // NSScreen.screens to find which screen contains the cursor.
-        let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-        let screens: id = msg_send![class!(NSScreen), screens];
-        if screens == nil {
-            let _ = window.center();
-            return;
-        }
-        let count: usize = msg_send![screens, count];
-        let mut chosen_frame: Option<NSRect> = None;
-        for i in 0..count {
-            let screen: id = msg_send![screens, objectAtIndex: i];
-            let frame: NSRect = msg_send![screen, frame];
-            if cursor.x >= frame.origin.x
-                && cursor.x <= frame.origin.x + frame.size.width
-                && cursor.y >= frame.origin.y
-                && cursor.y <= frame.origin.y + frame.size.height
-            {
-                chosen_frame = Some(frame);
-                break;
-            }
-        }
-        let Some(frame) = chosen_frame else {
-            let _ = window.center();
-            return;
-        };
-
-        // Position centered horizontally on the chosen screen, 30% from the
-        // top (Spotlight-style). All math in AppKit bottom-up coords; we
-        // call setFrameOrigin: directly so no conversion to Tauri's
-        // top-left coord system is needed.
-        let x = frame.origin.x + (frame.size.width - win_frame.size.width) / 2.0;
-        let y_top_pad = frame.size.height * 0.30;
-        let y = frame.origin.y + frame.size.height - y_top_pad - win_frame.size.height;
-        let origin = NSPoint { x, y };
-        let _: () = msg_send![ns_window, setFrameOrigin: origin];
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn center_on_active_screen(window: &tauri::WebviewWindow) {
-    let _ = window.center();
 }

@@ -111,15 +111,16 @@ pub enum ExpressionErrorKind {
 pub fn init() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        // Aptabase Tauri plugin handles transport; we just log the init for now.
-        // The plugin attachment lives in `main.rs` (`tauri-plugin-aptabase`).
         tracing::info!("telemetry init — aptabase key {}", APTABASE_KEY);
     });
 }
 
 /// Type-safe send: `event` is one of the whitelisted variants.
-/// This function deliberately discards the event silently in tests / when the
-/// Aptabase client isn't wired (the binding lives on the Tauri AppHandle).
+///
+/// On macOS/Windows this dispatches to the `tauri-plugin-aptabase` plugin
+/// (registered in `app::setup`). The plugin handles batching and offline
+/// buffering. Per §12 we never include prompt content / triggers / expression
+/// source — the `TelemetryEvent` enum itself enforces this at compile time.
 pub fn send(app: &tauri::AppHandle, event: TelemetryEvent) {
     let payload = serde_json::to_value(&event).unwrap_or(Value::Null);
     let (name, props) = match payload {
@@ -137,12 +138,31 @@ pub fn send(app: &tauri::AppHandle, event: TelemetryEvent) {
     if name.is_empty() {
         return;
     }
-    // The aptabase tauri plugin exposes a `track_event` command; we call it
-    // via the plugin's API in the actual integration. Here we just log so
-    // the binding can be added in Phase 11.
-    let _ = app;
-    let _ = props;
     tracing::debug!("telemetry: {} {}", name, event.short_name());
+
+    // Forward to Aptabase. The plugin exposes `EventTracker::track_event`
+    // on the AppHandle; in tests / when the plugin isn't registered (unit
+    // tests), `try_state` returns None and we silently drop.
+    #[cfg(not(test))]
+    forward_to_aptabase(app, &name, props);
+    #[cfg(test)]
+    {
+        let _ = (app, props);
+    }
+}
+
+#[cfg(not(test))]
+fn forward_to_aptabase(app: &tauri::AppHandle, name: &str, props: Value) {
+    use tauri_plugin_aptabase::EventTracker;
+    let props_opt = match props {
+        Value::Object(_) | Value::Array(_) | Value::String(_) | Value::Number(_) | Value::Bool(_) => {
+            Some(props)
+        }
+        Value::Null => None,
+    };
+    if let Err(e) = app.track_event(name, props_opt) {
+        tracing::debug!("aptabase track_event failed: {}", e);
+    }
 }
 
 impl TelemetryEvent {

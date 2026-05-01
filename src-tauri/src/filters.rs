@@ -143,4 +143,100 @@ mod tests {
         );
         assert_eq!(s, "baz bar baz");
     }
+
+    #[test]
+    fn regex_replace_first_only_without_g() {
+        let s = apply_chain(
+            "foo bar foo",
+            &["regex-replace: s/foo/baz/".into()],
+        );
+        assert_eq!(s, "baz bar foo");
+    }
+
+    #[test]
+    fn regex_replace_case_insensitive_flag() {
+        let s = apply_chain(
+            "Foo FOO",
+            &["regex-replace: s/foo/baz/gi".into()],
+        );
+        assert_eq!(s, "baz baz");
+    }
+
+    #[test]
+    fn regex_replace_invalid_pattern_is_passthrough() {
+        let s = apply_chain(
+            "abc",
+            &["regex-replace: s/[/X/g".into()],
+        );
+        assert_eq!(s, "abc");
+    }
+
+    #[test]
+    fn regex_replace_malformed_spec_is_passthrough() {
+        let s = apply_chain("abc", &["regex-replace: not-an-s-spec".into()]);
+        assert_eq!(s, "abc");
+    }
+
+    #[test]
+    fn capitalize_first_char_only() {
+        assert_eq!(apply_chain("hello world", &["capitalize".into()]), "Hello world");
+        assert_eq!(apply_chain("", &["capitalize".into()]), "");
+    }
+
+    #[test]
+    fn trim_strips_leading_trailing_whitespace() {
+        assert_eq!(apply_chain("  hi  ", &["trim".into()]), "hi");
+    }
+
+    #[test]
+    fn strip_thinking_handles_self_closed_thinking_tag() {
+        // <think>...</think> alias also works (common LLM pattern).
+        let s = strip_thinking_blocks("a<think>secret</think>b");
+        assert_eq!(s, "ab");
+    }
+
+    #[test]
+    fn strip_thinking_preserves_normal_text() {
+        let s = strip_thinking_blocks("plain text without tags");
+        assert_eq!(s, "plain text without tags");
+    }
+
+    #[test]
+    fn markdown_to_plain_extracts_text() {
+        let s = apply_chain(
+            "# Heading\n\nSome **bold** text and `code`.",
+            &["markdown-to-plain".into()],
+        );
+        assert!(s.contains("Heading"));
+        assert!(s.contains("bold"));
+        assert!(s.contains("code"));
+        // Markdown emphasis markers should be gone.
+        assert!(!s.contains("**"));
+        assert!(!s.contains('`'));
+    }
+
+    #[test]
+    fn unknown_filter_passes_through() {
+        let s = apply_chain("untouched", &["this-filter-does-not-exist".into()]);
+        assert_eq!(s, "untouched");
+    }
+
+    #[test]
+    fn empty_chain_is_identity() {
+        let s = apply_chain("hello", &[]);
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn inject_typos_filter_is_currently_passthrough() {
+        // Documented: typo injection happens at schedule time, not in the filter chain.
+        // The filter is reserved for paste-mode scenarios.
+        assert_eq!(apply_chain("hello", &["inject-typos".into()]), "hello");
+    }
+
+    #[test]
+    fn filter_with_inline_arg_uses_colon_separator() {
+        let s = apply_chain("AAAA", &["regex-replace: s/A/b/g".into()]);
+        assert_eq!(s, "bbbb");
+    }
 }

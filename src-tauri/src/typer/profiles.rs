@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, specta::Type)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProfileKind {
     #[default]
@@ -118,7 +118,7 @@ impl Profile {
 }
 
 /// §7.1 `typing-overrides:` mapping.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "kebab-case", default)]
 pub struct TypingOverrides {
     pub iki_median_ms: Option<f64>,

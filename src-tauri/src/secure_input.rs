@@ -14,14 +14,33 @@ extern "C" {
 
 /// Returns true when macOS has Secure Event Input engaged.
 /// On non-mac targets always returns false.
+///
+/// In test builds, always returns false so unit tests aren't sensitive to
+/// the developer's terminal-secure-input setting at the time tests run.
 #[allow(unused)]
 pub fn is_active() -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(test)]
+    {
+        return false;
+    }
+    #[cfg(all(target_os = "macos", not(test)))]
     unsafe {
         IsSecureEventInputEnabled() != 0
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(test)))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_active_returns_false_in_tests() {
+        // Sanity check: tests must not be sensitive to the dev's local
+        // SecureInput state. The cfg(test) override above guarantees this.
+        assert!(!is_active());
     }
 }

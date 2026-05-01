@@ -518,4 +518,67 @@ mod tests {
         let e = expand("today: $DATE", &PlaceholderContext::default());
         assert!(e.text.starts_with("today: 20"));
     }
+
+    #[test]
+    fn unknown_bare_var_renders_empty() {
+        // Unknown variables should not crash; they render as empty.
+        let e = expand("a $NOTAREALVAR b", &PlaceholderContext::default());
+        // The exact rendering policy is "empty for unknown var", so the result
+        // should be "a  b" or similar — assert it doesn't include the literal name.
+        assert!(!e.text.contains("NOTAREALVAR"));
+    }
+
+    #[test]
+    fn dollar_at_end_of_string_is_literal() {
+        let e = expand("price: $", &PlaceholderContext::default());
+        assert_eq!(e.text, "price: $");
+    }
+
+    #[test]
+    fn nested_braces_are_handled() {
+        // ${1/regex/${1:/upcase}/g} contains a nested ${1:/upcase}
+        let mut ctx = PlaceholderContext::default();
+        ctx.selection = Some("hello".into());
+        let e = expand("${SELECTION/(.*)/${1:/upcase}/g}", &ctx);
+        assert_eq!(e.text, "HELLO");
+    }
+
+    #[test]
+    fn multiple_tab_stops_collected() {
+        let e = expand("$1 then $2 then $3", &PlaceholderContext::default());
+        assert_eq!(e.unfilled_stops.len(), 3);
+    }
+
+    #[test]
+    fn user_machine_render_non_empty() {
+        // We don't assert the value (test machines vary) but they must expand.
+        let e = expand("$USER@$MACHINE", &PlaceholderContext::default());
+        // Should not include literal `$USER` after expansion.
+        assert!(!e.text.contains("$USER"));
+        assert!(!e.text.contains("$MACHINE"));
+    }
+
+    #[test]
+    fn random_renders_digit() {
+        let e = expand("$RANDOM", &PlaceholderContext::default());
+        // Defaults to digits — must parse as a non-negative int.
+        let n: u64 = e.text.parse().expect("RANDOM should be numeric");
+        let _ = n;
+    }
+
+    #[test]
+    fn uuid_is_36_chars() {
+        let e = expand("$UUID", &PlaceholderContext::default());
+        assert_eq!(e.text.len(), 36, "uuid v4 hyphenated form is 36 chars");
+        assert_eq!(e.text.chars().filter(|c| *c == '-').count(), 4);
+    }
+
+    #[test]
+    fn body_without_placeholders_unchanged() {
+        let body = "this body has no placeholders, just text.";
+        let e = expand(body, &PlaceholderContext::default());
+        assert_eq!(e.text, body);
+        assert!(e.unfilled_stops.is_empty());
+        assert!(e.final_cursor.is_none());
+    }
 }

@@ -109,3 +109,98 @@ impl AppState {
         *self.commit_char.lock() = c;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starts_disarmed() {
+        let s = AppState::new();
+        assert!(!s.is_armed(), "§10.1 — app starts disarmed every launch");
+    }
+
+    #[test]
+    fn toggle_armed_returns_new_state() {
+        let s = AppState::new();
+        assert!(s.toggle_armed());
+        assert!(s.is_armed());
+        assert!(!s.toggle_armed());
+        assert!(!s.is_armed());
+    }
+
+    #[test]
+    fn begin_and_end_playback_track_state() {
+        let s = AppState::new();
+        assert!(!s.is_playing());
+        let cancel = s.begin_playback();
+        assert!(s.is_playing());
+        assert!(!cancel.load(Ordering::Relaxed));
+        s.end_playback();
+        assert!(!s.is_playing());
+    }
+
+    #[test]
+    fn cancel_playback_sets_flag() {
+        let s = AppState::new();
+        let cancel = s.begin_playback();
+        s.cancel_playback();
+        assert!(cancel.load(Ordering::Relaxed));
+        s.end_playback();
+        // end_playback resets cancel flag too
+        assert!(!cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn panic_ring_fires_on_three_fast_keys() {
+        // §2.6 — three keystrokes within 600ms cancel the playback.
+        let s = AppState::new();
+        s.begin_playback();
+        let t0 = Instant::now();
+        assert!(!s.record_cancel_keystroke(t0));
+        assert!(!s.record_cancel_keystroke(t0 + Duration::from_millis(100)));
+        assert!(s.record_cancel_keystroke(t0 + Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn panic_ring_does_not_fire_when_keys_are_spread() {
+        let s = AppState::new();
+        s.begin_playback();
+        let t0 = Instant::now();
+        assert!(!s.record_cancel_keystroke(t0));
+        // 700ms is wider than the 600ms PANIC_WINDOW, so the oldest entry
+        // will be > window away from the newest.
+        assert!(!s.record_cancel_keystroke(t0 + Duration::from_millis(400)));
+        assert!(!s.record_cancel_keystroke(t0 + Duration::from_millis(800)));
+    }
+
+    #[test]
+    fn panic_ring_resets_on_begin_playback() {
+        let s = AppState::new();
+        s.begin_playback();
+        let t0 = Instant::now();
+        s.record_cancel_keystroke(t0);
+        s.record_cancel_keystroke(t0 + Duration::from_millis(50));
+        s.end_playback();
+        s.begin_playback();
+        // Ring is fresh after the new begin; first key should not trigger.
+        assert!(!s.record_cancel_keystroke(t0 + Duration::from_millis(60)));
+    }
+
+    #[test]
+    fn commit_char_default_and_override() {
+        let s = AppState::new();
+        assert_eq!(s.commit_char(), '>');
+        s.set_commit_char('!');
+        assert_eq!(s.commit_char(), '!');
+    }
+
+    #[test]
+    fn shared_returns_arc() {
+        let a = AppState::shared();
+        let b = a.clone();
+        a.set_armed(true);
+        // Both Arc clones see the same state.
+        assert!(b.is_armed());
+    }
+}

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "picker",
+  "description": "Picker window — search + select. No file system, no dragging, no devtools in release.",
+  "windows": ["picker"],
+  "permissions": []
+}

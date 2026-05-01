@@ -52,7 +52,7 @@
 
   function estimateSeconds(p: Prompt): number {
     const words = p.body.trim().split(/\s+/).filter((w) => w.length).length;
-    return Math.max(1, Math.round((words / profileWpm(p.typing_profile)) * 60));
+    return Math.max(1, Math.round((words / profileWpm(p.typing_profile ?? "sales-engineer")) * 60));
   }
 
   async function ensureSelectedVisible() {
@@ -221,7 +221,7 @@
             </span>
             <span class="row-right">
               {#if !p.enabled}<span class="badge off">off</span>{/if}
-              <span class="badge profile">{profileShort(p.typing_profile)}</span>
+              <span class="badge profile">{profileShort(p.typing_profile ?? "sales-engineer")}</span>
               <span class="badge time">~{estimateSeconds(p)}s</span>
               {#if p.triggers.length}
                 <code class="trigger">{p.triggers[0]}{p.commit_char}</code>

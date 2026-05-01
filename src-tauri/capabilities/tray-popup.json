@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tray-popup",
+  "description": "Tray popover — armed toggle, top prompts, navigation. Needs setSize for content-fit.",
+  "windows": ["tray-popup"],
+  "permissions": [
+    "core:window:allow-set-size"
+  ]
+}

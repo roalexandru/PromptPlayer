@@ -30,9 +30,21 @@
   }
   let estSeconds = $derived(
     draft
-      ? Math.round((wordCount / profileWpm(draft.typing_profile)) * 60 + 1.0)
+      ? Math.round((wordCount / profileWpm(draft.typing_profile ?? "sales-engineer")) * 60 + 1.0)
       : 0,
   );
+
+  // Frontmatter fields are optional in the on-disk form; the parser fills in
+  // defaults but the generated TS contract reflects the optional shape. Use
+  // these helpers everywhere we touch optional fields.
+  const EMPTY_OVERRIDES = {} as NonNullable<Prompt["typing_overrides"]>;
+  function tov(p: Prompt | null) {
+    return p?.typing_overrides ?? EMPTY_OVERRIDES;
+  }
+  function ensureTov(p: Prompt) {
+    if (!p.typing_overrides) p.typing_overrides = { ...EMPTY_OVERRIDES };
+    return p.typing_overrides;
+  }
 
   async function refresh() {
     try {
@@ -373,7 +385,7 @@
                 <label for="tags">Tags</label>
                 <input
                   id="tags"
-                  value={listToString(draft.tags)}
+                  value={listToString(draft.tags ?? [])}
                   oninput={(e) => {
                     if (!draft) return;
                     draft.tags = stringToList((e.target as HTMLInputElement).value);
@@ -409,11 +421,11 @@
                     id="iki"
                     type="number"
                     placeholder="140"
-                    value={draft.typing_overrides["iki-median-ms"] ?? ""}
+                    value={tov(draft)["iki-median-ms"] ?? ""}
                     oninput={(e) => {
                       if (!draft) return;
                       const v = (e.target as HTMLInputElement).value;
-                      draft.typing_overrides["iki-median-ms"] =
+                      ensureTov(draft)["iki-median-ms"] =
                         v === "" ? null : Number(v);
                       markDirty();
                     }}
@@ -427,11 +439,11 @@
                     type="number"
                     step="0.001"
                     placeholder="0.011"
-                    value={draft.typing_overrides["typo-rate"] ?? ""}
+                    value={tov(draft)["typo-rate"] ?? ""}
                     oninput={(e) => {
                       if (!draft) return;
                       const v = (e.target as HTMLInputElement).value;
-                      draft.typing_overrides["typo-rate"] =
+                      ensureTov(draft)["typo-rate"] =
                         v === "" ? null : Number(v);
                       markDirty();
                     }}
@@ -445,11 +457,11 @@
                     type="number"
                     step="0.1"
                     placeholder="1.0"
-                    value={draft.typing_overrides["pause-variance-scale"] ?? ""}
+                    value={tov(draft)["pause-variance-scale"] ?? ""}
                     oninput={(e) => {
                       if (!draft) return;
                       const v = (e.target as HTMLInputElement).value;
-                      draft.typing_overrides["pause-variance-scale"] =
+                      ensureTov(draft)["pause-variance-scale"] =
                         v === "" ? null : Number(v);
                       markDirty();
                     }}
@@ -460,10 +472,10 @@
                   <label>
                     <input
                       type="checkbox"
-                      checked={draft.typing_overrides["typos-enabled"] !== false}
+                      checked={tov(draft)["typos-enabled"] !== false}
                       onchange={(e) => {
                         if (!draft) return;
-                        draft.typing_overrides["typos-enabled"] =
+                        ensureTov(draft)["typos-enabled"] =
                           (e.target as HTMLInputElement).checked;
                         markDirty();
                       }}
@@ -473,10 +485,10 @@
                   <label>
                     <input
                       type="checkbox"
-                      checked={draft.typing_overrides["burst-enabled"] !== false}
+                      checked={tov(draft)["burst-enabled"] !== false}
                       onchange={(e) => {
                         if (!draft) return;
-                        draft.typing_overrides["burst-enabled"] =
+                        ensureTov(draft)["burst-enabled"] =
                           (e.target as HTMLInputElement).checked;
                         markDirty();
                       }}
@@ -486,10 +498,10 @@
                   <label>
                     <input
                       type="checkbox"
-                      checked={draft.typing_overrides["pre-submit-pause-enabled"] !== false}
+                      checked={tov(draft)["pre-submit-pause-enabled"] !== false}
                       onchange={(e) => {
                         if (!draft) return;
-                        draft.typing_overrides["pre-submit-pause-enabled"] =
+                        ensureTov(draft)["pre-submit-pause-enabled"] =
                           (e.target as HTMLInputElement).checked;
                         markDirty();
                       }}
@@ -499,10 +511,10 @@
                   <label>
                     <input
                       type="checkbox"
-                      checked={!!draft.typing_overrides["send-final-enter"]}
+                      checked={!!tov(draft)["send-final-enter"]}
                       onchange={(e) => {
                         if (!draft) return;
-                        draft.typing_overrides["send-final-enter"] =
+                        ensureTov(draft)["send-final-enter"] =
                           (e.target as HTMLInputElement).checked;
                         markDirty();
                       }}

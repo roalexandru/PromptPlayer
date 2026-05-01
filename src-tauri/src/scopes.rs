@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One scope filter from §4.2: app(s), window-title regex, url regex, time-of-day.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "kebab-case", default)]
 pub struct ScopeFilter {
     pub app: Vec<String>,
@@ -40,47 +40,12 @@ pub fn capture_foreground_context() -> ForegroundContext {
 
 #[cfg(target_os = "macos")]
 fn capture_macos() -> ForegroundContext {
-    use cocoa::base::{id, nil};
-    use objc::{class, msg_send, sel, sel_impl};
-    unsafe {
-        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let app: id = msg_send![workspace, frontmostApplication];
-        if app == nil {
-            return ForegroundContext::default();
-        }
-        let bundle: id = msg_send![app, bundleIdentifier];
-        let bundle_id = if bundle != nil {
-            let utf8: *const std::os::raw::c_char = msg_send![bundle, UTF8String];
-            if !utf8.is_null() {
-                Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let exe: id = msg_send![app, executableURL];
-        let executable = if exe != nil {
-            let path: id = msg_send![exe, path];
-            if path != nil {
-                let utf8: *const std::os::raw::c_char = msg_send![path, UTF8String];
-                if !utf8.is_null() {
-                    Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        ForegroundContext {
-            bundle_id,
-            executable,
-            window_title: None, // requires AXUIElement — Phase 13
-            url: None,          // browser URL via AppleScript — Phase 8 territory
-        }
+    let snap = crate::platform::macos::nsworkspace::frontmost_app();
+    ForegroundContext {
+        bundle_id: snap.bundle_id,
+        executable: snap.executable_path,
+        window_title: None, // requires AXUIElement — Phase 13
+        url: None,          // browser URL via AppleScript — Phase 8 territory
     }
 }
 

@@ -69,10 +69,12 @@ const KCG_EVENT_SOURCE_UNIX_PROCESS_ID: u32 = 41;
 pub type Decision = Option<()>;
 
 /// Per-event callback invoked from the tap thread. Returns Pass or Suppress.
-pub type EventHandler = Arc<dyn Fn(KeyEvent) -> Decision + Send + Sync>;
+pub type EventHandler = Arc<dyn Fn(NativeKeyEvent) -> Decision + Send + Sync>;
 
+/// Native macOS key event before translation into the cross-platform
+/// `crate::hook::KeyEvent`.
 #[derive(Debug, Clone)]
-pub struct KeyEvent {
+pub struct NativeKeyEvent {
     pub keycode: u16,
     pub typed: Option<char>,
     pub is_backspace: bool,
@@ -188,7 +190,7 @@ extern "C" fn tap_callback(
         is_backspace
     );
 
-    let evt = KeyEvent {
+    let evt = NativeKeyEvent {
         keycode,
         typed,
         is_backspace,

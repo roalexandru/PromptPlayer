@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities granted to all windows",
+  "description": "Baseline capabilities every window inherits",
   "windows": ["library", "picker", "settings", "tray-popup"],
   "permissions": [
     "core:default",
@@ -10,15 +10,10 @@
     "core:window:allow-hide",
     "core:window:allow-set-focus",
     "core:window:allow-close",
-    "core:window:allow-start-dragging",
-    "core:window:allow-minimize",
-    "core:window:allow-toggle-maximize",
-    "core:window:allow-set-size",
     "core:webview:default",
-    "core:webview:allow-internal-toggle-devtools",
     "global-shortcut:default",
-    "fs:default",
     "dialog:default",
-    "autostart:default"
+    "autostart:default",
+    "aptabase:allow-track-event"
   ]
 }

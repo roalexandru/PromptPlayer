@@ -59,54 +59,19 @@ pub const RESTORATION_DELAY: Duration = Duration::from_millis(150);
 
 #[cfg(target_os = "macos")]
 fn capture_foreground() -> ForegroundSnapshot {
-    use cocoa::base::{id, nil};
-    use cocoa::foundation::NSString;
-    use objc::{class, msg_send, sel, sel_impl};
-    unsafe {
-        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let app: id = msg_send![workspace, frontmostApplication];
-        if app == nil {
-            return ForegroundSnapshot::default();
-        }
-        let bundle: id = msg_send![app, bundleIdentifier];
-        let pid: i32 = msg_send![app, processIdentifier];
-        let bundle_id = if bundle != nil {
-            let utf8: *const std::os::raw::c_char = msg_send![bundle, UTF8String];
-            if !utf8.is_null() {
-                Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        ForegroundSnapshot {
-            bundle_id,
-            executable: None,
-            window_title: None,
-            captured_at: Some(Instant::now()),
-            handle: Some(pid as u64),
-        }
+    let snap = crate::platform::macos::nsworkspace::frontmost_app();
+    ForegroundSnapshot {
+        bundle_id: snap.bundle_id,
+        executable: snap.executable_path.clone(),
+        window_title: None,
+        captured_at: Some(Instant::now()),
+        handle: snap.pid.map(|p| p as u64),
     }
 }
 
 #[cfg(target_os = "macos")]
 fn restore_to(pid: u64) -> bool {
-    use cocoa::base::{id, nil, BOOL, YES};
-    use objc::{class, msg_send, sel, sel_impl};
-    unsafe {
-        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let app: id =
-            msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid as i32];
-        if app == nil {
-            return false;
-        }
-        // Activation options: NSApplicationActivateIgnoringOtherApps = 1<<1
-        let opts: u64 = 1 << 1;
-        let res: BOOL = msg_send![app, activateWithOptions: opts];
-        let _ = workspace;
-        res == YES
-    }
+    crate::platform::macos::nsworkspace::activate_pid(pid as i32)
 }
 
 #[cfg(target_os = "windows")]

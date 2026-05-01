@@ -11,7 +11,6 @@ default-run = "prompt-player"
 [lib]
 name = "prompt_player"
 path = "src/lib.rs"
-crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
 name = "prompt-player"
@@ -44,9 +43,11 @@ rand_chacha = { workspace = true }
 
 # keystroke synthesis
 enigo = "0.2"
-# keyboard listening with suppression — using rdev as cross-platform fallback,
-# with native CGEventTap / SetWindowsHookEx behind platform modules
-rdev = { version = "0.5", features = ["unstable_grab"] }
+# keyboard listening — Windows uses rdev (SetWindowsHookEx wrapper);
+# macOS uses a native CGEventTap impl in `hook/macos.rs`.
+# rdev's macOS path SIGTRAPs on newer macOS (TSM thread assertion), and the
+# `unstable_grab` feature pulls in TSM-touching code paths, so we never want
+# rdev compiled on Mac builds.
 
 # expressions sandbox
 boa_engine = "0.19"
@@ -57,6 +58,11 @@ nucleo-matcher = "0.3"
 # telemetry
 tauri-plugin-aptabase = "1"
 sysinfo = "0.31"
+
+# Rust↔TS type contract (generates `src/lib/ipc.gen.ts` from `#[specta::Type]`).
+specta = { version = "=2.0.0-rc.20", features = ["derive"] }
+specta-typescript = "=0.0.7"
+tauri-specta = { version = "=2.0.0-rc.20", features = ["derive", "typescript"] }
 
 # markdown
 pulldown-cmark = "0.12"
@@ -79,25 +85,53 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 crossbeam-channel = "0.5"
+sys-locale = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"
 core-foundation = "0.10"
+# Legacy objc/cocoa stack — used by some existing call sites; new code in
+# `platform/macos/` uses objc2 instead. Both can coexist and we migrate
+# module-by-module.
 cocoa = "0.26"
 objc = "0.2"
 block = "0.1"
+# Modern objc2 ecosystem (type-safe Obj-C bindings, no msg_send! macro).
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = [
+    "NSString",
+    "NSGeometry",
+    "NSArray",
+    "NSEnumerator",
+    "NSValue",
+    "NSURL",
+] }
+objc2-app-kit = { version = "0.2", features = [
+    "NSWindow",
+    "NSPanel",
+    "NSEvent",
+    "NSScreen",
+    "NSApplication",
+    "NSWorkspace",
+    "NSRunningApplication",
+    "NSResponder",
+    "NSView",
+    "NSGraphics",
+    "libc",
+] }
+block2 = "0.5"
 window-vibrancy = "0.5"
 
-[target.'cfg(target_os = "windows")'.dependencies.windows]
-version = "0.58"
-features = [
+[target.'cfg(target_os = "windows")'.dependencies]
+rdev = { version = "0.5", features = ["unstable_grab"] }
+windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
     "Win32_Graphics_Gdi",
-]
+] }
 
 [features]
 default = ["custom-protocol"]

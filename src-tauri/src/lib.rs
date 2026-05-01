@@ -10,14 +10,20 @@ pub mod inject;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod hook;
 
-pub mod matcher;
-pub mod prompts;
-pub mod scopes;
+pub mod app;
+pub mod commands;
+pub mod error;
 pub mod filters;
+pub mod hotkey;
+pub mod matcher;
+pub mod platform;
+pub mod prompts;
 pub mod rdp;
+pub mod scopes;
+pub mod state;
+pub mod store;
 pub mod telemetry;
 pub mod undo;
-pub mod state;
 
 #[cfg(target_os = "macos")]
 pub mod secure_input;
@@ -26,4 +32,3 @@ pub mod secure_input;
 pub mod tcc;
 
 pub mod picker;
-pub mod ipc;

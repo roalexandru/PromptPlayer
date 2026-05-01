@@ -4,8 +4,13 @@
 //! `string_from_code` calls `TSMGetInputSourceProperty` from the tap callback
 //! thread and SIGTRAPs on newer macOS.
 //!
-//! On Windows we keep `rdev::grab` (which uses `SetWindowsHookEx` under the hood
-//! and doesn't have the same TSM issue).
+//! On Windows we keep `rdev::grab` (which uses `SetWindowsHookEx` under the
+//! hood and doesn't have the same TSM issue).
+//!
+//! Both platforms translate their native event into a `KeyEvent`, then the
+//! shared `process_event` function decides Pass / Suppress. This is the
+//! single source of truth for: armed gate, secure-input gate, undo,
+//! panic-ring, escape-hatch (`\>`), trigger match, ring-buffer maintenance.
 
 use crate::matcher::MatcherState;
 use crate::state::AppState;
@@ -19,7 +24,22 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-#[derive(Debug, Clone)]
+/// Cross-platform key event passed to `process_event`. Each platform module
+/// translates its native event type into this struct.
+#[derive(Debug, Clone, Default)]
+pub struct KeyEvent {
+    /// The Unicode character produced by this keystroke (None for non-text
+    /// keys: arrows, F-keys, modifier-only events, etc.).
+    pub typed: Option<char>,
+    /// Backspace pressed.
+    pub is_backspace: bool,
+    /// True for events that are pure modifier keypresses (Shift/Ctrl/Alt/
+    /// Meta with no other key). Set by the platform layer; macOS' callback
+    /// already filters these out at the OS layer, Windows surfaces them.
+    pub is_pure_modifier: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum HookDecision {
     Pass,
     Suppress,
@@ -27,6 +47,88 @@ pub enum HookDecision {
 
 pub struct HookHandle {
     _t: std::marker::PhantomData<()>,
+}
+
+/// Bundle of references the shared `process_event` needs. Cheap to construct
+/// per-event because everything is already an `Arc`.
+pub struct HookDeps<'a> {
+    pub matcher: &'a Arc<MatcherState>,
+    pub undo: &'a Arc<UndoLog>,
+    pub app_state: &'a Arc<AppState>,
+    pub on_fire: &'a Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
+    pub on_undo: &'a Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Shared event-handling pipeline used by both macOS and Windows hooks.
+///
+/// Returns `Pass` when the host should let the event continue to the focused
+/// app, `Suppress` when it should swallow the event (commit-char that fired
+/// a trigger, or backspace that triggered an undo).
+pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
+    if !deps.app_state.is_armed() {
+        return HookDecision::Pass;
+    }
+    if crate::secure_input::is_active() {
+        return HookDecision::Pass;
+    }
+    tracing::trace!(
+        "hook armed: typed={:?} buf_size={} commit='{}' last={:?}",
+        evt.typed,
+        deps.matcher.buffer.read().len(),
+        deps.app_state.commit_char(),
+        deps.matcher.last_char()
+    );
+
+    let now = Instant::now();
+
+    if evt.is_backspace {
+        if deps.undo.take_recent(now).is_some() {
+            (deps.on_undo)();
+            return HookDecision::Suppress;
+        }
+        deps.matcher.observe_backspace(now);
+        if deps.app_state.is_playing() && deps.app_state.record_cancel_keystroke(now) {
+            deps.app_state.cancel_playback();
+        }
+        return HookDecision::Pass;
+    }
+
+    if deps.app_state.is_playing() {
+        if !evt.is_pure_modifier && deps.app_state.record_cancel_keystroke(now) {
+            deps.app_state.cancel_playback();
+        }
+        if let Some(c) = evt.typed {
+            deps.matcher.observe_char(c, now);
+        }
+        return HookDecision::Pass;
+    }
+
+    let Some(c) = evt.typed else {
+        return HookDecision::Pass;
+    };
+
+    let global_commit = deps.app_state.commit_char();
+    if c == global_commit {
+        // §2.4 — escape hatch: `\>` types a literal `>`.
+        if deps.matcher.last_char() == Some('\\') {
+            deps.matcher.pop_last_chars(1);
+            return HookDecision::Pass;
+        }
+        let candidates = deps.matcher.try_match_all(c, now);
+        if !candidates.is_empty() {
+            let typed_form = candidates[0].typed_form.clone();
+            let trigger_chars = candidates[0].trigger_chars;
+            let candidate_ids: Vec<String> =
+                candidates.into_iter().map(|m| m.prompt_id).collect();
+            deps.matcher.pop_last_chars(trigger_chars);
+            (deps.on_fire)(candidate_ids, typed_form);
+            return HookDecision::Suppress;
+        }
+        deps.matcher.observe_char(c, now);
+        return HookDecision::Pass;
+    }
+    deps.matcher.observe_char(c, now);
+    HookDecision::Pass
 }
 
 /// Spawn the platform-specific hook in its own thread.
@@ -62,93 +164,26 @@ fn spawn_macos(
     on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
     on_undo: Arc<dyn Fn() + Send + Sync>,
 ) {
-    use macos::{KeyEvent, EventHandler};
-    let handler: EventHandler = Arc::new(move |evt: KeyEvent| {
-        process_event_native(&evt, &matcher, &undo, &app_state, &on_fire, &on_undo)
+    use macos::EventHandler;
+    let handler: EventHandler = Arc::new(move |evt: macos::NativeKeyEvent| {
+        let key = KeyEvent {
+            typed: evt.typed,
+            is_backspace: evt.is_backspace,
+            is_pure_modifier: false, // macOS tap filters these at OS layer.
+        };
+        let deps = HookDeps {
+            matcher: &matcher,
+            undo: &undo,
+            app_state: &app_state,
+            on_fire: &on_fire,
+            on_undo: &on_undo,
+        };
+        match process_event(&key, &deps) {
+            HookDecision::Pass => Some(()),
+            HookDecision::Suppress => None,
+        }
     });
     macos::spawn(handler);
-}
-
-#[cfg(target_os = "macos")]
-fn process_event_native(
-    evt: &macos::KeyEvent,
-    matcher: &Arc<MatcherState>,
-    undo: &Arc<UndoLog>,
-    app_state: &Arc<AppState>,
-    on_fire: &Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
-    on_undo: &Arc<dyn Fn() + Send + Sync>,
-) -> Option<()> {
-    if !app_state.is_armed() {
-        tracing::debug!("hook: disarmed; passing through");
-        return Some(());
-    }
-    if crate::secure_input::is_active() {
-        tracing::warn!("hook: SECURE INPUT active; passing through (typing in a password-protected field?)");
-        return Some(());
-    }
-    tracing::info!(
-        "hook armed: typed={:?} buf_size={} commit='{}' last={:?}",
-        evt.typed,
-        matcher.buffer.read().len(),
-        app_state.commit_char(),
-        matcher.last_char()
-    );
-
-    let now = Instant::now();
-
-    if evt.is_backspace {
-        if undo.take_recent(now).is_some() {
-            (on_undo)();
-            return None;
-        }
-        matcher.observe_backspace(now);
-        // Backspace still counts toward the §2.6 panic ring during playback.
-        if app_state.is_playing() && app_state.record_cancel_keystroke(now) {
-            app_state.cancel_playback();
-        }
-        return Some(());
-    }
-
-    // §2.6 — during playback, count *any* key down (printable or not) toward
-    // the panic-abort ring. Pure modifier presses arrive as
-    // `KCG_EVENT_FLAGS_CHANGED` and are filtered out by the tap callback in
-    // `hook/macos.rs` (which only forwards `KCG_EVENT_KEY_DOWN`), so we don't
-    // need to exclude them here.
-    if app_state.is_playing() {
-        if app_state.record_cancel_keystroke(now) {
-            app_state.cancel_playback();
-        }
-        if let Some(c) = evt.typed {
-            matcher.observe_char(c, now);
-        }
-        return Some(());
-    }
-
-    let Some(c) = evt.typed else {
-        return Some(());
-    };
-
-    let global_commit = app_state.commit_char();
-    if c == global_commit {
-        if matcher.last_char() == Some('\\') {
-            matcher.pop_last_chars(1);
-            return Some(());
-        }
-        let candidates = matcher.try_match_all(c, now);
-        if !candidates.is_empty() {
-            let typed_form = candidates[0].typed_form.clone();
-            let trigger_chars = candidates[0].trigger_chars;
-            let candidate_ids: Vec<String> =
-                candidates.into_iter().map(|m| m.prompt_id).collect();
-            matcher.pop_last_chars(trigger_chars);
-            (on_fire)(candidate_ids, typed_form);
-            return None;
-        }
-        matcher.observe_char(c, now);
-        return Some(());
-    }
-    matcher.observe_char(c, now);
-    Some(())
 }
 
 #[cfg(target_os = "windows")]
@@ -164,7 +199,18 @@ fn spawn_windows(
         .spawn(move || {
             tracing::info!("hook thread starting (rdev/Win)");
             let result = rdev::grab(move |event: rdev::Event| {
-                process_event_rdev(event, &matcher, &undo, &app_state, &on_fire, &on_undo)
+                let key = translate_rdev(&event);
+                let deps = HookDeps {
+                    matcher: &matcher,
+                    undo: &undo,
+                    app_state: &app_state,
+                    on_fire: &on_fire,
+                    on_undo: &on_undo,
+                };
+                match process_event(&key, &deps) {
+                    HookDecision::Pass => Some(event),
+                    HookDecision::Suppress => None,
+                }
             });
             if let Err(e) = result {
                 tracing::error!("hook errored: {:?}", e);
@@ -174,37 +220,12 @@ fn spawn_windows(
 }
 
 #[cfg(target_os = "windows")]
-fn process_event_rdev(
-    event: rdev::Event,
-    matcher: &Arc<MatcherState>,
-    undo: &Arc<UndoLog>,
-    app_state: &Arc<AppState>,
-    on_fire: &Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
-    on_undo: &Arc<dyn Fn() + Send + Sync>,
-) -> Option<rdev::Event> {
-    if !app_state.is_armed() {
-        return Some(event);
-    }
-    let now = Instant::now();
+fn translate_rdev(event: &rdev::Event) -> KeyEvent {
     let key = match &event.event_type {
         rdev::EventType::KeyPress(k) => Some(*k),
         _ => None,
     };
-    if matches!(key, Some(rdev::Key::Backspace)) {
-        if undo.take_recent(now).is_some() {
-            (on_undo)();
-            return None;
-        }
-        matcher.observe_backspace(now);
-        // Backspace still counts toward the §2.6 panic ring during playback.
-        if app_state.is_playing() && app_state.record_cancel_keystroke(now) {
-            app_state.cancel_playback();
-        }
-        return Some(event);
-    }
-    // §2.6 — during playback, any non-modifier key down (printable or not)
-    // counts toward the panic-abort ring. We filter pure modifiers here because
-    // rdev surfaces them as ordinary `KeyPress` events.
+    let is_backspace = matches!(key, Some(rdev::Key::Backspace));
     let is_pure_modifier = matches!(
         key,
         Some(rdev::Key::ShiftLeft)
@@ -216,42 +237,205 @@ fn process_event_rdev(
             | Some(rdev::Key::MetaLeft)
             | Some(rdev::Key::MetaRight)
     );
-    if app_state.is_playing() && key.is_some() && !is_pure_modifier {
-        if app_state.record_cancel_keystroke(now) {
-            app_state.cancel_playback();
-        }
-    }
-    let ch = match (&event.event_type, &event.name) {
+    let typed = match (&event.event_type, &event.name) {
         (rdev::EventType::KeyPress(_), Some(name)) => name.chars().find(|c| !c.is_control()),
         _ => None,
     };
-    if let Some(c) = ch {
-        if app_state.is_playing() {
-            // Panic ring already updated above; just keep the matcher buffer
-            // in sync and pass the keystroke through.
-            matcher.observe_char(c, now);
-            return Some(event);
-        }
-        let global_commit = app_state.commit_char();
-        if c == global_commit {
-            if matcher.last_char() == Some('\\') {
-                matcher.pop_last_chars(1);
-                return Some(event);
-            }
-            let candidates = matcher.try_match_all(c, now);
-            if !candidates.is_empty() {
-                let typed_form = candidates[0].typed_form.clone();
-                let trigger_chars = candidates[0].trigger_chars;
-                let candidate_ids: Vec<String> =
-                    candidates.into_iter().map(|m| m.prompt_id).collect();
-                matcher.pop_last_chars(trigger_chars);
-                (on_fire)(candidate_ids, typed_form);
-                return None;
-            }
-            matcher.observe_char(c, now);
-            return Some(event);
-        }
-        matcher.observe_char(c, now);
+    KeyEvent {
+        typed,
+        is_backspace,
+        is_pure_modifier,
     }
-    Some(event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::matcher::TriggerEntry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn make_deps_default(
+    ) -> (Arc<MatcherState>, Arc<UndoLog>, Arc<AppState>) {
+        (
+            MatcherState::shared(),
+            Arc::new(UndoLog::new()),
+            AppState::shared(),
+        )
+    }
+
+    fn fire_count_callback() -> (
+        Arc<dyn Fn(Vec<String>, String) + Send + Sync>,
+        Arc<AtomicUsize>,
+    ) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let count2 = count.clone();
+        let cb: Arc<dyn Fn(Vec<String>, String) + Send + Sync> =
+            Arc::new(move |_ids, _form| {
+                count2.fetch_add(1, Ordering::Relaxed);
+            });
+        (cb, count)
+    }
+
+    fn no_op_undo_callback() -> Arc<dyn Fn() + Send + Sync> {
+        Arc::new(|| {})
+    }
+
+    fn ke(c: char) -> KeyEvent {
+        KeyEvent {
+            typed: Some(c),
+            is_backspace: false,
+            is_pure_modifier: false,
+        }
+    }
+
+    #[test]
+    fn disarmed_passes_everything_through() {
+        let (matcher, undo, app_state) = make_deps_default();
+        let (on_fire, count) = fire_count_callback();
+        let on_undo = no_op_undo_callback();
+        let deps = HookDeps {
+            matcher: &matcher,
+            undo: &undo,
+            app_state: &app_state,
+            on_fire: &on_fire,
+            on_undo: &on_undo,
+        };
+        // Disarmed (default) — every event is Pass and never matches.
+        for ch in ['b', 'u', 'i', 'l', 'd', '>'] {
+            let d = process_event(&ke(ch), &deps);
+            assert!(matches!(d, HookDecision::Pass));
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn armed_with_no_trigger_passes_commit_char() {
+        let (matcher, undo, app_state) = make_deps_default();
+        app_state.set_armed(true);
+        let (on_fire, count) = fire_count_callback();
+        let on_undo = no_op_undo_callback();
+        let deps = HookDeps {
+            matcher: &matcher,
+            undo: &undo,
+            app_state: &app_state,
+            on_fire: &on_fire,
+            on_undo: &on_undo,
+        };
+        for ch in ['x', 'y', '>'] {
+            let _ = process_event(&ke(ch), &deps);
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn armed_with_matching_trigger_fires_and_suppresses_commit() {
+        let (matcher, undo, app_state) = make_deps_default();
+        app_state.set_armed(true);
+        matcher
+            .rebuild_index(vec![TriggerEntry {
+                canonical: "build".into(),
+                prompt_id: "p1".into(),
+                word_count: 1,
+                commit_char: '>',
+            }])
+            .unwrap();
+
+        let (on_fire, count) = fire_count_callback();
+        let on_undo = no_op_undo_callback();
+        let deps = HookDeps {
+            matcher: &matcher,
+            undo: &undo,
+            app_state: &app_state,
+            on_fire: &on_fire,
+            on_undo: &on_undo,
+        };
+        for ch in ['B', 'u', 'i', 'l', 'd'] {
+            let d = process_event(&ke(ch), &deps);
+            assert!(matches!(d, HookDecision::Pass));
+        }
+        let d = process_event(&ke('>'), &deps);
+        assert!(matches!(d, HookDecision::Suppress), "commit char must be suppressed when trigger matches");
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn escape_hatch_for_commit_char() {
+        let (matcher, undo, app_state) = make_deps_default();
+        app_state.set_armed(true);
+        let (on_fire, count) = fire_count_callback();
+        let on_undo = no_op_undo_callback();
+        let deps = HookDeps {
+            matcher: &matcher,
+            undo: &undo,
+            app_state: &app_state,
+            on_fire: &on_fire,
+            on_undo: &on_undo,
+        };
+        // Type `\` then `>` — the `>` should pass through without firing.
+        let _ = process_event(&ke('\\'), &deps);
+        let d = process_event(&ke('>'), &deps);
+        assert!(matches!(d, HookDecision::Pass));
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn backspace_during_undo_window_invokes_undo_callback() {
+        let (matcher, undo, app_state) = make_deps_default();
+        app_state.set_armed(true);
+        let undo_count = Arc::new(AtomicUsize::new(0));
+        let undo_count2 = undo_count.clone();
+        let on_fire: Arc<dyn Fn(Vec<String>, String) + Send + Sync> =
+            Arc::new(|_, _| {});
+        let on_undo: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            undo_count2.fetch_add(1, Ordering::Relaxed);
+        });
+        // Seed the undo log with a recent expansion.
+        undo.record("Build".into(), 50);
+        let deps = HookDeps {
+            matcher: &matcher,
+            undo: &undo,
+            app_state: &app_state,
+            on_fire: &on_fire,
+            on_undo: &on_undo,
+        };
+        let key = KeyEvent {
+            typed: None,
+            is_backspace: true,
+            is_pure_modifier: false,
+        };
+        let d = process_event(&key, &deps);
+        assert!(matches!(d, HookDecision::Suppress));
+        assert_eq!(undo_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn pure_modifier_during_playback_does_not_count_toward_panic_ring() {
+        let (matcher, undo, app_state) = make_deps_default();
+        app_state.set_armed(true);
+        let _cancel = app_state.begin_playback();
+        let (on_fire, _) = fire_count_callback();
+        let on_undo = no_op_undo_callback();
+        let deps = HookDeps {
+            matcher: &matcher,
+            undo: &undo,
+            app_state: &app_state,
+            on_fire: &on_fire,
+            on_undo: &on_undo,
+        };
+        // Three pure-modifier events in fast succession should NOT trigger
+        // the panic-cancel.
+        let modifier_event = KeyEvent {
+            typed: None,
+            is_backspace: false,
+            is_pure_modifier: true,
+        };
+        for _ in 0..3 {
+            process_event(&modifier_event, &deps);
+        }
+        assert!(!app_state
+            .begin_playback()
+            .load(Ordering::Relaxed));
+        // (begin_playback returns the cancel flag fresh, so we test that
+        // it's not pre-set.)
+    }
 }

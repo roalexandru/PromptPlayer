@@ -5,7 +5,7 @@ use crate::prompts::Prompt;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
 pub struct SearchHit {
     pub prompt_id: String,
     pub score: u32,
@@ -18,6 +18,9 @@ pub struct SearchIndex {
     matcher: Matcher,
     /// Stable list of prompts in current order; rebuilt on hot-reload.
     haystacks: Vec<(String, String)>, // (id, haystack)
+    /// PromptStore generation we last built against. Used by
+    /// `rebuild_if_stale` to skip redundant rebuilds.
+    last_built_generation: u64,
 }
 
 impl SearchIndex {
@@ -25,7 +28,19 @@ impl SearchIndex {
         Self {
             matcher: Matcher::new(Config::DEFAULT),
             haystacks: Vec::new(),
+            last_built_generation: 0,
         }
+    }
+
+    /// Rebuild only if `current_generation` differs from the last build.
+    /// `current_generation` of 0 always rebuilds (guarantees first-build
+    /// works without bookkeeping).
+    pub fn rebuild_if_stale(&mut self, current_generation: u64, prompts: &[Prompt]) {
+        if current_generation != 0 && current_generation == self.last_built_generation {
+            return;
+        }
+        self.rebuild(prompts);
+        self.last_built_generation = current_generation;
     }
 
     pub fn rebuild(&mut self, prompts: &[Prompt]) {
@@ -142,5 +157,37 @@ mod tests {
         let hits = idx.query("refac", 5);
         assert!(!hits.is_empty());
         assert_eq!(hits[0].prompt_id, "bravo");
+    }
+
+    #[test]
+    fn rebuild_if_stale_is_idempotent_for_same_generation() {
+        let mut idx = SearchIndex::new();
+        let prompts = vec![p("alpha", "Alpha thing", "")];
+        idx.rebuild_if_stale(7, &prompts);
+        // Mutate the slice and call with same generation — must NOT re-pick
+        // up the new state, because we promised the index it's still gen 7.
+        let mutated = vec![p("zeta", "Zeta thing", "")];
+        idx.rebuild_if_stale(7, &mutated);
+        let hits = idx.query("zeta", 5);
+        assert!(hits.is_empty(), "stale rebuild must not pick up new prompts");
+    }
+
+    #[test]
+    fn rebuild_if_stale_picks_up_new_generation() {
+        let mut idx = SearchIndex::new();
+        idx.rebuild_if_stale(1, &[p("alpha", "Alpha", "")]);
+        idx.rebuild_if_stale(2, &[p("zeta", "Zeta", "")]);
+        let hits = idx.query("zeta", 5);
+        assert_eq!(hits.first().map(|h| h.prompt_id.as_str()), Some("zeta"));
+    }
+
+    #[test]
+    fn rebuild_if_stale_zero_always_rebuilds() {
+        // Generation 0 = "always rebuild" sentinel for safety.
+        let mut idx = SearchIndex::new();
+        idx.rebuild_if_stale(0, &[p("alpha", "Alpha", "")]);
+        idx.rebuild_if_stale(0, &[p("zeta", "Zeta", "")]);
+        let hits = idx.query("zeta", 5);
+        assert_eq!(hits.first().map(|h| h.prompt_id.as_str()), Some("zeta"));
     }
 }

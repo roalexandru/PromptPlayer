@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "library",
+  "description": "Library window — full prompt CRUD + filesystem access",
+  "windows": ["library"],
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:webview:allow-internal-toggle-devtools",
+    "fs:default"
+  ]
+}
