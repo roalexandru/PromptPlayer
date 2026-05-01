@@ -53,4 +53,5 @@ export const ipc = {
     invoke<void>("ipc_tray_open", { target: label }),
   trayQuit: () => invoke<void>("ipc_tray_quit"),
   trayPopupHide: () => invoke<void>("ipc_tray_popup_hide"),
+  pickerDismiss: () => invoke<void>("ipc_picker_dismiss"),
 };

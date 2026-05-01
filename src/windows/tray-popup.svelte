@@ -76,17 +76,82 @@
   }
   function clearHover() { hoverKey = null; }
 
+  let lastClientX = 0;
+  let lastClientY = 0;
+  let pollHandle: number | undefined;
+
+  function pickKeyAt(x: number, y: number): string | null {
+    const el = document.elementFromPoint(x, y);
+    const row = (el as HTMLElement | null)?.closest<HTMLElement>("[data-hkey]");
+    return row?.dataset.hkey ?? null;
+  }
+
+  function onAnyMouseMove(e: MouseEvent | PointerEvent) {
+    lastClientX = e.clientX;
+    lastClientY = e.clientY;
+    hoverKey = pickKeyAt(e.clientX, e.clientY);
+  }
+  function onLeaveDocument() { hoverKey = null; }
+
+  // Some WKWebView + NSPanel combos drop mouse-moved events. As a last
+  // resort, poll on rAF using the most recent known cursor position.
+  // Cheap (no allocation; one elementFromPoint per frame).
+  function startPoll() {
+    let prev: string | null = null;
+    const tick = () => {
+      const k = pickKeyAt(lastClientX, lastClientY);
+      if (k !== prev) {
+        prev = k;
+        hoverKey = k;
+      }
+      pollHandle = requestAnimationFrame(tick);
+    };
+    pollHandle = requestAnimationFrame(tick);
+  }
+
+  let unlistenMouseMove: UnlistenFn | null = null;
+
   onMount(async () => {
     await refresh();
     await fitWindow();
+    document.addEventListener("mousemove", onAnyMouseMove, true);
+    document.addEventListener("pointermove", onAnyMouseMove, true);
+    document.addEventListener("mouseover", onAnyMouseMove, true);
+    document.addEventListener("mouseleave", onLeaveDocument, true);
+    document.addEventListener("mouseout", (e) => {
+      if (!e.relatedTarget) onLeaveDocument();
+    }, true);
+    startPoll();
     unlisten = await listen("tray-popup-show", async () => {
       await refresh();
       await fitWindow();
     });
+    // Native bridge: macOS NSEvent monitor in Rust feeds us cursor positions
+    // (x, y in CSS px relative to the popover window) since WKWebView in a
+    // non-activating NSPanel drops mouse-moved events.
+    unlistenMouseMove = await listen<[number, number]>(
+      "tray-popup-mousemove",
+      (e) => {
+        const [x, y] = e.payload;
+        lastClientX = x;
+        lastClientY = y;
+        if (x < 0 || y < 0) {
+          hoverKey = null;
+          return;
+        }
+        hoverKey = pickKeyAt(x, y);
+      },
+    );
   });
 
   onDestroy(() => {
     unlisten?.();
+    unlistenMouseMove?.();
+    if (pollHandle !== undefined) cancelAnimationFrame(pollHandle);
+    document.removeEventListener("mousemove", onAnyMouseMove, true);
+    document.removeEventListener("pointermove", onAnyMouseMove, true);
+    document.removeEventListener("mouseover", onAnyMouseMove, true);
+    document.removeEventListener("mouseleave", onLeaveDocument, true);
   });
 
   $effect(() => {
@@ -331,10 +396,7 @@
       color: rgba(0, 0, 0, 0.88);
     }
     .row.hover:not(.disabled) {
-      background: rgba(0, 0, 0, 0.12);
-    }
-    .row:active:not(.disabled) {
-      background: rgba(0, 0, 0, 0.18);
+      background: rgba(0, 0, 0, 0.10);
     }
     .label.muted {
       color: rgba(0, 0, 0, 0.5);

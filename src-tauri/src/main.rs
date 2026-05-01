@@ -295,6 +295,7 @@ fn main() {
             ipc_picker_open,
             ipc_picker_search,
             ipc_picker_select,
+            ipc_picker_dismiss,
             ipc_set_prompt_enabled,
             ipc_tray_open,
             ipc_tray_quit,
@@ -369,13 +370,7 @@ fn main() {
                             Some(NSVisualEffectState::Active),
                             Some(12.0),
                         );
-                        // Same NSPanel + nonactivating treatment as the tray
-                        // popover so showing the picker does NOT activate the
-                        // Prompt Player app and steal focus from the app the
-                        // user was working in. The picker still becomes key
-                        // (so it can receive keystrokes), but the underlying
-                        // app remains the foreground app.
-                        configure_popover_window(&w);
+                        configure_picker_window(&w);
                     }
                     #[cfg(target_os = "macos")]
                     if label == "tray-popup" {
@@ -398,6 +393,14 @@ fn main() {
                         // overwritten.
                         configure_popover_window(&w);
                     }
+                    // Library + settings: make them space-neutral so when
+                    // we activate the app to summon the picker, macOS
+                    // doesn't switch the user's Space to wherever these
+                    // windows happen to live.
+                    #[cfg(target_os = "macos")]
+                    if label == "library" || label == "settings" {
+                        make_window_space_neutral(&w);
+                    }
                     let w_clone = w.clone();
                     let label_owned = label.to_string();
                     let app_handle_for_event = app.handle().clone();
@@ -418,8 +421,36 @@ fn main() {
                                 remove_outside_click_monitor(monitor.inner());
                             }
                         }
+                        // Picker — Spotlight-style. When the user clicks
+                        // Outside-click / focus-loss dismiss. Hide and
+                        // restore focus to the previously-active app
+                        // (Spotlight-style).
+                        tauri::WindowEvent::Focused(false) if label_owned == "picker" => {
+                            let _ = w_clone.hide();
+                            if let Some(focus) =
+                                app_handle_for_event.try_state::<Arc<FocusStore>>()
+                            {
+                                let _ = focus.restore();
+                            }
+                        }
                         _ => {}
                     });
+                }
+            }
+
+            // Tray-only / menu-bar utility behavior: no Dock icon, no
+            // Cmd+Tab entry, AND — critically — `NSApp.activate(ignoringOtherApps:)`
+            // does NOT yank the user out of fullscreen-app Spaces when the
+            // policy is `.accessory`. This is how Raycast / Alfred / native
+            // popovers stay in the user's current Space when summoned.
+            #[cfg(target_os = "macos")]
+            {
+                use cocoa::base::id;
+                use objc::{class, msg_send, sel, sel_impl};
+                unsafe {
+                    let nsapp: id = msg_send![class!(NSApplication), sharedApplication];
+                    // NSApplicationActivationPolicyAccessory = 1.
+                    let _: () = msg_send![nsapp, setActivationPolicy: 1i64];
                 }
             }
 
@@ -492,19 +523,20 @@ fn show_window(app: &tauri::AppHandle, label: &str) {
 /// activating the Prompt Player app. Tauri's `WebviewWindow::set_focus` calls
 /// `[NSApp activateIgnoringOtherApps:YES]` which steals focus from the
 /// foreground app — the opposite of what a stealth/menu-bar utility wants.
-/// We instead order the NSPanel front and make it key directly, leaving the
-/// underlying app's foreground status untouched.
+/// We use `makeKeyAndOrderFront:` instead, which on an NSPanel marked
+/// nonactivating both orders the panel front and triggers the first-
+/// responder handoff (so the WKWebView can accept keystrokes) without
+/// promoting the Prompt Player app to the foreground.
 #[cfg(target_os = "macos")]
 fn order_panel_front_no_activate(window: &tauri::WebviewWindow) {
-    use cocoa::base::id;
+    use cocoa::base::{id, nil};
     use objc::{msg_send, sel, sel_impl};
     let Ok(ns_window_ptr) = window.ns_window() else {
         return;
     };
     unsafe {
         let ns_window: id = ns_window_ptr as id;
-        let _: () = msg_send![ns_window, orderFrontRegardless];
-        let _: () = msg_send![ns_window, makeKeyWindow];
+        let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
     }
 }
 #[cfg(not(target_os = "macos"))]
@@ -517,11 +549,17 @@ fn order_panel_front_no_activate(window: &tauri::WebviewWindow) {
 /// click outside the popover (anywhere in the system) dismisses it the way a
 /// native popover does.
 #[cfg(target_os = "macos")]
-struct OutsideClickMonitor(parking_lot::Mutex<Option<usize>>);
+struct OutsideClickMonitor {
+    outside: parking_lot::Mutex<Option<usize>>,
+    mouse_track: parking_lot::Mutex<Option<usize>>,
+}
 #[cfg(target_os = "macos")]
 impl OutsideClickMonitor {
     fn shared() -> Arc<Self> {
-        Arc::new(Self(parking_lot::Mutex::new(None)))
+        Arc::new(Self {
+            outside: parking_lot::Mutex::new(None),
+            mouse_track: parking_lot::Mutex::new(None),
+        })
     }
 }
 
@@ -532,17 +570,15 @@ fn install_outside_click_monitor(app: &AppHandle, monitor_state: &Arc<OutsideCli
     use objc::{class, msg_send, sel, sel_impl};
 
     // Already installed? Don't double up.
-    if monitor_state.0.lock().is_some() {
+    if monitor_state.outside.lock().is_some() {
         return;
     }
     // NSEventMaskLeftMouseDown (1<<1) | NSEventMaskRightMouseDown (1<<3) |
     // NSEventMaskOtherMouseDown (1<<25).
     let mask: u64 = (1u64 << 1) | (1u64 << 3) | (1u64 << 25);
-    let app = app.clone();
+    let app2 = app.clone();
     let block = ConcreteBlock::new(move |_event: id| {
-        // The block runs on the main thread because NSEvent monitors deliver
-        // there; just forward to our hide IPC for symmetry.
-        if let Some(w) = app.get_webview_window("tray-popup") {
+        if let Some(w) = app2.get_webview_window("tray-popup") {
             let _ = w.hide();
         }
     });
@@ -555,7 +591,68 @@ fn install_outside_click_monitor(app: &AppHandle, monitor_state: &Arc<OutsideCli
             handler: &*block
         ];
         if monitor != nil {
-            *monitor_state.0.lock() = Some(monitor as usize);
+            *monitor_state.outside.lock() = Some(monitor as usize);
+        }
+    }
+
+    // ALSO install a LOCAL monitor for mouseMoved so we can feed cursor
+    // positions to the popover webview. WKWebView inside a non-activating
+    // NSPanel doesn't dispatch mouseMoved events to JS, leaving CSS :hover
+    // and JS hover state frozen on whatever the last received event was. By
+    // intercepting mouseMoved at the NSEvent layer and emitting them as
+    // Tauri events, we can drive hover from the OS event stream regardless
+    // of what the WKWebView decides to forward.
+    if monitor_state.mouse_track.lock().is_some() {
+        return;
+    }
+    // NSEventMaskMouseMoved = 1 << 5.
+    let move_mask: u64 = 1u64 << 5;
+    let app3 = app.clone();
+    let move_block = ConcreteBlock::new(move |event: id| -> id {
+        // We must return the event unchanged so normal dispatch continues.
+        unsafe {
+            if let Some(w) = app3.get_webview_window("tray-popup") {
+                if let Ok(ns_window_ptr) = w.ns_window() {
+                    let ns_window: id = ns_window_ptr as id;
+                    // locationInWindow is in the panel's window coordinate
+                    // space when the event window matches; otherwise we
+                    // convert from screen.
+                    let ev_window: id = msg_send![event, window];
+                    let loc: cocoa::foundation::NSPoint = if ev_window == ns_window {
+                        msg_send![event, locationInWindow]
+                    } else {
+                        let screen_loc: cocoa::foundation::NSPoint = msg_send![event, locationInWindow];
+                        // Convert to screen, then to our window's coords.
+                        let global: cocoa::foundation::NSPoint = if ev_window != nil {
+                            let pt: cocoa::foundation::NSPoint = msg_send![ev_window, convertPointToScreen: screen_loc];
+                            pt
+                        } else {
+                            // No source window — treat as global already.
+                            screen_loc
+                        };
+                        let p: cocoa::foundation::NSPoint = msg_send![ns_window, convertPointFromScreen: global];
+                        p
+                    };
+                    // Convert AppKit (origin bottom-left) to web (origin top-left).
+                    let frame: cocoa::foundation::NSRect = msg_send![ns_window, frame];
+                    let css_x = loc.x;
+                    let css_y = frame.size.height - loc.y;
+                    let _ = w.emit("tray-popup-mousemove", (css_x, css_y));
+                }
+            }
+        }
+        event
+    });
+    let move_block = move_block.copy();
+    unsafe {
+        let nsevent_class = class!(NSEvent);
+        let monitor: id = msg_send![
+            nsevent_class,
+            addLocalMonitorForEventsMatchingMask: move_mask
+            handler: &*move_block
+        ];
+        if monitor != nil {
+            *monitor_state.mouse_track.lock() = Some(monitor as usize);
         }
     }
 }
@@ -564,12 +661,288 @@ fn install_outside_click_monitor(app: &AppHandle, monitor_state: &Arc<OutsideCli
 fn remove_outside_click_monitor(monitor_state: &Arc<OutsideClickMonitor>) {
     use cocoa::base::id;
     use objc::{class, msg_send, sel, sel_impl};
-    let Some(ptr) = monitor_state.0.lock().take() else {
-        return;
-    };
     unsafe {
-        let nsevent_class = class!(NSEvent);
-        let _: () = msg_send![nsevent_class, removeMonitor: ptr as id];
+        if let Some(ptr) = monitor_state.outside.lock().take() {
+            let nsevent_class = class!(NSEvent);
+            let _: () = msg_send![nsevent_class, removeMonitor: ptr as id];
+        }
+        if let Some(ptr) = monitor_state.mouse_track.lock().take() {
+            let nsevent_class = class!(NSEvent);
+            let _: () = msg_send![nsevent_class, removeMonitor: ptr as id];
+        }
+    }
+}
+
+/// Spotlight-style picker config — the canonical recipe used by
+/// `tauri-nspanel` / `alt-tab-macos` / Hammerspoon's Chooser:
+///
+/// 1. Subclass NSPanel with a runtime class that overrides
+///    `-canBecomeKeyWindow` to return YES. NSPanel with `nonActivatingPanel`
+///    style mask defaults to NO, which is why a plain non-activating panel
+///    silently swallows all keystrokes — they fall through to the
+///    underlying app.
+/// 2. `styleMask |= NonactivatingPanel` so the panel can be key without
+///    triggering app activation (which would switch Spaces).
+/// 3. `collectionBehavior = CanJoinAllSpaces | FullScreenAuxiliary` so the
+///    panel surfaces on whatever Space is current (incl. fullscreen).
+/// 4. `level = NSPopUpMenuWindowLevel`.
+/// 5. Show via `makeKeyAndOrderFront(nil)`. **Never** call
+///    `NSApp.activate(ignoringOtherApps:)` — that's what was switching
+///    Spaces on every previous attempt.
+#[cfg(target_os = "macos")]
+fn configure_picker_window(window: &tauri::WebviewWindow) {
+    use cocoa::base::id;
+    use objc::runtime::Class;
+    use objc::{class, msg_send, sel, sel_impl};
+    extern "C" {
+        fn object_setClass(obj: id, cls: *const Class) -> *const Class;
+    }
+    let Ok(ns_window_ptr) = window.ns_window() else { return };
+    unsafe {
+        let ns_window: id = ns_window_ptr as id;
+
+        let panel_class = register_picker_panel_class();
+        object_setClass(ns_window, panel_class);
+
+        let current_mask: u64 = msg_send![ns_window, styleMask];
+        let _: () = msg_send![ns_window, setStyleMask: current_mask | (1u64 << 7)];
+
+        let collection: u64 = (1u64 << 0) | (1u64 << 8);
+        let _: () = msg_send![ns_window, setCollectionBehavior: collection];
+
+        let _: () = msg_send![ns_window, setLevel: 101 as std::os::raw::c_long];
+        let _: () = msg_send![ns_window, setBecomesKeyOnlyIfNeeded: 0u8];
+        let _: () = msg_send![ns_window, setFloatingPanel: 1u8];
+        let _: () = msg_send![ns_window, setHidesOnDeactivate: 0u8];
+        let _: () = msg_send![ns_window, setHasShadow: 1u8];
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn configure_picker_window(_window: &tauri::WebviewWindow) {}
+
+/// Register an Obj-C class `PromptPlayerKeyPanel` (NSPanel subclass) that
+/// overrides `-canBecomeKeyWindow` and `-canBecomeMainWindow` to return YES.
+/// This is the trick that lets a `nonActivatingPanel` actually receive
+/// keystrokes — without it the panel can never be key, so keys flow to the
+/// underlying app no matter what other flags are set.
+#[cfg(target_os = "macos")]
+fn register_picker_panel_class() -> *const objc::runtime::Class {
+    use objc::declare::ClassDecl;
+    use objc::runtime::{Class, Object, Sel, BOOL, YES};
+    use objc::{class, sel, sel_impl};
+    use std::sync::Once;
+
+    extern "C" fn can_become_key(_this: &Object, _cmd: Sel) -> BOOL {
+        YES
+    }
+    extern "C" fn can_become_main(_this: &Object, _cmd: Sel) -> BOOL {
+        YES
+    }
+
+    static mut CLASS: *const Class = std::ptr::null();
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        let superclass = class!(NSPanel);
+        let mut decl = ClassDecl::new("PromptPlayerKeyPanel", superclass)
+            .expect("register PromptPlayerKeyPanel");
+        decl.add_method(
+            sel!(canBecomeKeyWindow),
+            can_become_key as extern "C" fn(&Object, Sel) -> BOOL,
+        );
+        decl.add_method(
+            sel!(canBecomeMainWindow),
+            can_become_main as extern "C" fn(&Object, Sel) -> BOOL,
+        );
+        CLASS = decl.register();
+    });
+    unsafe { CLASS }
+}
+
+/// Apply `CanJoinAllSpaces | FullScreenAuxiliary` collection behavior to a
+/// non-popover window (library, settings). Ensures that when our app is
+/// activated to summon the picker, macOS doesn't switch the user back to
+/// whatever Space these windows happen to live on.
+#[cfg(target_os = "macos")]
+fn make_window_space_neutral(window: &tauri::WebviewWindow) {
+    use cocoa::base::id;
+    use objc::{msg_send, sel, sel_impl};
+    let Ok(ns_window_ptr) = window.ns_window() else { return };
+    unsafe {
+        let ns_window: id = ns_window_ptr as id;
+        let collection: u64 = (1u64 << 0) | (1u64 << 8);
+        let _: () = msg_send![ns_window, setCollectionBehavior: collection];
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn make_window_space_neutral(_window: &tauri::WebviewWindow) {}
+
+/// Reposition the picker centered horizontally on the screen that contains
+/// the cursor, ~30% from the top (Spotlight placement). Does NOT show or
+/// activate — call `show_window("picker")` after this.
+#[cfg(target_os = "macos")]
+fn position_picker_on_cursor_screen(app: &AppHandle) {
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::{NSPoint, NSRect};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    let Some(window) = app.get_webview_window("picker") else { return };
+    let Ok(ns_window_ptr) = window.ns_window() else { return };
+    unsafe {
+        let ns_window: id = ns_window_ptr as id;
+        let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+        let screens: id = msg_send![class!(NSScreen), screens];
+        if screens == nil { return; }
+        let count: usize = msg_send![screens, count];
+        let mut chosen_visible: Option<NSRect> = None;
+        for i in 0..count {
+            let screen: id = msg_send![screens, objectAtIndex: i];
+            let frame: NSRect = msg_send![screen, frame];
+            if cursor.x >= frame.origin.x
+                && cursor.x <= frame.origin.x + frame.size.width
+                && cursor.y >= frame.origin.y
+                && cursor.y <= frame.origin.y + frame.size.height
+            {
+                let vf: NSRect = msg_send![screen, visibleFrame];
+                chosen_visible = Some(vf);
+                break;
+            }
+        }
+        let Some(vf) = chosen_visible else { return };
+        let win_frame: NSRect = msg_send![ns_window, frame];
+        let x = vf.origin.x + (vf.size.width - win_frame.size.width) / 2.0;
+        let y_top_pad = vf.size.height * 0.30;
+        let y = vf.origin.y + vf.size.height - y_top_pad - win_frame.size.height;
+        let origin = NSPoint { x, y };
+        let _: () = msg_send![ns_window, setFrameOrigin: origin];
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn position_picker_on_cursor_screen(_app: &AppHandle) {}
+
+/// Show the picker positioned on the screen the user is currently on
+/// (cursor's screen, falling back to the primary). Must be called from the
+/// main thread — AppKit calls (NSEvent.mouseLocation, NSScreen.screens,
+/// setFrameOrigin:) are not thread-safe and return stale data off-thread.
+///
+/// Sequence (matches the Multi.app / Raycast recipe):
+/// 1. Read NSEvent.mouseLocation, find which NSScreen contains it.
+/// 2. Compute the target NSPoint in AppKit bottom-left coords.
+/// 3. Use the alpha-0 trick: setAlphaValue:0 → makeKeyAndOrderFront → set
+///    the frame on that screen → setAlphaValue:1. setFrameOrigin alone on
+///    a hidden window doesn't bind the window to the new NSScreen, which is
+///    why every previous attempt landed on the primary.
+fn show_picker_on_active_screen(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("picker") else { return };
+    let _ = prepare_picker(app, true);
+
+    #[cfg(target_os = "macos")]
+    {
+        use cocoa::base::{id, nil};
+        use cocoa::foundation::{NSPoint, NSRect};
+        use objc::{class, msg_send, sel, sel_impl};
+
+        // Force any other visible windows of our app to orderOut so when
+        // we activate, macOS has no other window to "bring forward" — it
+        // can only bring the picker forward, which has CanJoinAllSpaces and
+        // therefore lands on the user's current Space.
+        for other in ["library", "settings", "tray-popup"] {
+            if let Some(w) = app.get_webview_window(other) {
+                let _ = w.hide();
+            }
+        }
+
+        let Ok(ns_window_ptr) = window.ns_window() else { return };
+        unsafe {
+            let ns_window: id = ns_window_ptr as id;
+
+            // Find the screen the cursor is currently on. We DO NOT activate
+            // the app — doing so would pull a user inside a fullscreen-app
+            // Space back to our home Space.
+            let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+            let screens: id = msg_send![class!(NSScreen), screens];
+            let mut chosen_visible: Option<NSRect> = None;
+            let mut chosen_idx: i64 = -1;
+            tracing::info!("picker show: cursor=({:.1}, {:.1})", cursor.x, cursor.y);
+            if screens != nil {
+                let count: usize = msg_send![screens, count];
+                for i in 0..count {
+                    let screen: id = msg_send![screens, objectAtIndex: i];
+                    let frame: NSRect = msg_send![screen, frame];
+                    tracing::info!(
+                        "  screen[{}] frame=(x={:.1}, y={:.1}, w={:.1}, h={:.1})",
+                        i, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
+                    );
+                    if cursor.x >= frame.origin.x
+                        && cursor.x <= frame.origin.x + frame.size.width
+                        && cursor.y >= frame.origin.y
+                        && cursor.y <= frame.origin.y + frame.size.height
+                    {
+                        let vf: NSRect = msg_send![screen, visibleFrame];
+                        chosen_visible = Some(vf);
+                        chosen_idx = i as i64;
+                        break;
+                    }
+                }
+            }
+            tracing::info!("  → chosen screen index = {}", chosen_idx);
+
+            let win_frame: NSRect = msg_send![ns_window, frame];
+            tracing::info!(
+                "  win_frame: x={:.1} y={:.1} w={:.1} h={:.1}",
+                win_frame.origin.x, win_frame.origin.y, win_frame.size.width, win_frame.size.height
+            );
+            let target_origin = if let Some(vf) = chosen_visible {
+                let x = vf.origin.x + (vf.size.width - win_frame.size.width) / 2.0;
+                let y_top_pad = vf.size.height * 0.30;
+                let y = vf.origin.y + vf.size.height - y_top_pad - win_frame.size.height;
+                tracing::info!("  target origin: ({:.1}, {:.1})", x, y);
+                NSPoint { x, y }
+            } else {
+                tracing::warn!("  no screen matched cursor — keeping current origin");
+                win_frame.origin
+            };
+
+            // Verbatim tauri-nspanel `show_and_make_key` recipe:
+            //   1. makeFirstResponder(contentView)  — BEFORE ordering, so
+            //      the WKWebView is responder when the panel becomes key
+            //   2. orderFrontRegardless              — show without a key
+            //      transition (avoids triggering app activation)
+            //   3. makeKeyWindow                      — explicit key set
+            //   4. setFrameOrigin                     — bind to target
+            //      screen now that the panel is on screen
+            // This is what the canBecomeKeyWindow=YES override on our
+            // subclass (PromptPlayerKeyPanel) enables: a non-activating
+            // panel that actually receives keystrokes.
+            // Same pattern as `show_window` (which works reliably from the
+            // tray menu): activate app → Tauri show + set_focus. With
+            // `.accessory` activation policy + space-neutral library/
+            // settings windows, this does NOT switch the user's Space.
+            // The all-msg_send sequence we tried before raced the Tauri
+            // show() runloop posting and made every other summon fail.
+            let _: () = msg_send![ns_window, setAlphaValue: 0.0f64];
+            activate_macos_app();
+            let _ = window.show();
+            let _ = window.set_focus();
+            let _: () = msg_send![ns_window, setFrameOrigin: target_origin];
+            // Force first-responder rebuild on each show: clear to nil, then
+            // re-set to contentView. The cached `contentView` firstResponder
+            // pointer survives hide/show cycles, making a single
+            // makeFirstResponder a no-op the second time.
+            let content_view: id = msg_send![ns_window, contentView];
+            let _: bool = msg_send![ns_window, makeFirstResponder: nil];
+            if content_view != nil {
+                let _: bool = msg_send![ns_window, makeFirstResponder: content_view];
+            }
+            let _: () = msg_send![ns_window, setAlphaValue: 1.0f64];
+        }
+        let _ = window.emit("picker-shown", ());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit("picker-shown", ());
     }
 }
 
@@ -882,20 +1255,25 @@ fn register_shortcuts(
                     tracing::info!("hotkey arm → enabled={}", new);
                     refresh_tray_popup(&app_handle);
                 } else if shortcut == &shortcut_picker {
-                    // Snapshot + show the picker via the same IPC path.
-                    if let (Some(focus), Some(prompts), Some(index)) = (
-                        app_handle.try_state::<Arc<FocusStore>>(),
-                        app_handle.try_state::<Arc<parking_lot::RwLock<Vec<Prompt>>>>(),
-                        app_handle.try_state::<parking_lot::Mutex<SearchIndex>>(),
-                    ) {
-                        focus.capture();
-                        index.lock().rebuild(&prompts.read());
-                    }
-                    if let Some(w) = app_handle.get_webview_window("picker") {
-                        let _ = prepare_picker(&app_handle, true);
-                        let _ = w.show();
-                        order_panel_front_no_activate(&w);
-                    }
+                    // Use the EXACT same code path as the tray menu's
+                    // "Command palette…" item, which the user confirmed
+                    // works reliably 100% of the time. The only difference
+                    // is the positioning is added on top.
+                    let app_for_main = app_handle.clone();
+                    let _ = app_handle.run_on_main_thread(move || {
+                        if let (Some(focus), Some(prompts), Some(index)) = (
+                            app_for_main.try_state::<Arc<FocusStore>>(),
+                            app_for_main.try_state::<Arc<parking_lot::RwLock<Vec<Prompt>>>>(),
+                            app_for_main.try_state::<parking_lot::Mutex<SearchIndex>>(),
+                        ) {
+                            focus.capture();
+                            index.lock().rebuild(&prompts.read());
+                        }
+                        // Position on cursor's screen first, then use the
+                        // same show_window path the tray menu uses.
+                        position_picker_on_cursor_screen(&app_for_main);
+                        show_window(&app_for_main, "picker");
+                    });
                 } else if shortcut == &shortcut_kill {
                     tracing::warn!("KILL-SWITCH invoked");
                     app_state_kill.cancel_playback();
@@ -1009,6 +1387,22 @@ fn ipc_tray_quit(app: tauri::AppHandle) {
 }
 
 #[tauri::command]
+fn ipc_picker_dismiss(
+    app: tauri::AppHandle,
+    focus: tauri::State<'_, Arc<FocusStore>>,
+) {
+    if let Some(w) = app.get_webview_window("picker") {
+        let _ = w.hide();
+    }
+    // Spotlight-style: restore focus to the app the user was in before
+    // summoning the palette so the next keystroke goes back where they
+    // expect.
+    if !focus.restore() {
+        tracing::warn!("focus restore on picker dismiss failed");
+    }
+}
+
+#[tauri::command]
 fn ipc_tray_popup_hide(app: tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("tray-popup") {
         let _ = w.hide();
@@ -1117,11 +1511,8 @@ fn ipc_picker_open(
         let mut idx = index.lock();
         idx.rebuild(&prompts.read());
     }
-    if let Some(w) = app.get_webview_window("picker") {
-        prepare_picker(&app, true)?;
-        w.show().map_err(|e| e.to_string())?;
-        order_panel_front_no_activate(&w);
-    }
+    position_picker_on_cursor_screen(&app);
+    show_window(&app, "picker");
     Ok(())
 }
 

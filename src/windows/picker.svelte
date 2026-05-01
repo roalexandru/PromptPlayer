@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, onDestroy, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { type Prompt } from "$lib/ipc";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { ipc, type Prompt } from "$lib/ipc";
 
   type Hit = { prompt_id: string; score: number; highlights: number[] };
 
@@ -30,8 +31,10 @@
   }
 
   async function dismiss() {
-    await getCurrentWindow().hide();
     q = "";
+    // Hide AND restore focus to the previously-foreground app (so the next
+    // user keystroke goes there, not nowhere). Backend handles both.
+    await ipc.pickerDismiss();
   }
 
   function profileShort(k: string): string {
@@ -66,7 +69,16 @@
   function onKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.preventDefault();
-      dismiss();
+      // Two-step Esc: first press clears the search if non-empty, second
+      // press closes the palette. Mirrors Spotlight / Raycast behavior.
+      if (q.length > 0) {
+        q = "";
+        selected = 0;
+        // Re-anchor focus after the input clears.
+        focusInput();
+      } else {
+        dismiss();
+      }
       return;
     }
     if (e.key === "ArrowDown") {
@@ -104,11 +116,69 @@
     search();
   });
 
+  let unlistenShown: UnlistenFn | null = null;
+
+  let focusPollHandle: ReturnType<typeof setInterval> | null = null;
+
+  async function focusInput() {
+    await tick();
+    if (!inputEl) return;
+    if (focusPollHandle) {
+      clearInterval(focusPollHandle);
+      focusPollHandle = null;
+    }
+    // Retry focus until the OS (not just the DOM) actually has focus on
+    // our input. The race: `makeKeyWindow` returns before AppKit's run-loop
+    // drains the key transition, so a one-shot focus() can land while the
+    // panel is still not really key, leaving keystrokes routed to the
+    // previously-active app — even though `document.activeElement` looks
+    // correct. The exit condition must be `document.hasFocus() &&
+    // activeElement === inputEl`. setInterval (not rAF) so the loop ticks
+    // even while the panel is alpha-0 / not yet composited.
+    const start = performance.now();
+    const tryGrab = () => {
+      if (!inputEl) {
+        if (focusPollHandle) {
+          clearInterval(focusPollHandle);
+          focusPollHandle = null;
+        }
+        return;
+      }
+      inputEl.focus();
+      inputEl.select?.();
+      const ok = document.hasFocus() && document.activeElement === inputEl;
+      if (ok || performance.now() - start > 1500) {
+        if (focusPollHandle) {
+          clearInterval(focusPollHandle);
+          focusPollHandle = null;
+        }
+      }
+    };
+    tryGrab();
+    focusPollHandle = setInterval(tryGrab, 30);
+  }
+
   onMount(async () => {
     await loadPrompts();
     await search();
-    await tick();
-    inputEl?.focus();
+    await focusInput();
+    // Refocus + clear query each time the picker is shown so subsequent
+    // open cycles start fresh with the input ready.
+    unlistenShown = await listen("picker-shown", async () => {
+      await loadPrompts();
+      q = "";
+      selected = 0;
+      // Yield to the microtask queue so the q="" reactive update + search
+      // effect have flushed before we start the focus poll. Otherwise
+      // focus could be stolen by the list re-render that follows.
+      await Promise.resolve();
+      await tick();
+      await focusInput();
+    });
+  });
+
+  onDestroy(() => {
+    unlistenShown?.();
   });
 </script>
 
