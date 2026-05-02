@@ -20,6 +20,16 @@
 //!   was caused by adding a `tauri::State<'_, PromptStore>` parameter to a
 //!   command without `.manage(ctx.prompts.clone())`. Test #3 below exercises
 //!   the exact code path that hit and fails before merge.
+//!
+//! Platform note (Windows): the runtime smoke test (#3) requires the
+//! `tauri/test` feature, which on Windows links against WebView2 at
+//! executable load time. The CI runner's WebView2 component mismatches
+//! at link load (`STATUS_ENTRYPOINT_NOT_FOUND`), so the entire test
+//! binary fails to start. We gate this whole integration test on
+//! non-Windows; the cross-check tests #1 and #2 are duplicated as unit
+//! tests inside `commands::mod` so they still run on Windows CI.
+
+#![cfg(not(target_os = "windows"))]
 
 use prompt_player::app::context::AppContext;
 use prompt_player::app::setup::manage_state;
