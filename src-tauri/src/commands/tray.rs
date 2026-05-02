@@ -27,6 +27,16 @@ pub fn tray_open(
             ctx.search
                 .lock()
                 .rebuild_if_stale(ctx.prompts.generation(), &ctx.prompts.read());
+            // Reposition the picker on whichever monitor the cursor is on
+            // BEFORE showing. Without this, the picker stays on whatever
+            // monitor it was last shown on — wrong when the user clicked
+            // "Command palette" from the tray on a different monitor.
+            // The global-shortcut path (`app::shortcuts::summon_picker`)
+            // already does this; this matches that behavior.
+            #[cfg(target_os = "macos")]
+            crate::platform::macos::position_picker_on_cursor_screen(&app);
+            #[cfg(target_os = "windows")]
+            crate::platform::windows::position_picker_on_cursor_screen(&app);
             show_picker_window(&app);
             Ok(())
         }
@@ -109,51 +119,115 @@ pub fn toggle_popup(app: &AppHandle, rect: tauri::Rect) {
 }
 
 fn position_popup(window: &tauri::WebviewWindow, rect: tauri::Rect) {
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let icon_pos = rect.position.to_physical::<f64>(scale);
-    #[cfg(target_os = "windows")]
-    let icon_size = rect.size.to_physical::<f64>(scale);
-    let outer = window.outer_size().ok();
-    let Some(size) = outer else { return };
-    let win_w = size.width as f64;
-    let win_h = size.height as f64;
-
-    // Default placement (anchor below icon, left edge aligned — matches
-    // native NSMenu placement on Mac). On Windows this is overridden per
-    // taskbar edge in `position_for_taskbar_edge`.
-    #[cfg(not(target_os = "windows"))]
-    let (mut x, mut y) = (icon_pos.x, icon_pos.y + 4.0);
-
-    // SHAppBarMessage tells us where the taskbar lives so we can anchor the
-    // popup on the side OPPOSITE the taskbar edge — same idiom Win11's
-    // Quick Settings popover uses.
-    #[cfg(target_os = "windows")]
-    let (mut x, mut y) = {
-        let edge = crate::platform::windows::taskbar_edge();
-        position_for_taskbar_edge(edge, icon_pos, icon_size, win_w, win_h)
-    };
-
-    // Clamp so the window stays on the same screen the icon is on (the
-    // tray-icon rect can sit at a screen edge).
-    if let Some(monitor) = window.current_monitor().ok().flatten() {
-        let m_pos = monitor.position();
-        let m_size = monitor.size();
-        let right_edge = (m_pos.x as f64) + (m_size.width as f64) - 4.0;
-        let bottom_edge = (m_pos.y as f64) + (m_size.height as f64) - 4.0;
-        if x + win_w > right_edge {
-            x = right_edge - win_w;
-        }
-        if x < (m_pos.x as f64) + 4.0 {
-            x = (m_pos.x as f64) + 4.0;
-        }
-        if y + win_h > bottom_edge {
-            y = bottom_edge - win_h;
-        }
-        if y < (m_pos.y as f64) + 4.0 {
-            y = (m_pos.y as f64) + 4.0;
-        }
+    // macOS: bypass Tauri's PhysicalPosition path entirely. On mixed-DPI
+    // multi-monitor setups, monitor physical-pixel bounds can OVERLAP (a
+    // retina laptop at scale=2 has its right edge at 3024px while a 1x
+    // external at logical x=1512 starts at physical x=1512). That makes
+    // "find the monitor whose physical bounds contain icon_phys" ambiguous,
+    // and `set_position(PhysicalPosition)` lands on the wrong monitor.
+    //
+    // AppKit's NSEvent.mouseLocation + NSScreen.screens use logical points
+    // in a single unified coord space across all monitors regardless of
+    // DPI. setFrameOrigin: (also AppKit logical pt) places the window
+    // unambiguously. This is the same recipe the picker palette uses.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = rect; // size/position not needed; we use the live cursor.
+        crate::platform::macos::position_popover_under_cursor(window);
+        return;
     }
-    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+
+    // Windows-only path below. The Tauri PhysicalPosition coord space is
+    // unambiguous on Win32 (no per-monitor pixel overlaps).
+    #[cfg(target_os = "windows")]
+    {
+        // Tauri normalizes tray rects to PhysicalPosition on Windows. We work
+        // entirely in physical pixels for placement.
+        let icon_phys = match rect.position {
+            tauri::Position::Physical(p) => tauri::PhysicalPosition::new(p.x as f64, p.y as f64),
+            tauri::Position::Logical(_) => {
+                // Tauri 2 uses Physical for tray rects; convert via window scale
+                // as a defensive fallback if that ever changes.
+                let scale = window.scale_factor().unwrap_or(1.0);
+                rect.position.to_physical::<f64>(scale)
+            }
+        };
+        #[cfg(target_os = "windows")]
+        let icon_size_phys = match rect.size {
+            tauri::Size::Physical(s) => tauri::PhysicalSize::new(s.width as f64, s.height as f64),
+            tauri::Size::Logical(_) => {
+                let scale = window.scale_factor().unwrap_or(1.0);
+                rect.size.to_physical::<f64>(scale)
+            }
+        };
+
+        // Find the monitor that contains the tray icon's CENTER point. Walking
+        // available_monitors() is the only Tauri-2 API that doesn't presuppose
+        // which monitor is "current".
+        let target_monitor = window
+            .available_monitors()
+            .ok()
+            .and_then(|monitors| {
+                monitors.into_iter().find(|m| {
+                    let mp = m.position();
+                    let ms = m.size();
+                    let mx = mp.x as f64;
+                    let my = mp.y as f64;
+                    let mw = ms.width as f64;
+                    let mh = ms.height as f64;
+                    icon_phys.x >= mx
+                        && icon_phys.x < mx + mw
+                        && icon_phys.y >= my
+                        && icon_phys.y < my + mh
+                })
+            })
+            // Fallback: if no monitor matched (unlikely, but possible if the
+            // icon is at a screen-edge boundary), use whatever monitor the
+            // popover currently lives on.
+            .or_else(|| window.current_monitor().ok().flatten());
+
+        let outer = window.outer_size().ok();
+        let Some(size) = outer else { return };
+        let win_w = size.width as f64;
+        let win_h = size.height as f64;
+
+        // Default placement: anchor BELOW the icon, left edge aligned
+        // (native NSMenu placement on Mac).
+        #[cfg(not(target_os = "windows"))]
+        let (mut x, mut y) = (icon_phys.x, icon_phys.y + 4.0);
+
+        // Windows: pick anchor side based on taskbar edge.
+        #[cfg(target_os = "windows")]
+        let (mut x, mut y) = {
+            let edge = crate::platform::windows::taskbar_edge();
+            position_for_taskbar_edge(edge, icon_phys, icon_size_phys, win_w, win_h)
+        };
+
+        // Clamp to the TARGET monitor's bounds (not the popover's previous
+        // monitor). This is what was making the popup reappear on monitor 1
+        // after a click on monitor 2.
+        if let Some(monitor) = target_monitor {
+            let mp = monitor.position();
+            let ms = monitor.size();
+            let m_left = mp.x as f64 + 4.0;
+            let m_top = mp.y as f64 + 4.0;
+            let m_right = (mp.x as f64) + (ms.width as f64) - 4.0;
+            let m_bottom = (mp.y as f64) + (ms.height as f64) - 4.0;
+            if x + win_w > m_right {
+                x = m_right - win_w;
+            }
+            if x < m_left {
+                x = m_left;
+            }
+            if y + win_h > m_bottom {
+                y = m_bottom - win_h;
+            }
+            if y < m_top {
+                y = m_top;
+            }
+        }
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    } // end #[cfg(target_os = "windows")] block
 }
 
 #[cfg(target_os = "windows")]

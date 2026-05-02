@@ -15,4 +15,6 @@ pub use monitor::{
     install_outside_click_monitor, remove_outside_click_monitor, OutsideClickMonitor,
 };
 pub use panel::{configure_picker_window, configure_popover_window, make_window_space_neutral};
-pub use screen::{position_centered_on_cursor, position_picker_on_cursor_screen};
+pub use screen::{
+    position_centered_on_cursor, position_picker_on_cursor_screen, position_popover_under_cursor,
+};

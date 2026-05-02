@@ -167,7 +167,18 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// Build a `tauri::test::App<MockRuntime>` with all production-equivalent
 /// state managed and the no-AppHandle commands registered.
-fn mock_app_with_state() -> tauri::App<tauri::test::MockRuntime> {
+///
+/// IMPORTANT: redirects the prompt library to a tempdir via the
+/// `PROMPT_PLAYER_PROMPTS` env var BEFORE any IPC command that writes to
+/// disk runs (`save_prompt`, `create_prompt`, `set_prompt_enabled`). Without
+/// this, `cargo test` against the real binary would happily write
+/// `smoke-created.pp.md` etc. into the developer's actual library at
+/// `~/Library/Application Support/PromptPlayer/prompts/`.
+fn mock_app_with_state(prompts_dir: &std::path::Path) -> tauri::App<tauri::test::MockRuntime> {
+    // Set BEFORE constructing AppContext / running any save command. The env
+    // var is process-wide; we keep it set for the whole test process.
+    std::env::set_var("PROMPT_PLAYER_PROMPTS", prompts_dir);
+
     let ctx = AppContext::new();
     // Seed ONE prompt so list_prompts has something to return — gives us
     // a realistic non-empty payload to deserialize as a sanity check.
@@ -233,7 +244,12 @@ fn ping(
 
 #[test]
 fn smoke_test_no_apphandle_commands_resolve_with_managed_state() {
-    let app = mock_app_with_state();
+    // Isolate disk writes: every `save_prompt`/`create_prompt` invocation in
+    // this test would otherwise write a `.pp.md` file into the dev's real
+    // library. Tempdir survives the whole test (held in scope until end);
+    // dropped automatically with all files in it.
+    let prompts_dir = tempfile::tempdir().expect("tempdir");
+    let app = mock_app_with_state(prompts_dir.path());
     let webview = WebviewWindowBuilder::new(&app, "smoke", WebviewUrl::App("/".into()))
         .build()
         .expect("smoke webview");
