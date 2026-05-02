@@ -108,6 +108,22 @@ impl PromptStore {
         Ok(snapshot)
     }
 
+    /// Toggle the per-prompt `pinned` flag and persist to disk. Pinned prompts
+    /// surface in the tray menu (Apple Shortcuts pinned model).
+    pub fn set_pinned(&self, id: &str, pinned: bool) -> AppResult<Prompt> {
+        let snapshot = self.modify(id, |p| p.pinned = pinned)?;
+        let path = snapshot
+            .source_path
+            .clone()
+            .ok_or_else(|| AppError::NoSourcePath { id: id.to_string() })?;
+        let body = parser::serialize(&snapshot)?;
+        std::fs::write(&path, body).map_err(|e| AppError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        Ok(snapshot)
+    }
+
     /// Persist a prompt to its `source_path` (or to a freshly-derived path).
     /// Returns the path written to.
     pub fn save(&self, prompt: &Prompt) -> AppResult<PathBuf> {
@@ -183,6 +199,7 @@ mod tests {
             hotkey: None,
             tags: Vec::new(),
             enabled: true,
+            pinned: false,
             body: "body".into(),
             source_path: None,
         }

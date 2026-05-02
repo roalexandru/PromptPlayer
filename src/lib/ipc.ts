@@ -4,9 +4,9 @@
 // `src-tauri/src/app/setup.rs::generate_typescript_bindings`).
 // Treat it as source-controlled but auto-managed — do not edit by hand.
 
-import { commands, type Prompt, type ProfileKind, type TypingOverrides, type SearchHit, type IpcError, type Result } from "./ipc.gen";
+import { commands, type Prompt, type ProfileKind, type TypingOverrides, type SearchHit, type IpcError, type UpdateInfo, type ForegroundAppInfo, type Result } from "./ipc.gen";
 
-export type { Prompt, ProfileKind, TypingOverrides, SearchHit, IpcError };
+export type { Prompt, ProfileKind, TypingOverrides, SearchHit, IpcError, UpdateInfo, ForegroundAppInfo };
 
 /// Unwrap a tauri-specta `Result<T, IpcError>` into a Promise that throws the
 /// IpcError on the error branch. Lets call sites use plain `await` syntax
@@ -22,6 +22,7 @@ export const ipc = {
   getArmed: () => commands.getArmed(),
   toggleArmed: () => commands.toggleArmed(),
   kill: () => commands.kill(),
+  isPlaying: () => commands.isPlaying(),
   // prompts
   listPrompts: () => commands.listPrompts(),
   libraryRoot: () => unwrap(commands.libraryRoot()),
@@ -30,6 +31,8 @@ export const ipc = {
   deletePrompt: (promptId: string) => unwrap(commands.deletePrompt(promptId)),
   setPromptEnabled: (promptId: string, enabled: boolean) =>
     unwrap(commands.setPromptEnabled(promptId, enabled)),
+  setPromptPinned: (promptId: string, pinned: boolean) =>
+    unwrap(commands.setPromptPinned(promptId, pinned)),
   // picker
   pickerOpen: () => unwrap(commands.pickerOpen()),
   pickerSearch: (q: string, limit?: number) =>
@@ -38,8 +41,19 @@ export const ipc = {
     unwrap(commands.pickerSelect(promptId, mode)),
   pickerDismiss: () => unwrap(commands.pickerDismiss()),
   // tray
-  trayOpen: (target: "library" | "picker" | "settings" | "about") =>
+  trayOpen: (target: "library" | "picker" | "about") =>
     unwrap(commands.trayOpen(target)),
   trayQuit: () => commands.trayQuit(),
   trayPopupHide: () => unwrap(commands.trayPopupHide()),
+  trayFirePrompt: (promptId: string) => unwrap(commands.trayFirePrompt(promptId)),
+  // updater
+  updaterCurrentVersion: () => commands.updaterCurrentVersion(),
+  updaterCheck: () => unwrap(commands.updaterCheck()),
+  updaterInstall: () => unwrap(commands.updaterInstall()),
+  // library helpers (§10.2)
+  captureForegroundApp: () => commands.captureForegroundApp(),
+  expandPromptText: (text: string) => commands.expandPromptText(text),
+  importPrompt: (sourcePath: string) => unwrap(commands.importPrompt(sourcePath)),
+  exportPrompt: (promptId: string, destPath: string) =>
+    unwrap(commands.exportPrompt(promptId, destPath)),
 };

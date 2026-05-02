@@ -38,6 +38,12 @@ pub struct Prompt {
     /// working without touching their files.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Tray surfacing flag. The menu-bar popup shows ONLY pinned prompts
+    /// (Apple Shortcuts model). Unpinned prompts still live in the library
+    /// and still fire from triggers — they're just not in the tray menu.
+    /// Defaults to `false` so existing prompts don't crowd the tray.
+    #[serde(default)]
+    pub pinned: bool,
     /// Body of the prompt — Markdown source after frontmatter.
     pub body: String,
     /// Filesystem path the prompt was loaded from. None for in-memory prompts.

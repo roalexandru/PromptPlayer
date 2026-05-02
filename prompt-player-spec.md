@@ -256,9 +256,7 @@ Floating window, clipboard-history-style. For non-stealth use, rehearsal, and de
 - Windows: `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`.
 - macOS: `NSWindow.sharingType = .none` + `setSharingType(.none)`.
 
-Toggle in settings ("Show during screen sharing") for rehearsal mode. **Critical for stealth demos** — without this, the picker pops up on the projector mid-demo.
-
-Paste 6.0 added this exact toggle for the same reason.
+Default-on, no toggle. **Critical for stealth demos** — without this, the picker pops up on the projector mid-demo. Recording the picker UI itself (e.g., for an onboarding video) is a niche we don't support; the user can fall back to a separate screen recorder pointed at the physical display.
 
 ### 5.5 Focus restoration
 
@@ -560,7 +558,7 @@ Genuinely supported. Two architectures, both shipped:
   - Speed multiplier: ×1.3 slower than configured profile.
   - Disable clipboard fallback (RDP clipboard sync is unreliable).
   - Backspace coalescing: send single events, not bursts.
-- Recognized RDP-client list editable in settings.
+- Recognized RDP-client list editable in `promptplayer.yaml`.
 
 **Architecture B — Guest-side helper daemon (optional, for pathological cases):**
 - Tiny Windows daemon (~2 MB MSI) installed inside the Windows VM.
@@ -588,7 +586,7 @@ Tested explicitly for: emoji, accented Latin, CJK, Cyrillic, Arabic.
 
 ### 10.1 Tray
 
-Two states: armed (filled icon, accent color) / disarmed (outline). Click toggles. Right-click menu: Open library, Open picker, Settings, Quit, About.
+Two states: armed (filled icon, accent color) / disarmed (outline). Click toggles. Right-click menu: Open library, Open picker, About, Quit.
 
 App **starts disarmed every launch.** Never persists "armed" state across restarts.
 
@@ -602,17 +600,11 @@ App **starts disarmed every launch.** Never persists "armed" state across restar
 - Expression "Test" button: evaluates `${{ ... }}` blocks with current context.
 - Import/export `.pp.md` files.
 
-### 10.3 Settings
+### 10.3 No Settings window
 
-- Profile selection (Sales Engineer / Fast Presenter / Thoughtful CEO / Custom).
-- Custom-profile sliders (advanced, behind disclosure).
-- Hotkeys: arm/disarm, picker, kill-switch, panic-reset.
-- Commit-char default.
-- Auto-disarm timer (default off, suggested 30 min).
-- "Show picker during screen sharing" toggle (default off — i.e., hide).
-- RDP client list editor.
-- Telemetry toggle (debug builds only — prod is always-on per Q5).
-- Update channel: stable / beta.
+Cross-cutting config lives in `promptplayer.yaml` (§7.2): `profile-default`, `commit-char-default`, hotkeys (`hotkey-arm`, `hotkey-picker`, `hotkey-kill`), auto-disarm timer, RDP client list, update channel. Users edit YAML directly — the audience already authors prompts in this format, so there's no second discovery surface to learn.
+
+Per-prompt overrides (typing profile, hotkey, scope, filters) live in each `.pp.md` frontmatter and are edited from the library window. Picker screen-capture exclusion is default-on with no toggle (§5.4). TCC reset surfaces reactively when the macOS Accessibility probe fails (§9.1) — no Settings entry needed. Telemetry follows Q5 (always-on in prod, off in debug); not user-configurable.
 
 ### 10.4 Authoring shortcuts
 

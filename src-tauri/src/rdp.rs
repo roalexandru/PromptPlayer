@@ -35,7 +35,9 @@ pub enum RdpMode {
     HostSide,
 }
 
-/// User-editable RDP-client list. Settings UI in Phase 13 mutates this.
+/// RDP-client list. The defaults below cover the major clients; users who
+/// need to add a custom client edit `promptplayer.yaml` directly (no
+/// dedicated Settings UI).
 #[derive(Debug, Clone)]
 pub struct RdpRegistry {
     inner: Arc<RwLock<Vec<String>>>,

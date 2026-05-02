@@ -32,7 +32,6 @@ export default defineConfig({
       input: {
         library: resolve(__dirname, "index.html"),
         picker: resolve(__dirname, "picker.html"),
-        settings: resolve(__dirname, "settings.html"),
         "tray-popup": resolve(__dirname, "tray-popup.html"),
       },
     },

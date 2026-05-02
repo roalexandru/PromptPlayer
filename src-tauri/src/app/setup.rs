@@ -138,6 +138,8 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_aptabase::Builder::new(crate::telemetry::APTABASE_KEY).build());
 
     // Per-state managed handles. Each typed `tauri::State<'_, T>` IPC
@@ -159,12 +161,14 @@ pub fn run() {
             commands::armed::get_armed,
             commands::armed::toggle_armed,
             commands::armed::kill,
+            commands::armed::is_playing,
             commands::prompts::list_prompts,
             commands::prompts::library_root,
             commands::prompts::save_prompt,
             commands::prompts::create_prompt,
             commands::prompts::delete_prompt,
             commands::prompts::set_prompt_enabled,
+            commands::prompts::set_prompt_pinned,
             commands::picker::picker_open,
             commands::picker::picker_search,
             commands::picker::picker_select,
@@ -172,13 +176,23 @@ pub fn run() {
             commands::tray::tray_open,
             commands::tray::tray_quit,
             commands::tray::tray_popup_hide,
+            commands::tray::tray_fire_prompt,
+            commands::updater::updater_current_version,
+            commands::updater::updater_check,
+            commands::updater::updater_install,
+            commands::library::capture_foreground_app,
+            commands::library::expand_prompt_text,
+            commands::library::import_prompt,
+            commands::library::export_prompt,
         ])
         .setup(move |app| {
             // Tray icon — left-click toggles the WiFi-style stay-open popover.
-            let tray_icon_path = std::env::current_dir()
-                .unwrap()
-                .join("src-tauri/icons/tray-icon.png");
-            let tray_image = tauri::image::Image::from_path(&tray_icon_path)
+            // Embedded at compile-time: runtime path resolution is brittle
+            // (cargo/tauri-dev CWD differs from the packaged .app's resources
+            // dir, and the bundle doesn't ship icons/ as a resource). Bytes
+            // baked into the binary work in both contexts.
+            const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../icons/tray-icon.png");
+            let tray_image = tauri::image::Image::from_bytes(TRAY_ICON_BYTES)
                 .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(tray_image)
@@ -256,6 +270,14 @@ pub fn run() {
                     .expect("spawn secure-input poll thread");
             }
 
+            // §13 — auto-update poller. Checks on startup and every 6h.
+            // Emits a `update-available` event with `{ version, notes }` when
+            // a new release is published; the frontend listens for it on the
+            // tray-popup window and surfaces an "Install update vX.Y.Z" entry.
+            // Manual checks (user clicks "Check for updates…") use the
+            // `updater_check` IPC command and do NOT go through this poller.
+            spawn_update_poller(app.handle().clone());
+
             // App-started telemetry event — once per launch.
             let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
             telemetry::send(
@@ -286,6 +308,58 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// Poll the updater endpoint on startup and every 6h. Emits a frontend
+/// `update-available` event when a new release is found, so the tray popup
+/// can surface an "Install update vX.Y.Z" entry without blocking on its own
+/// check call. Errors are logged and swallowed — a transient network blip
+/// shouldn't kill the poller.
+fn spawn_update_poller(app: tauri::AppHandle) {
+    use tauri::Emitter;
+    use tauri_plugin_updater::UpdaterExt;
+    tauri::async_runtime::spawn(async move {
+        // Small initial delay so the poller doesn't race the rest of startup.
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        loop {
+            match app.updater() {
+                Ok(updater) => match updater.check().await {
+                    Ok(Some(update)) => {
+                        tracing::info!(
+                            "update available: {} → {}",
+                            env!("CARGO_PKG_VERSION"),
+                            update.version
+                        );
+                        let payload = serde_json::json!({
+                            "version": update.version,
+                            "notes": update.body,
+                        });
+                        let _ = app.emit("update-available", payload);
+                        crate::telemetry::send(
+                            &app,
+                            crate::telemetry::TelemetryEvent::UpdateCheck {
+                                available: true,
+                                current_version: env!("CARGO_PKG_VERSION"),
+                            },
+                        );
+                    }
+                    Ok(None) => {
+                        crate::telemetry::send(
+                            &app,
+                            crate::telemetry::TelemetryEvent::UpdateCheck {
+                                available: false,
+                                current_version: env!("CARGO_PKG_VERSION"),
+                            },
+                        );
+                    }
+                    Err(e) => tracing::warn!("update check failed: {}", e),
+                },
+                Err(e) => tracing::warn!("updater unavailable: {}", e),
+            }
+            // Spec §13: every 6h.
+            tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+        }
+    });
 }
 
 /// Look up the bundled `prompts-examples` directory in the .app's Resources
@@ -324,12 +398,14 @@ fn generate_typescript_bindings() -> Result<(), String> {
         crate::commands::armed::get_armed,
         crate::commands::armed::toggle_armed,
         crate::commands::armed::kill,
+        crate::commands::armed::is_playing,
         crate::commands::prompts::list_prompts,
         crate::commands::prompts::library_root,
         crate::commands::prompts::save_prompt,
         crate::commands::prompts::create_prompt,
         crate::commands::prompts::delete_prompt,
         crate::commands::prompts::set_prompt_enabled,
+        crate::commands::prompts::set_prompt_pinned,
         crate::commands::picker::picker_open,
         crate::commands::picker::picker_search,
         crate::commands::picker::picker_select,
@@ -337,6 +413,14 @@ fn generate_typescript_bindings() -> Result<(), String> {
         crate::commands::tray::tray_open,
         crate::commands::tray::tray_quit,
         crate::commands::tray::tray_popup_hide,
+        crate::commands::tray::tray_fire_prompt,
+        crate::commands::updater::updater_current_version,
+        crate::commands::updater::updater_check,
+        crate::commands::updater::updater_install,
+        crate::commands::library::capture_foreground_app,
+        crate::commands::library::expand_prompt_text,
+        crate::commands::library::import_prompt,
+        crate::commands::library::export_prompt,
     ]);
 
     // Resolve the workspace root reliably from CARGO_MANIFEST_DIR (baked in
@@ -377,7 +461,7 @@ fn rebuild_match_index(ctx: &AppContext) {
 }
 
 fn apply_window_chrome(app: &tauri::App) {
-    for label in ["library", "picker", "settings", "tray-popup"] {
+    for label in ["library", "picker", "tray-popup"] {
         if let Some(w) = app.get_webview_window(label) {
             #[cfg(target_os = "macos")]
             apply_macos_chrome(label, &w);
@@ -414,7 +498,7 @@ fn apply_macos_chrome(label: &str, w: &tauri::WebviewWindow) {
             );
             configure_popover_window(w);
         }
-        "library" | "settings" => {
+        "library" => {
             make_window_space_neutral(w);
         }
         _ => {}
@@ -441,7 +525,7 @@ fn apply_windows_chrome(label: &str, w: &tauri::WebviewWindow) {
             }
             configure_popover_window(w);
         }
-        // Library / settings — no chrome, no vibrancy. CSS backdrop-filter
+        // Library — no chrome, no vibrancy. CSS backdrop-filter
         // gives inner panels glass in the webview.
         _ => {}
     }

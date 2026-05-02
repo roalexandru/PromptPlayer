@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { ipc, type Prompt, type ProfileKind } from "$lib/ipc";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
   import { IS_MAC } from "$lib/platform";
   import CadencePreview from "$lib/components/CadencePreview.svelte";
   import HotkeyRecorder from "$lib/components/HotkeyRecorder.svelte";
@@ -138,6 +139,26 @@
     await togglePromptEnabled(draft, new Event("synth"));
   }
 
+  async function togglePromptPinned(p: Prompt, e: Event) {
+    e.stopPropagation();
+    e.preventDefault();
+    const next = !p.pinned;
+    prompts = prompts.map((x) => (x.id === p.id ? { ...x, pinned: next } : x));
+    if (draft && draft.id === p.id) draft = { ...draft, pinned: next };
+    try {
+      await ipc.setPromptPinned(p.id, next);
+    } catch (err) {
+      error = String(err);
+      prompts = prompts.map((x) => (x.id === p.id ? { ...x, pinned: !next } : x));
+      if (draft && draft.id === p.id) draft = { ...draft, pinned: !next };
+    }
+  }
+
+  async function toggleDraftPinned() {
+    if (!draft) return;
+    await togglePromptPinned(draft, new Event("synth"));
+  }
+
   async function deleteCurrent() {
     if (!draft) return;
     if (!confirm(`Delete "${draft.name}"? This removes the .pp.md file.`)) return;
@@ -188,6 +209,127 @@
     }
   }
 
+  // ──────────────────────────────────────────────────────────────────────
+  // §10.2 helpers — scope auto-capture, expression Test, import/export.
+  // ──────────────────────────────────────────────────────────────────────
+
+  // ── Scope editor ──
+  // The scope frontmatter exists in YAML but had no editor surface; new in
+  // this slice. We expose the `app` bundle-ID list (chips) and the optional
+  // window-title-regex. URL-regex / time-of-day stay frontmatter-only —
+  // niche enough that yaml editing is fine.
+  function ensureScope(p: Prompt) {
+    if (!p.scope) p.scope = { app: [], "window-title-regex": null, "url-regex": null, "time-of-day": null };
+    return p.scope;
+  }
+  function addScopeApp(bundleId: string) {
+    if (!draft || !bundleId.trim()) return;
+    const s = ensureScope(draft);
+    if (!s.app.includes(bundleId)) {
+      s.app = [...s.app, bundleId];
+      markDirty();
+    }
+  }
+  function removeScopeApp(bundleId: string) {
+    if (!draft?.scope) return;
+    draft.scope = { ...draft.scope, app: draft.scope.app.filter((b) => b !== bundleId) };
+    markDirty();
+  }
+
+  // ── Capture-foreground flow ──
+  // Hide library, count down 3s while the user focuses the target app, ask
+  // the backend which app is foreground, then re-show. The 3s is enough for
+  // a single deliberate window switch (Cmd+Tab + click) on every system
+  // we've tested. If the captured app is Prompt Player itself the user
+  // didn't switch in time — drop it on the floor with a small toast.
+  let capturing = $state(false);
+  let captureCountdown = $state(3);
+  let captureMsg = $state<string | null>(null);
+  async function captureScope() {
+    if (!draft || capturing) return;
+    capturing = true;
+    captureMsg = null;
+    try {
+      const win = getCurrentWindow();
+      await win.hide();
+      for (let i = 3; i > 0; i--) {
+        captureCountdown = i;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      const fg = await ipc.captureForegroundApp();
+      await win.show();
+      await win.setFocus();
+      const id = fg.bundleId ?? fg.executable ?? null;
+      if (!id) {
+        captureMsg = "Could not identify foreground app.";
+      } else if (id.includes("promptplayer") || id.includes("prompt-player") || id.toLowerCase().includes("prompt player")) {
+        captureMsg = "Captured Prompt Player itself — switch to a different app first.";
+      } else {
+        addScopeApp(id);
+        captureMsg = `Added: ${fg.name ?? id}`;
+      }
+    } catch (e) {
+      captureMsg = `Capture failed: ${e}`;
+      try { await getCurrentWindow().show(); } catch {}
+    } finally {
+      capturing = false;
+    }
+  }
+
+  // ── Expression Test ──
+  // Runs the body through expressions + placeholders so authors can verify
+  // a `${{ now.toISOString() }}` block resolves the way they expect without
+  // firing the prompt for real. Empty clipboard / selection / app metadata
+  // is documented in the helper.
+  let testOpen = $state(false);
+  let testResult = $state<string>("");
+  let testRunning = $state(false);
+  async function runTestExpansion() {
+    if (!draft) return;
+    testRunning = true;
+    testOpen = true;
+    try {
+      testResult = await ipc.expandPromptText(draft.body);
+    } catch (e) {
+      testResult = `[error: ${e}]`;
+    } finally {
+      testRunning = false;
+    }
+  }
+
+  // ── Import / Export ──
+  async function importFile() {
+    const picked = await openFileDialog({
+      title: "Import .pp.md",
+      multiple: false,
+      filters: [{ name: "Prompt Player", extensions: ["md"] }],
+    });
+    if (!picked || Array.isArray(picked)) return;
+    try {
+      const p = await ipc.importPrompt(picked);
+      await refresh();
+      selectedId = p.id;
+      draft = clone(p);
+      dirty = false;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+  async function exportFile() {
+    if (!draft) return;
+    const dest = await saveFileDialog({
+      title: "Export prompt",
+      defaultPath: `${draft.id}.pp.md`,
+      filters: [{ name: "Prompt Player", extensions: ["md"] }],
+    });
+    if (!dest) return;
+    try {
+      await ipc.exportPrompt(draft.id, dest);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   onMount(() => {
     refresh();
     refreshArmed();
@@ -212,6 +354,12 @@
     <div class="topbar-actions">
       <button class="ghost" onclick={createNew} title={`New prompt (${NEW_HINT})`}>
         + New
+      </button>
+      <button class="ghost" onclick={importFile} title="Import a .pp.md file">
+        Import…
+      </button>
+      <button class="ghost" onclick={exportFile} disabled={!draft} title="Export the selected prompt">
+        Export…
       </button>
       <button class="arm-btn" class:armed onclick={toggleArmed} title="Global enable/disable">
         <span class="dot"></span>
@@ -240,6 +388,7 @@
               class="prompt-item"
               class:active={selectedId === p.id}
               class:dim={!p.enabled}
+              title={p.name}
               onclick={() => selectPrompt(p)}
             >
               <div class="prompt-name">{p.name}</div>
@@ -248,6 +397,26 @@
                   <code class="chip">{t}{p.commit_char}</code>
                 {/each}
               </div>
+            </button>
+            <button
+              class="row-pin"
+              class:on={p.pinned}
+              aria-pressed={p.pinned}
+              title={p.pinned ? "Unpin from menu bar" : "Pin to menu bar"}
+              onclick={(e) => togglePromptPinned(p, e)}
+            >
+              <!-- Vertical thumbtack — recognizable at small sizes. The on/off
+                   states differ in fill (solid blue) vs outline (~60% gray)
+                   so it's obvious whether a prompt is pinned without hover. -->
+              {#if p.pinned}
+                <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+                  <path fill="currentColor" d="M16 9V4l1-1V2H7v1l1 1v5l-2 2v2h5v7l1 1 1-1v-7h5v-2l-2-2z"/>
+                </svg>
+              {:else}
+                <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+                  <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" d="M16 9V4l1-1V2H7v1l1 1v5l-2 2v2h5v7l1 1 1-1v-7h5v-2z"/>
+                </svg>
+              {/if}
             </button>
             <button
               class="row-switch"
@@ -262,8 +431,14 @@
           </li>
         {/each}
         {#if prompts.length === 0}
-          <li class="empty">
-            No prompts. Click <kbd>+ New</kbd> to create one.
+          <li class="empty quick-start">
+            <div class="qs-title">Welcome to Prompt Player</div>
+            <ol class="qs-steps">
+              <li>Click <kbd>+ New</kbd> to create a prompt.</li>
+              <li>Pin it (📌) to surface it in the menu bar.</li>
+              <li>Type its trigger anywhere — e.g. <kbd>hello&gt;</kbd> — to fire it.</li>
+              <li>Press <kbd>{IS_MAC ? "⌘⇧V" : "Ctrl+⇧V"}</kbd> to open the picker.</li>
+            </ol>
           </li>
         {/if}
       </ul>
@@ -299,6 +474,25 @@
               >
                 <span class="prompt-knob"></span>
                 <span class="prompt-toggle-label">{draft.enabled ? "Enabled" : "Disabled"}</span>
+              </button>
+              <button
+                class="pin-btn"
+                class:on={draft.pinned}
+                aria-pressed={draft.pinned}
+                onclick={toggleDraftPinned}
+                title={draft.pinned ? "Unpin from menu bar" : "Pin to menu bar"}
+              >
+                {#if draft.pinned}
+                  <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+                    <path fill="currentColor" d="M16 9V4l1-1V2H7v1l1 1v5l-2 2v2h5v7l1 1 1-1v-7h5v-2l-2-2z"/>
+                  </svg>
+                  Pinned
+                {:else}
+                  <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+                    <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" d="M16 9V4l1-1V2H7v1l1 1v5l-2 2v2h5v7l1 1 1-1v-7h5v-2z"/>
+                  </svg>
+                  Pin
+                {/if}
               </button>
               <button class="ghost danger" onclick={deleteCurrent}>Delete</button>
               <button class="primary" onclick={save} disabled={!dirty}>
@@ -416,6 +610,61 @@
             </div>
 
             <details class="overrides">
+              <summary>Scope (per-app routing)</summary>
+              <div class="form-grid">
+                <div class="field" style="grid-column: 1 / -1">
+                  <label>Apps (bundle ID / executable)</label>
+                  <div class="chips">
+                    {#each (draft.scope?.app ?? []) as bid (bid)}
+                      <span class="chip">
+                        {bid}
+                        <button class="chip-x" onclick={() => removeScopeApp(bid)} title="Remove">×</button>
+                      </span>
+                    {/each}
+                    {#if (draft.scope?.app ?? []).length === 0}
+                      <span class="chip-empty">No apps yet — capture one or paste a bundle ID below.</span>
+                    {/if}
+                  </div>
+                  <div class="row gap">
+                    <input
+                      class="grow"
+                      placeholder="com.example.app  (or full /path/to/app.exe)"
+                      onkeydown={(e) => {
+                        if (e.key === "Enter") {
+                          const el = e.target as HTMLInputElement;
+                          addScopeApp(el.value);
+                          el.value = "";
+                        }
+                      }}
+                    />
+                    <button class="ghost" onclick={captureScope} disabled={capturing} title="Library hides for 3s while you focus the target app">
+                      {capturing ? `Capturing… ${captureCountdown}` : "Capture (3s)"}
+                    </button>
+                  </div>
+                  {#if captureMsg}
+                    <small class="hint">{captureMsg}</small>
+                  {/if}
+                </div>
+
+                <div class="field" style="grid-column: 1 / -1">
+                  <label for="wtitle">Window title regex (optional)</label>
+                  <input
+                    id="wtitle"
+                    placeholder=".*chat.*"
+                    value={draft.scope?.["window-title-regex"] ?? ""}
+                    oninput={(e) => {
+                      if (!draft) return;
+                      const v = (e.target as HTMLInputElement).value;
+                      ensureScope(draft)["window-title-regex"] = v === "" ? null : v;
+                      markDirty();
+                    }}
+                  />
+                  <small>Narrows match within the selected apps. Per §4.2.</small>
+                </div>
+              </div>
+            </details>
+
+            <details class="overrides">
               <summary>Cadence overrides (advanced)</summary>
               <div class="form-grid">
                 <div class="field narrow">
@@ -529,7 +778,17 @@
             </details>
 
             <div class="body-section">
-              <label class="body-label">Body</label>
+              <div class="body-header">
+                <label class="body-label">Body</label>
+                <div class="body-actions">
+                  <button class="ghost small" onclick={runTestExpansion} disabled={testRunning} title="Evaluate placeholders + ${'${{...}}'} expressions against now">
+                    {testRunning ? "Testing…" : "Test expansion"}
+                  </button>
+                  {#if testOpen}
+                    <button class="ghost small" onclick={() => (testOpen = false)} title="Hide test result">Hide</button>
+                  {/if}
+                </div>
+              </div>
               <textarea
                 bind:value={draft.body}
                 oninput={markDirty}
@@ -542,6 +801,15 @@
                 (<code>$CLIPBOARD</code>, <code>$SELECTION</code>, <code>$DATE</code>…),
                 and TypeScript expressions (<code>${"{{ now.toISOString() }}"}</code>).
               </small>
+              {#if testOpen}
+                <div class="test-pane">
+                  <div class="test-header">
+                    <span>Expanded preview</span>
+                    <small class="hint">No clipboard / selection / app context — those resolve at fire time.</small>
+                  </div>
+                  <pre class="test-body">{testResult || "(empty)"}</pre>
+                </div>
+              {/if}
             </div>
           </section>
         {:else}
@@ -830,9 +1098,110 @@
     transition: transform 140ms ease;
   }
   .row-switch.on .row-knob { transform: translateX(12px); }
+
+  /* Pin button on each list row. Always visible — outline at ~65% opacity
+     when not pinned, filled accent blue when pinned. Without the always-on
+     visibility, users can't discover it (real feedback from a v0.1 review).
+     Slight bg lift on hover for click affordance. */
+  .row-pin {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px; height: 26px;
+    margin-right: 2px;
+    background: transparent;
+    border: none;
+    border-radius: 5px;
+    color: rgba(255, 255, 255, 0.55);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: color 120ms ease, background-color 120ms ease;
+  }
+  .row-pin:hover { background: rgba(255, 255, 255, 0.10); color: rgba(255, 255, 255, 0.92); }
+  .row-pin.on { color: rgba(10, 132, 255, 1); background: rgba(10, 132, 255, 0.10); }
+  .row-pin.on:hover { color: rgba(10, 132, 255, 1); background: rgba(10, 132, 255, 0.18); }
+
+  /* Pin button in the editor header — text + icon, sits next to the
+     Enabled toggle. */
+  .pin-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    border: 1px solid var(--separator);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-secondary, rgba(255,255,255,0.6));
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
+  }
+  .pin-btn:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text, rgba(255,255,255,0.92));
+  }
+  .pin-btn.on {
+    color: rgba(10, 132, 255, 1);
+    border-color: rgba(10, 132, 255, 0.4);
+    background: rgba(10, 132, 255, 0.10);
+  }
+  .pin-btn.on:hover {
+    background: rgba(10, 132, 255, 0.18);
+  }
+  @media (prefers-color-scheme: light) {
+    .row-pin { color: rgba(0, 0, 0, 0.5); }
+    .row-pin:hover { background: rgba(0, 0, 0, 0.07); color: rgba(0, 0, 0, 0.88); }
+    .row-pin.on { color: rgba(0, 122, 255, 1); background: rgba(0, 122, 255, 0.08); }
+    .row-pin.on:hover { background: rgba(0, 122, 255, 0.14); }
+    .pin-btn { color: rgba(0,0,0,0.6); }
+    .pin-btn:hover { background: rgba(0,0,0,0.05); color: rgba(0,0,0,0.88); }
+    .pin-btn.on {
+      color: rgba(0, 122, 255, 1);
+      border-color: rgba(0, 122, 255, 0.4);
+      background: rgba(0, 122, 255, 0.08);
+    }
+  }
+
+  /* Quick Start panel — replaces the bare "No prompts" empty state. */
+  .quick-start {
+    padding: 16px 14px !important;
+    text-align: left !important;
+    color: var(--text-secondary, rgba(255,255,255,0.7)) !important;
+  }
+  .qs-title {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: var(--text, rgba(255,255,255,0.92));
+  }
+  .qs-steps {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .qs-steps li { margin-bottom: 2px; }
+  .qs-steps kbd {
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 3px;
+    padding: 1px 5px;
+  }
+  @media (prefers-color-scheme: light) {
+    .qs-steps kbd { background: rgba(0, 0, 0, 0.06); }
+  }
+
   .prompt-name {
-    font-weight: 500; font-size: 13px;
+    font-weight: 500; font-size: 12.5px;
     margin-bottom: 3px; line-height: 1.3;
+    /* Single-line truncation. Full name is available via the parent
+       button's title attribute. Stops "Product spec from one-liner" from
+       wrapping into two lines and doubling row height. */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .prompt-trigs { display: flex; gap: 3px; flex-wrap: wrap; }
   .chip {
@@ -1087,6 +1456,100 @@
     border-radius: 3px;
     font-size: 11px;
     color: var(--text-secondary);
+  }
+
+  /* Body header — label + Test/Hide buttons on the right. */
+  .body-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  .body-header .body-label { margin-bottom: 0; }
+  .body-actions { display: flex; gap: 6px; }
+  .ghost.small { font-size: 11px; padding: 4px 9px; }
+
+  /* Expansion preview — boxed result of running expressions + placeholders
+     against the body. Read-only; <pre> preserves whitespace. */
+  .test-pane {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--selection-border);
+    border-radius: 6px;
+    background: var(--hover);
+  }
+  .test-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+  }
+  .test-header .hint {
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  .test-body {
+    margin: 0;
+    padding: 8px 10px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow: auto;
+    background: var(--bg-base, transparent);
+    border-radius: 4px;
+  }
+
+  /* Scope app chips. */
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+    min-height: 24px;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 6px 3px 8px;
+    background: var(--hover);
+    border: 1px solid var(--selection-border);
+    border-radius: 4px;
+    font-size: 11.5px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .chip-x {
+    background: transparent;
+    border: 0;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 0 2px;
+    font-size: 14px;
+    line-height: 1;
+  }
+  .chip-x:hover { color: var(--text-primary); }
+  .chip-empty {
+    color: var(--text-muted);
+    font-size: 11.5px;
+    font-style: italic;
+  }
+  .row.gap { display: flex; gap: 6px; align-items: center; }
+  .grow { flex: 1; }
+  small.hint {
+    display: block;
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 11px;
   }
 
   /* Empty state */

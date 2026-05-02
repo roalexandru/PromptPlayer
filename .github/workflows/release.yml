@@ -159,12 +159,16 @@ jobs:
             os: macos-latest
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
-            artifact_glob: "src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Prompt Player_*.dmg"
+            # DMG = primary distributable; .app.tar.gz + .sig = updater bundle
+            # consumed by tauri-plugin-updater. Both must be uploaded for
+            # in-app updates to work.
+            artifact_glob: "src-tauri/target/aarch64-apple-darwin/release/bundle/{dmg/Prompt Player_*.dmg,macos/Prompt Player.app.tar.gz,macos/Prompt Player.app.tar.gz.sig}"
           - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             args: ""
-            artifact_glob: "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/Prompt Player_*.msi"
+            # MSI = primary; .msi.zip + .sig = updater bundle.
+            artifact_glob: "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/Prompt Player_*.{msi,msi.zip,msi.zip.sig}"
     runs-on: ${{ matrix.platform.os }}
 
     steps:
@@ -217,8 +221,14 @@ jobs:
         run: cargo test --workspace --all-targets
 
       # Direct `tauri build` (not tauri-action) so we control the upload step
-      # and gate it on e2e green.
+      # and gate it on e2e green. Signing env vars cause Tauri to emit the
+      # updater archive (.app.tar.gz on Mac, .msi.zip on Win) plus a `.sig`
+      # next to it; the in-app updater verifies that signature against the
+      # public key embedded in tauri.conf.json before installing.
       - name: Tauri build (${{ matrix.platform.name }})
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build ${{ matrix.platform.args }}
 
       - name: E2E (macOS)
@@ -248,6 +258,76 @@ jobs:
             echo "uploading $f"
             gh release upload "${{ github.ref_name }}" "$f" --clobber
           done
+
+  # Compose `latest.json` (the manifest tauri-plugin-updater fetches) once
+  # all platform legs have uploaded their signed bundles. Format per
+  # https://v2.tauri.app/plugin/updater/#static-json-file:
+  #   { version, notes, pub_date, platforms: { <triple>: { signature, url } } }
+  # The signature is the raw content of the `.sig` file Tauri emitted next
+  # to the updater archive; the URL is the GitHub release-asset download URL.
+  # Skipped on platform-leg failure — partial manifests would brick clients.
+  compose-updater-manifest:
+    name: compose updater latest.json
+    needs: release-platform
+    if: success() && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compose and upload latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          repo="${{ github.repository }}"
+          base="https://github.com/${repo}/releases/download/${tag}"
+
+          mkdir -p sigs
+          # Asset-name conventions match the artifact_glob entries above.
+          # If you rename a bundle, update both places together.
+          mac_sig_asset="Prompt Player.app.tar.gz.sig"
+          win_sig_asset="Prompt Player_${version}_x64_en-US.msi.zip.sig"
+          mac_archive="Prompt Player.app.tar.gz"
+          win_archive="Prompt Player_${version}_x64_en-US.msi.zip"
+
+          # `gh release download` errors if the asset is missing. We do not
+          # tolerate missing signatures — better to fail the manifest than
+          # ship one that omits a platform silently.
+          gh release download "$tag" -R "$repo" -p "$mac_sig_asset" -D sigs --clobber
+          gh release download "$tag" -R "$repo" -p "$win_sig_asset" -D sigs --clobber
+          mac_sig=$(cat "sigs/${mac_sig_asset}")
+          win_sig=$(cat "sigs/${win_sig_asset}")
+
+          notes=$(gh release view "$tag" --json body -q .body)
+          pub_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # url-encode spaces in the asset filenames.
+          mac_url="${base}/${mac_archive// /%20}"
+          win_url="${base}/${win_archive// /%20}"
+
+          jq -n \
+            --arg version "$version" \
+            --arg notes "$notes" \
+            --arg pub_date "$pub_date" \
+            --arg mac_url "$mac_url" \
+            --arg win_url "$win_url" \
+            --arg mac_sig "$mac_sig" \
+            --arg win_sig "$win_sig" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-aarch64": { signature: $mac_sig, url: $mac_url },
+                "windows-x86_64": { signature: $win_sig, url: $win_url }
+              }
+            }' > latest.json
+
+          gh release upload "$tag" latest.json --clobber
 
   # Runs once after all platform legs complete, regardless of pass/fail. If
   # both legs failed, this still runs but does nothing useful — the release

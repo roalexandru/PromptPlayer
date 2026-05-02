@@ -70,6 +70,7 @@ pub fn create_prompt(
         hotkey: None,
         tags: Vec::new(),
         enabled: true,
+        pinned: false,
         body: " your new prompt body here.".into(),
         source_path: Some(path.clone()),
     };
@@ -91,5 +92,17 @@ pub fn set_prompt_enabled(
 ) -> IpcResult<()> {
     into_ipc(store.set_enabled(&prompt_id, enabled).map(|updated| {
         tracing::info!("prompt {} → enabled={}", updated.id, updated.enabled);
+    }))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_prompt_pinned(
+    prompt_id: String,
+    pinned: bool,
+    store: tauri::State<'_, PromptStore>,
+) -> IpcResult<()> {
+    into_ipc(store.set_pinned(&prompt_id, pinned).map(|updated| {
+        tracing::info!("prompt {} → pinned={}", updated.id, updated.pinned);
     }))
 }

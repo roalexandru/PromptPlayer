@@ -49,6 +49,18 @@ pub enum AppError {
 
     #[error("internal: {0}")]
     Internal(String),
+
+    #[error("updater unavailable: {0}")]
+    UpdaterUnavailable(String),
+
+    #[error("update check failed: {0}")]
+    UpdaterCheckFailed(String),
+
+    #[error("update install failed: {0}")]
+    UpdaterInstallFailed(String),
+
+    #[error("no update available")]
+    UpdaterNoUpdateAvailable,
 }
 
 impl AppError {
@@ -66,6 +78,10 @@ impl AppError {
             AppError::Tauri(_) => "tauri",
             AppError::Enigo(_) => "enigo",
             AppError::Internal(_) => "internal",
+            AppError::UpdaterUnavailable(_) => "updater-unavailable",
+            AppError::UpdaterCheckFailed(_) => "updater-check-failed",
+            AppError::UpdaterInstallFailed(_) => "updater-install-failed",
+            AppError::UpdaterNoUpdateAvailable => "updater-no-update-available",
         }
     }
 }

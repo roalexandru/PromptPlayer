@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Baseline capabilities every window inherits",
-  "windows": ["library", "picker", "settings", "tray-popup"],
+  "windows": ["library", "picker", "tray-popup"],
   "permissions": [
     "core:default",
     "core:window:default",
@@ -15,6 +15,8 @@
     "dialog:default",
     "autostart:default",
     "aptabase:allow-track-event",
-    "os:default"
+    "os:default",
+    "updater:default",
+    "process:default"
   ]
 }

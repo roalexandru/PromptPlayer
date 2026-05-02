@@ -41,6 +41,7 @@ struct Frontmatter {
     /// If unset, derived from the file name.
     id: Option<String>,
     enabled: Option<bool>,
+    pinned: Option<bool>,
 }
 
 /// Parse a `.pp.md` file: leading `---\n<yaml>\n---\n<body>`.
@@ -117,6 +118,7 @@ pub fn parse_str(raw: &str, path: &Path) -> Result<Prompt, ParseError> {
         hotkey: fm.hotkey,
         tags: fm.tags,
         enabled: fm.enabled.unwrap_or(true),
+        pinned: fm.pinned.unwrap_or(false),
         body,
         source_path: None,
     })
@@ -150,12 +152,17 @@ pub fn serialize(prompt: &Prompt) -> Result<String, serde_yaml::Error> {
         tags: &'a Vec<String>,
         #[serde(skip_serializing_if = "is_true")]
         enabled: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        pinned: bool,
     }
     fn is_zero(v: &i32) -> bool {
         *v == 0
     }
     fn is_true(v: &bool) -> bool {
         *v
+    }
+    fn is_false(v: &bool) -> bool {
+        !*v
     }
     fn is_default_overrides(v: &crate::typer::TypingOverrides) -> bool {
         v.iki_median_ms.is_none()
@@ -180,6 +187,7 @@ pub fn serialize(prompt: &Prompt) -> Result<String, serde_yaml::Error> {
         hotkey: &prompt.hotkey,
         tags: &prompt.tags,
         enabled: prompt.enabled,
+        pinned: prompt.pinned,
     };
     let yaml = serde_yaml::to_string(&out)?;
     Ok(format!("---\n{yaml}---\n{}", prompt.body))

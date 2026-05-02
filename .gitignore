@@ -34,6 +34,11 @@ src-tauri/WixTools*/
 .env
 .env.local
 
+# Tauri updater signing key — private half. Never commit. The matching
+# public half (updater.key.pub) IS committed and embedded in tauri.conf.json
+# so installed apps can verify update signatures.
+src-tauri/updater.key
+
 # Claude Code session state
 .claude/
 .claude.json

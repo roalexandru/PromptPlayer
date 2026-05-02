@@ -27,3 +27,11 @@ pub fn kill(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) {
     state.cancel_playback();
     telemetry::send(&app, TelemetryEvent::PromptKilled);
 }
+
+/// True while a typing playback is in flight. Used by the tray Quit handler
+/// to surface a confirm dialog instead of dropping mid-stream.
+#[tauri::command]
+#[specta::specta]
+pub fn is_playing(state: tauri::State<'_, Arc<AppState>>) -> bool {
+    state.is_playing()
+}

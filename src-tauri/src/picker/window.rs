@@ -4,8 +4,8 @@
 //! - Windows: `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)`.
 //!
 //! Both APIs cause OS-level screen recorders, broadcasters, and capture-card
-//! drivers to render this window as black/missing. Toggle in settings ("Show
-//! during screen sharing") for rehearsal mode (Phase 13).
+//! drivers to render this window as black/missing. Default-on with no toggle
+//! — rehearsal recording of the picker UI itself is a niche we don't support.
 
 use tauri::WebviewWindow;
 

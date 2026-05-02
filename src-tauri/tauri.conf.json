@@ -41,14 +41,6 @@
         "url": "picker.html"
       },
       {
-        "label": "settings",
-        "title": "Prompt Player Settings",
-        "width": 640,
-        "height": 720,
-        "visible": false,
-        "url": "settings.html"
-      },
-      {
         "label": "tray-popup",
         "title": "Prompt Player",
         "width": 300,
@@ -66,6 +58,17 @@
     ],
     "security": {
       "csp": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/roalexandru/PromptPlayer/releases/latest/download/latest.json"
+      ],
+      "pubkey": "ZFc1MGNuVnpkR1ZrSUdOdmJXMWxiblE2SUcxcGJtbHphV2R1SUhCMVlteHBZeUJyWlhrNklEZEJOVGRDTkRnelJUSTFOekV3T0RZS1VsZFRSMFZHWm1sbk4xSllaV3hSUVdNNE9HNWFObkJ0Ym1sRldUSjRhMlpGTTA5NlZuUkNPVzF2VkU1b2RrNU5ObFJOTW01emJYY0s=",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   },
   "bundle": {

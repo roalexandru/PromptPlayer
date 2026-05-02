@@ -40,10 +40,6 @@ pub fn tray_open(
             show_picker_window(&app);
             Ok(())
         }
-        "settings" => {
-            show_window(&app, "settings");
-            Ok(())
-        }
         "about" => {
             use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
             app.dialog()
@@ -66,6 +62,27 @@ pub fn tray_open(
 #[specta::specta]
 pub fn tray_quit(app: AppHandle) {
     app.exit(0);
+}
+
+/// Run a prompt from the tray (left-click on a pinned row). Hides the popup
+/// first, then fires through the picker pipeline at human cadence. The
+/// menu-bar / system-tray click never activates the app (`NSNonactivatingPanelMask`
+/// on macOS, `WS_EX_NOACTIVATE` on Windows), so the original foreground app
+/// is still focused — no focus-restore dance needed.
+#[tauri::command]
+#[specta::specta]
+pub fn tray_fire_prompt(
+    app: AppHandle,
+    prompt_id: String,
+    ctx: tauri::State<'_, AppContext>,
+) -> IpcResult<()> {
+    if let Some(w) = app.get_webview_window("tray-popup") {
+        let _ = w.hide();
+    }
+    remove_outside_click_monitor_if_present(&app);
+    let fire = crate::app::FireService::new(ctx.inner().clone(), app.clone());
+    fire.fire_from_picker(&prompt_id, crate::app::fire::PickMode::Human);
+    Ok(())
 }
 
 #[tauri::command]

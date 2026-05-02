@@ -46,8 +46,16 @@ pub enum TelemetryEvent {
     ExpressionError {
         kind: ExpressionErrorKind,
     },
-    UpdateCheck,
-    UpdateApplied,
+    UpdateCheck {
+        available: bool,
+        current_version: &'static str,
+    },
+    UpdateApplied {
+        from_version: &'static str,
+        /// The version we updated to. `String` because it comes from the
+        /// network (`update.version`), not a `env!()` literal.
+        to_version: String,
+    },
     SecureInputDetected,
     RdpDetected,
 }
@@ -187,8 +195,8 @@ impl TelemetryEvent {
             Self::PickerSearchChars { .. } => "picker_search_chars",
             Self::ArmToggled { .. } => "arm_toggled",
             Self::ExpressionError { .. } => "expression_error",
-            Self::UpdateCheck => "update_check",
-            Self::UpdateApplied => "update_applied",
+            Self::UpdateCheck { .. } => "update_check",
+            Self::UpdateApplied { .. } => "update_applied",
             Self::SecureInputDetected => "secure_input_detected",
             Self::RdpDetected => "rdp_detected",
         }

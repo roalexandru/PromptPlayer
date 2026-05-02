@@ -13,7 +13,7 @@
 //! 5. Is shown via `makeKeyAndOrderFront(nil)`. **Never** call
 //!    `NSApp.activate(ignoringOtherApps:)` — that's what was switching
 //!    Spaces on every previous attempt. With `.accessory` activation policy
-//!    + space-neutral library/settings windows (see `make_window_space_neutral`),
+//!    + the space-neutral library window (see `make_window_space_neutral`),
 //!    activation does not switch Spaces, so we activate the app for the
 //!    picker (it needs key/focus) but not for the popover.
 
@@ -131,10 +131,9 @@ fn apply_options(window: &tauri::WebviewWindow, opts: &PanelOptions) {
     }
 }
 
-/// Apply `CanJoinAllSpaces | FullScreenAuxiliary` to a non-popover window
-/// (library, settings) so when our app is activated to summon the picker,
-/// macOS doesn't switch the user back to whatever Space these windows live
-/// on.
+/// Apply `CanJoinAllSpaces | FullScreenAuxiliary` to the library window so
+/// when our app is activated to summon the picker, macOS doesn't switch the
+/// user back to whatever Space the library lives on.
 pub fn make_window_space_neutral(window: &tauri::WebviewWindow) {
     let Ok(ns_window_ptr) = window.ns_window() else {
         return;

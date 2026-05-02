@@ -133,6 +133,7 @@ mod tests {
             hotkey: None,
             tags: Vec::new(),
             enabled: true,
+            pinned: false,
             body: body.into(),
             source_path: None,
         }

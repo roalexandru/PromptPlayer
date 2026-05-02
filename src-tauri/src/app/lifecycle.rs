@@ -17,7 +17,7 @@ use crate::platform::macos::OutsideClickMonitor;
 use crate::platform::windows::OutsideClickMonitor;
 
 pub fn install(app: &tauri::App) {
-    for label in ["library", "picker", "settings", "tray-popup"] {
+    for label in ["library", "picker", "tray-popup"] {
         if let Some(w) = app.get_webview_window(label) {
             install_window_handlers(app.handle().clone(), label, w);
         }

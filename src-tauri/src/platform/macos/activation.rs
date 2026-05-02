@@ -14,9 +14,9 @@ use tauri::WebviewWindow;
 
 /// Bring our application to the foreground via `[NSApp activateIgnoringOtherApps:YES]`.
 ///
-/// Used by `show_window` for regular windows (library, settings) and the
-/// picker. With activation policy `.accessory`, this does NOT pull the user
-/// out of fullscreen-app Spaces.
+/// Used by `show_window` for the library window and the picker. With
+/// activation policy `.accessory`, this does NOT pull the user out of
+/// fullscreen-app Spaces.
 pub fn activate_app() {
     unsafe {
         let app: id = msg_send![class!(NSApplication), sharedApplication];

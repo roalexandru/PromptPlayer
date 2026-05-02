@@ -2,9 +2,11 @@
 //! `generate_handler!` aggregation lives in `app::setup`.
 
 pub mod armed;
+pub mod library;
 pub mod picker;
 pub mod prompts;
 pub mod tray;
+pub mod updater;
 
 /// Single source of truth for the command name list.
 ///
@@ -19,12 +21,14 @@ pub const COMMAND_NAMES: &[&str] = &[
     "get_armed",
     "toggle_armed",
     "kill",
+    "is_playing",
     "list_prompts",
     "library_root",
     "save_prompt",
     "create_prompt",
     "delete_prompt",
     "set_prompt_enabled",
+    "set_prompt_pinned",
     "picker_open",
     "picker_search",
     "picker_select",
@@ -32,6 +36,14 @@ pub const COMMAND_NAMES: &[&str] = &[
     "tray_open",
     "tray_quit",
     "tray_popup_hide",
+    "tray_fire_prompt",
+    "updater_current_version",
+    "updater_check",
+    "updater_install",
+    "capture_foreground_app",
+    "expand_prompt_text",
+    "import_prompt",
+    "export_prompt",
 ];
 
 #[cfg(test)]

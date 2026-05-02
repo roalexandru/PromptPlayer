@@ -15,6 +15,13 @@ async toggleArmed() : Promise<boolean> {
 async kill() : Promise<void> {
     await TAURI_INVOKE("kill");
 },
+/**
+ * True while a typing playback is in flight. Used by the tray Quit handler
+ * to surface a confirm dialog instead of dropping mid-stream.
+ */
+async isPlaying() : Promise<boolean> {
+    return await TAURI_INVOKE("is_playing");
+},
 async listPrompts() : Promise<Prompt[]> {
     return await TAURI_INVOKE("list_prompts");
 },
@@ -53,6 +60,14 @@ async deletePrompt(promptId: string) : Promise<Result<null, IpcError>> {
 async setPromptEnabled(promptId: string, enabled: boolean) : Promise<Result<null, IpcError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_prompt_enabled", { promptId, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setPromptPinned(promptId: string, pinned: boolean) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_prompt_pinned", { promptId, pinned }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -103,6 +118,80 @@ async trayPopupHide() : Promise<Result<null, IpcError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Run a prompt from the tray (left-click on a pinned row). Hides the popup
+ * first, then fires through the picker pipeline at human cadence. The
+ * menu-bar / system-tray click never activates the app (`NSNonactivatingPanelMask`
+ * on macOS, `WS_EX_NOACTIVATE` on Windows), so the original foreground app
+ * is still focused — no focus-restore dance needed.
+ */
+async trayFirePrompt(promptId: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tray_fire_prompt", { promptId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updaterCurrentVersion() : Promise<string> {
+    return await TAURI_INVOKE("updater_current_version");
+},
+async updaterCheck() : Promise<Result<UpdateInfo, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("updater_check") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updaterInstall() : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("updater_install") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async captureForegroundApp() : Promise<ForegroundAppInfo> {
+    return await TAURI_INVOKE("capture_foreground_app");
+},
+/**
+ * Run a string through the same placeholder + expression pipeline used at
+ * fire time. Powers the editor's "Test" button. Errors inside `${{ … }}`
+ * blocks surface inline as `[expr error: …]` (consistent with how typing
+ * would handle them). Tab-stops, choices, and selection are not resolved
+ * here — the body is rendered as if the user had no clipboard / selection
+ * context, which is the right default for an authoring preview.
+ */
+async expandPromptText(text: string) : Promise<string> {
+    return await TAURI_INVOKE("expand_prompt_text", { text });
+},
+/**
+ * Import a `.pp.md` file: read it, parse it (validates frontmatter),
+ * then copy into the library root with a fresh ID if one already exists.
+ * Returns the parsed `Prompt` so the frontend can select it immediately.
+ */
+async importPrompt(sourcePath: string) : Promise<Result<Prompt, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("import_prompt", { sourcePath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Export a prompt to a user-chosen path. Re-serializes the in-memory
+ * `Prompt` to `.pp.md` rather than copying the source file, so unsaved
+ * edits in the library don't get exported as the older on-disk version.
+ */
+async exportPrompt(promptId: string, destPath: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("export_prompt", { promptId, destPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -116,6 +205,12 @@ async trayPopupHide() : Promise<Result<null, IpcError>> {
 
 /** user-defined types **/
 
+/**
+ * Identifying info for a foreground app. Every field is optional because
+ * platforms surface different subsets — Mac always has bundle_id+name,
+ * Windows always has executable+window_title, neither has both.
+ */
+export type ForegroundAppInfo = { bundleId: string | null; name: string | null; executable: string | null; windowTitle: string | null }
 /**
  * Specta-friendly mirror of `AppError`. The IPC layer returns this so the
  * generated TypeScript bindings have a clean structured-error shape:
@@ -136,6 +231,13 @@ export type Prompt = { id: string; name: string; description?: string; triggers:
  */
 enabled?: boolean; 
 /**
+ * Tray surfacing flag. The menu-bar popup shows ONLY pinned prompts
+ * (Apple Shortcuts model). Unpinned prompts still live in the library
+ * and still fire from triggers — they're just not in the tray menu.
+ * Defaults to `false` so existing prompts don't crowd the tray.
+ */
+pinned?: boolean; 
+/**
  * Body of the prompt — Markdown source after frontmatter.
  */
 body: string }
@@ -153,6 +255,12 @@ highlights: number[] }
  * §7.1 `typing-overrides:` mapping.
  */
 export type TypingOverrides = { "iki-median-ms": number | null; "typo-rate": number | null; "pause-variance-scale": number | null; "burst-enabled": boolean | null; "typos-enabled": boolean | null; "pre-submit-pause-enabled": boolean | null; "send-final-enter": boolean | null }
+/**
+ * Result of a `check()` call. `version` and `notes` are populated only
+ * when an update is available; otherwise `available` is `false` and the
+ * fields are `None`.
+ */
+export type UpdateInfo = { available: boolean; currentVersion: string; version: string | null; notes: string | null }
 
 /** tauri-specta globals **/
 
