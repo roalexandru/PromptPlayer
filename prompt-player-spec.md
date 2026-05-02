@@ -384,9 +384,9 @@ hotkey-picker: cmd+shift+v
 hotkey-kill: cmd+shift+escape
 
 prompts:
-  - uses: ./prompts/work/                      # all .pp.md in dir
+  - uses: ./prompts/work/                        # all .pp.md in dir
   - uses: ./prompts/cursor-demos.pp.md
-  - uses: github:org/team-prompts@main       # Continue-style hub ref
+  - uses: github:org/team-prompts@main           # Continue-style hub ref
   - uses: file://~/team-prompts/onboarding.pp.md
 ```
 
@@ -518,7 +518,7 @@ Required for picker focus restoration and RDP detection.
 
 **First-run UX:** detect missing permissions, show a modal with deep-links to the relevant System Settings panes. Never silently fail — the #1 reason these tools feel broken.
 
-**Stable bundle ID** across all releases (`com.roalexandru.promptplayer` or similar). Espanso's biggest UX disaster is bumping the bundle ID per release, which invalidates Accessibility approval and makes users re-approve on every update. We avoid this entirely.
+**Stable bundle ID** across all releases (`com.roalexandru.promptplayer`). Espanso's biggest UX disaster is bumping the bundle ID per release, which invalidates Accessibility approval and makes users re-approve on every update. We avoid this entirely.
 
 **TCC reset utility** built into the app for cases where permissions get stuck:
 - Detect "approved but not working" via test-tap with timeout.
