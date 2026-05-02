@@ -153,6 +153,13 @@ pub fn send(app: &tauri::AppHandle, event: TelemetryEvent) {
 
 #[cfg(not(test))]
 fn forward_to_aptabase(app: &tauri::AppHandle, name: &str, props: Value) {
+    // CI / E2E launches set PROMPT_PLAYER_E2E=1 — drop the event entirely so
+    // automated installs/launches don't show up as real users in Aptabase.
+    // Real users never set this var.
+    if std::env::var_os("PROMPT_PLAYER_E2E").is_some() {
+        tracing::debug!("telemetry: dropped {} (E2E mode)", name);
+        return;
+    }
     use tauri_plugin_aptabase::EventTracker;
     let props_opt = match props {
         Value::Object(_)

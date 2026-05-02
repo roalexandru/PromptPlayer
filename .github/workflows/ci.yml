@@ -17,14 +17,15 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Fail fast if version numbers in package.json, tauri.conf.json, and
-  # Cargo.toml have drifted out of sync — these MUST match for the release
-  # workflow to publish a coherent artifact set.
-  version-consistency:
-    name: version consistency
+  # ~60s ubuntu fast feedback. Catches the cheap-to-find regressions before
+  # spinning up the slow Mac/Win matrix below. If smoke fails, no platform
+  # runner gets touched.
+  smoke:
+    name: smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Verify package.json / tauri.conf.json / Cargo.toml versions match
         shell: bash
         run: |
@@ -39,8 +40,49 @@ jobs:
             exit 1
           fi
 
+      - name: Bundle ID smoke (locked at com.roalexandru.promptplayer)
+        shell: bash
+        run: |
+          grep -q '"identifier": "com.roalexandru.promptplayer"' src-tauri/tauri.conf.json
+          echo "bundle ID OK"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: IPC lint (no raw invoke() outside `$lib/ipc`)
+        run: bash scripts/lint-ipc.sh
+      - name: Frontend typecheck
+        run: pnpm typecheck
+      - name: Frontend unit tests (Vitest)
+        run: pnpm test
+
+      # The IPC-registry cross-checks (commands::registry_tests) parse
+      # setup.rs as a string — no Cocoa / WebView2 needed, so they run on
+      # Linux. Catches generate_handler! / collect_commands! / .manage()
+      # drift before any platform-specific work runs.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo (smoke)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            src-tauri
+          shared-key: smoke
+      - name: Frontend production build (needed for tauri::generate_context!)
+        run: pnpm build
+      - name: Rust IPC-registry cross-check unit tests
+        run: cargo test -p prompt-player --lib commands::registry_tests
+
   rust:
     name: rust (${{ matrix.os }})
+    needs: smoke
     strategy:
       fail-fast: false
       matrix:
@@ -103,32 +145,3 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets
-
-      - name: Bundle ID smoke test (locked at com.roalexandru.promptplayer)
-        shell: bash
-        run: |
-          grep -q '"identifier": "com.roalexandru.promptplayer"' src-tauri/tauri.conf.json
-          echo "bundle ID OK"
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: IPC lint (no raw invoke() outside `$lib/ipc`)
-        shell: bash
-        run: bash scripts/lint-ipc.sh
-      - name: Type check
-        run: pnpm typecheck
-      - name: Unit tests (Vitest)
-        run: pnpm test
-      - name: Production build
-        run: pnpm build

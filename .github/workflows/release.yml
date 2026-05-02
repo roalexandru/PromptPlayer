@@ -2,6 +2,20 @@ name: Release
 
 # Triggered by pushing a `v*` tag (e.g. `v0.1.0`). Manual `workflow_dispatch`
 # is also accepted for testing without creating a tag.
+#
+# Topology:
+#
+#   smoke (~60s ubuntu) ─┐
+#                        ├─► create-release (5s) ──► release-platform[mac]   ─┐
+#                        │                          release-platform[win]   ─┤
+#                        │                                                   │
+#                        └────────────────────────────────────────────► populate-changelog
+#
+# Each release-platform leg is fully independent: rust tests → tauri build →
+# e2e (install + launch + verify) → upload its own artifact to the Release.
+# Mac (~6m) doesn't wait for Windows (~11m); Windows e2e failure doesn't pull
+# the Mac DMG. populate-changelog runs `if: always()` so it appends notes to
+# whatever artifacts made it.
 on:
   push:
     tags: ["v*"]
@@ -11,86 +25,152 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Gate the build on a fast green check — typecheck, frontend tests, and
-  # backend tests. If any fail, no DMG/MSI gets uploaded.
-  test:
-    name: tests
-    runs-on: macos-latest
+  # ~60s ubuntu fast-feedback gate. If anything here fails, no slow Mac/Win
+  # runner gets spun up. Covers: version drift across the three manifests,
+  # the IPC contract lint, frontend typecheck + vitest, and the IPC-registry
+  # cross-check unit tests (which catch generate_handler! / collect_commands!
+  # / .manage() drift before any platform-specific work runs).
+  smoke:
+    name: smoke
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify package.json / tauri.conf.json / Cargo.toml versions match
+        shell: bash
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          tauri=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          cargo=$(grep -m1 '^version' Cargo.toml | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
+          echo "package.json:     $pkg"
+          echo "tauri.conf.json:  $tauri"
+          echo "Cargo.toml:       $cargo"
+          if [ "$pkg" != "$tauri" ] || [ "$pkg" != "$cargo" ]; then
+            echo "::error::version mismatch — bump all three to the same value"
+            exit 1
+          fi
+
+      - name: Verify tag matches package.json (release builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          # Strip pre-release suffix (e.g. "0.1.0-rc.1" → "0.1.0") for the match.
+          tag_base="${tag%%-*}"
+          if [ "$pkg" != "$tag_base" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match package.json $pkg"
+            exit 1
+          fi
+
+      - name: Bundle ID smoke (locked at com.roalexandru.promptplayer)
+        shell: bash
+        run: |
+          grep -q '"identifier": "com.roalexandru.promptplayer"' src-tauri/tauri.conf.json
+          echo "bundle ID OK"
 
       - uses: pnpm/action-setup@v4
         with:
           version: 9
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
+      - run: pnpm install --frozen-lockfile
 
+      - name: IPC lint (no raw invoke() outside `$lib/ipc`)
+        run: bash scripts/lint-ipc.sh
+      - name: Frontend typecheck
+        run: pnpm typecheck
+      - name: Frontend unit tests (Vitest)
+        run: pnpm test
+
+      # Lib-level Rust unit tests run on Linux without WebView2 / Cocoa, so
+      # the IPC-registry cross-checks (commands::registry_tests) execute here
+      # too. They're the cheap drift-catchers; the full workspace test runs
+      # on each platform leg below.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
+      - name: Cache cargo (smoke)
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             .
             src-tauri
-            guest-helper
-
-      - name: Install pnpm deps
-        run: pnpm install --frozen-lockfile
-
-      - name: Frontend typecheck
-        run: pnpm typecheck
-
-      - name: Frontend unit tests
-        run: pnpm test
-
-      # tauri::generate_context!() reads frontendDist (../dist) at compile
-      # time and panics if the directory is missing. Build the frontend
-      # before cargo so the lib compiles for `cargo test`.
-      - name: Frontend production build
+          shared-key: smoke
+      - name: Frontend production build (needed for tauri::generate_context!)
         run: pnpm build
+      - name: Rust IPC-registry cross-check unit tests
+        run: cargo test -p prompt-player --lib commands::registry_tests
 
-      - name: Rust workspace tests
-        run: cargo test --workspace
+  # Create the empty Release shell up-front so the per-platform legs can each
+  # `gh release upload` independently without racing on creation. Release is
+  # left as a draft; populate-changelog (or you, manually) flips it.
+  create-release:
+    name: create release shell
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create draft release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists — skipping create"
+            exit 0
+          fi
+          gh release create "$tag" \
+            --draft \
+            --title "Prompt Player $tag" \
+            --notes "$(cat <<'EOF'
+          ## What's new
 
-  build:
-    name: build (${{ matrix.platform.name }})
-    needs: test
-    # tauri-action creates / updates a GitHub Release and uploads the
-    # DMG/MSI assets. That requires write access to repository contents
-    # — without this the API call fails with
-    # "Resource not accessible by integration".
+          Auto-generated changelog will be appended once both platform builds finish.
+
+          ### macOS install
+          DMG is built for Apple Silicon (arm64). First launch: right-click → **Open** (unsigned build).
+
+          ### Windows install
+          Run the MSI. SmartScreen may warn for unsigned builds — click **More info → Run anyway**.
+          EOF
+          )"
+
+  # Per-OS independent leg. Mac and Windows run in parallel and DO NOT block
+  # each other: Mac (~6m) uploads its DMG as soon as its e2e is green; Windows
+  # (~11m) uploads its MSI when ready. If one leg's e2e fails, only that
+  # leg's artifact is missing from the Release — the other still ships.
+  release-platform:
+    name: release (${{ matrix.platform.name }})
+    needs: create-release
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         platform:
-          # Apple Silicon-only: macos-latest runners are M1, so this is a
-          # native build (no x86_64 cross-compile, no lipo). If we ever need
-          # to ship for Intel Macs, add a second matrix entry with target
-          # x86_64-apple-darwin and bundle two DMGs.
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
+            artifact_glob: "src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Prompt Player_*.dmg"
           - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             args: ""
+            artifact_glob: "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/Prompt Player_*.msi"
     runs-on: ${{ matrix.platform.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # Tell Microsoft Defender to skip Cargo's churn directories on Windows.
-      # Defender real-time scan adds ~25% overhead to every file write/open;
-      # Cargo writes ~100k small files per build. Runner is ephemeral, so the
-      # exclusion is gone when the job ends.
+      # Defender exclusion saves ~25% on Windows wall-clock.
       - name: Disable Defender scan on build dirs (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -103,7 +183,6 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 9
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -113,7 +192,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform.target }}
-
+          components: clippy
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -121,59 +200,62 @@ jobs:
             .
             src-tauri
             guest-helper
+          shared-key: ${{ matrix.platform.name }}
 
       - name: Install pnpm deps
         run: pnpm install --frozen-lockfile
 
-      - name: Bundle ID smoke test (locked at com.roalexandru.promptplayer)
+      # Frontend dist must exist before cargo touches anything that pulls
+      # tauri::generate_context!() at compile time.
+      - name: Frontend build
+        run: pnpm build
+
+      - name: Clippy (correctness only)
+        run: cargo clippy --workspace --all-targets -- -D clippy::correctness
+
+      - name: Rust workspace tests
+        run: cargo test --workspace --all-targets
+
+      # Direct `tauri build` (not tauri-action) so we control the upload step
+      # and gate it on e2e green.
+      - name: Tauri build (${{ matrix.platform.name }})
+        run: pnpm tauri build ${{ matrix.platform.args }}
+
+      - name: E2E (macOS)
+        if: runner.os == 'macOS'
+        env:
+          TARGET_TRIPLE: ${{ matrix.platform.target }}
+        run: bash scripts/e2e-mac.sh
+
+      - name: E2E (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh scripts/e2e-win.ps1 -Target ${{ matrix.platform.target }}
+
+      # Upload only after e2e passes. `--clobber` so re-runs replace the asset.
+      - name: Upload artifact to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          grep -q '"identifier": "com.roalexandru.promptplayer"' src-tauri/tauri.conf.json
-          echo "bundle ID OK"
+          shopt -s nullglob
+          files=( ${{ matrix.platform.artifact_glob }} )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no artifact matched ${{ matrix.platform.artifact_glob }}"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            echo "uploading $f"
+            gh release upload "${{ github.ref_name }}" "$f" --clobber
+          done
 
-      # tauri-action handles: building the frontend, running cargo bundle,
-      # creating the GitHub Release (or appending to one if it already
-      # exists for the same tag), and uploading the DMG/MSI artifacts.
-      # Signing/notarization is intentionally absent — produces unsigned
-      # .dmg / .msi until you provision Apple Developer ID and Windows EV
-      # certificate. README documents the one-time bypass.
-      #
-      # Updater signing keys (TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]) are
-      # commented out — wire only when shipping the updater plugin.
-      - name: Build & publish via tauri-action
-        uses: tauri-apps/tauri-action@v0.6.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Prompt Player ${{ github.ref_name }}"
-          releaseBody: |
-            ## What's new
-
-            See the auto-generated changelog below.
-
-            ### macOS install
-            DMG is built for Apple Silicon (arm64). Intel Macs are not
-            currently supported — if you need an Intel build, ping the
-            maintainer.
-            First launch: right-click → **Open** (unsigned build).
-
-            ### Windows install
-            Run the MSI. SmartScreen may warn for unsigned builds — click **More info → Run anyway**.
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.platform.args }}
-
-  # Once both build matrix jobs have published their artifacts, populate the
-  # Release body with GitHub's native auto-generated changelog ("what
-  # changed since the previous tag"). Done as a separate job so it runs
-  # exactly once even though the matrix produces two builds.
+  # Runs once after all platform legs complete, regardless of pass/fail. If
+  # both legs failed, this still runs but does nothing useful — the release
+  # stays in draft with the canned notes from create-release.
   populate-changelog:
     name: populate auto-changelog
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release-platform
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -182,14 +264,18 @@ jobs:
       - name: Generate and apply auto-changelog
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
           tag="${{ github.ref_name }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            echo "no release at $tag — nothing to populate"
+            exit 0
+          fi
           notes=$(gh api \
             "repos/${{ github.repository }}/releases/generate-notes" \
             -f tag_name="$tag" \
             -q .body)
-          # Append below the canned install instructions tauri-action wrote.
           existing=$(gh release view "$tag" --json body -q .body)
           combined="${existing}
 
