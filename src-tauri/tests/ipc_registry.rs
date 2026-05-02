@@ -171,23 +171,24 @@ fn mock_app_with_state() -> tauri::App<tauri::test::MockRuntime> {
     let ctx = AppContext::new();
     // Seed ONE prompt so list_prompts has something to return — gives us
     // a realistic non-empty payload to deserialize as a sanity check.
-    ctx.prompts.replace_all(vec![prompt_player::prompts::Prompt {
-        id: "smoke-test".into(),
-        name: "Smoke test prompt".into(),
-        description: String::new(),
-        triggers: vec!["smoke".into()],
-        commit_char: '>',
-        priority: 0,
-        typing_profile: Default::default(),
-        typing_overrides: Default::default(),
-        scope: None,
-        filters: Vec::new(),
-        hotkey: None,
-        tags: Vec::new(),
-        enabled: true,
-        body: "smoke".into(),
-        source_path: None,
-    }]);
+    ctx.prompts
+        .replace_all(vec![prompt_player::prompts::Prompt {
+            id: "smoke-test".into(),
+            name: "Smoke test prompt".into(),
+            description: String::new(),
+            triggers: vec!["smoke".into()],
+            commit_char: '>',
+            priority: 0,
+            typing_profile: Default::default(),
+            typing_overrides: Default::default(),
+            scope: None,
+            filters: Vec::new(),
+            hotkey: None,
+            tags: Vec::new(),
+            enabled: true,
+            body: "smoke".into(),
+            source_path: None,
+        }]);
 
     // Reuse the production `manage_state` function — guarantees this test
     // sees every `.manage()` call the real app uses. If a new managed type
