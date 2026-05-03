@@ -356,8 +356,11 @@
   // prompts still fire from triggers; they're just not in the menu.
   const pinnedPrompts = $derived(prompts.filter((p) => p.pinned));
   const hasAnyPrompts = $derived(prompts.length > 0);
-  const primaryShortcut = IS_MAC ? "⌘⇧V" : "Ctrl+⇧V";
-  const libraryShortcut = IS_MAC ? "⌘L" : "Ctrl+L";
+  // Source of truth: src-tauri/src/app/shortcuts.rs.
+  // Picker (Command Palette): Modifiers::ALT | PRIMARY + Code::Backslash
+  //   → Mac: ⌘⌥\, Win: Ctrl+Alt+\.
+  // Library has no global shortcut registered — don't show one in the menu.
+  const primaryShortcut = IS_MAC ? "⌘⌥\\" : "Ctrl+Alt+\\";
   const quitShortcut = IS_MAC ? "⌘Q" : "Ctrl+Q";
 </script>
 
@@ -449,7 +452,6 @@
     onclick={() => action("library")}
   >
     <span class="label">Prompt Library</span>
-    <span class="shortcut">{libraryShortcut}</span>
   </button>
   <button
     class="row plain"
