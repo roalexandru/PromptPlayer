@@ -15,27 +15,23 @@ name: Release
 #                                                              - tauri-apps/tauri-action
 #                                                                (build + sign + upload
 #                                                                 .dmg/.msi/.app.tar.gz
-#                                                                 + .sig to draft Release)
+#                                                                 + .sig + latest.json
+#                                                                 to draft Release)
 #                                                              - e2e (validates the
 #                                                                bundle Tauri just built)
-#                                                                  ↓
-#                                                          compose-updater-manifest
-#                                                          (ubuntu, ~10s — downloads
-#                                                           .sig files, writes +
-#                                                           uploads latest.json)
 #                              ↓                                   ↓
 #                       publish-finalize  (ubuntu, ~5s)
-#                       needs: [rust-tests, release-platform, compose-updater-manifest]
+#                       needs: [rust-tests, release-platform]
 #                       if: success() — flips draft → published
 #                              ↓
 #                       populate-changelog  (ubuntu, ~30s)
 #                       if: always() — appends auto-changelog
 #
 # Why tauri-action: it knows the per-Tauri-version artifact layout (asset
-# names, signature formats) so we don't have to track every format change.
-# Earlier custom build+upload tripped over .msi.zip vs .msi.sig naming,
-# space-in-path globs, bash 3.2 mapfile compat, etc. tauri-action handles
-# all of that.
+# names, signature formats) AND auto-generates latest.json when signing
+# keys are set. Custom build+upload tripped over .msi.zip vs .msi.sig
+# naming, space-in-path globs, bash 3.2 mapfile compat, asset-name
+# mismatches in the compose step — all of which tauri-action handles.
 #
 # Why this shape:
 # - Rust tests are ONE job on macOS (most platform-agnostic) running in
@@ -287,8 +283,7 @@ jobs:
       # of .app.tar.gz (Mac) / .msi.sig (Win) updater sidecars.
       #
       # Releases are uploaded as draft. publish-finalize flips them to
-      # published only when rust-tests + e2e + compose-updater-manifest
-      # all pass downstream.
+      # published only when rust-tests + e2e (this leg) all pass.
       - name: Build + upload via tauri-action
         uses: tauri-apps/tauri-action@v0.6.2
         env:
@@ -325,76 +320,12 @@ jobs:
   # The signature is the raw content of the `.sig` file Tauri emitted next
   # to the updater archive; the URL is the GitHub release-asset download URL.
   # Skipped on platform-leg failure — partial manifests would brick clients.
-  compose-updater-manifest:
-    name: compose updater latest.json
-    needs: release-platform
-    if: success() && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Compose and upload latest.json
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${{ github.ref_name }}"
-          version="${tag#v}"
-          repo="${{ github.repository }}"
-          base="https://github.com/${repo}/releases/download/${tag}"
-
-          mkdir -p sigs
-          # IMPORTANT: GitHub replaces the space in "Prompt Player" with a
-          # period when assets are uploaded — so the asset names on the
-          # release are "Prompt.Player_..." not "Prompt Player_...".
-          # (Local file on disk still has the space; the rename happens
-          # server-side during gh release upload.)
-          #
-          # Tauri 2's updater format:
-          #   - Mac: .app.tar.gz archive + .app.tar.gz.sig signature
-          #   - Win: the .msi itself + .msi.sig signature (NO .msi.zip
-          #     wrapper — Tauri 2 dropped that vs v1)
-          mac_sig_asset="Prompt.Player.app.tar.gz.sig"
-          win_sig_asset="Prompt.Player_${version}_x64_en-US.msi.sig"
-          mac_archive="Prompt.Player.app.tar.gz"
-          win_archive="Prompt.Player_${version}_x64_en-US.msi"
-
-          # `gh release download` errors if the asset is missing. We do not
-          # tolerate missing signatures — better to fail the manifest than
-          # ship one that omits a platform silently.
-          gh release download "$tag" -R "$repo" -p "$mac_sig_asset" -D sigs --clobber
-          gh release download "$tag" -R "$repo" -p "$win_sig_asset" -D sigs --clobber
-          mac_sig=$(cat "sigs/${mac_sig_asset}")
-          win_sig=$(cat "sigs/${win_sig_asset}")
-
-          notes=$(gh release view "$tag" --json body -q .body)
-          pub_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          # No space-encoding needed — asset names already use periods.
-          mac_url="${base}/${mac_archive}"
-          win_url="${base}/${win_archive}"
-
-          jq -n \
-            --arg version "$version" \
-            --arg notes "$notes" \
-            --arg pub_date "$pub_date" \
-            --arg mac_url "$mac_url" \
-            --arg win_url "$win_url" \
-            --arg mac_sig "$mac_sig" \
-            --arg win_sig "$win_sig" \
-            '{
-              version: $version,
-              notes: $notes,
-              pub_date: $pub_date,
-              platforms: {
-                "darwin-aarch64": { signature: $mac_sig, url: $mac_url },
-                "windows-x86_64": { signature: $win_sig, url: $win_url }
-              }
-            }' > latest.json
-
-          gh release upload "$tag" latest.json --clobber
+  # NOTE: The `compose-updater-manifest` job that used to live here was
+  # deleted — tauri-action 0.6+ already generates and uploads latest.json
+  # automatically when TAURI_SIGNING_PRIVATE_KEY is set. Verified on
+  # rc.7: the auto-generated manifest contains both darwin-aarch64 and
+  # windows-x86_64 entries with valid signatures, exactly the shape
+  # tauri-plugin-updater expects.
 
   # The publish gate. Flips the draft Release to published ONLY if rust-tests
   # AND every build-platform leg succeeded. If either fails, the release
@@ -402,11 +333,10 @@ jobs:
   # inspect, decide whether to publish, or kick a new tag.
   publish-finalize:
     name: publish finalize (draft → published)
-    # Also gate on compose-updater-manifest so the release doesn't flip
-    # to published BEFORE latest.json is uploaded — otherwise existing
-    # installs that auto-check during the gap would see the new version
-    # without the manifest and skip the update.
-    needs: [rust-tests, release-platform, compose-updater-manifest]
+    # tauri-action uploads latest.json as part of the release-platform
+    # leg itself, so by the time release-platform finishes the manifest
+    # is already attached. No separate compose step to wait on.
+    needs: [rust-tests, release-platform]
     if: success() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
