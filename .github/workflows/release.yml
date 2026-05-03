@@ -418,6 +418,10 @@ jobs:
       - name: Mark release as published (if currently draft)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `-R` so gh doesn't try to run `git remote get-url` — this job
+          # has no actions/checkout (doesn't need the source), so there's
+          # no git context available.
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           tag="${{ github.ref_name }}"
