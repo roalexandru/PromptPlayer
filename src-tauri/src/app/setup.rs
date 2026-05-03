@@ -260,11 +260,28 @@ pub fn run() {
             // (cargo/tauri-dev CWD differs from the packaged .app's resources
             // dir, and the bundle doesn't ship icons/ as a resource). Bytes
             // baked into the binary work in both contexts.
+            //
+            // Per-OS icon picking:
+            // - macOS: monochrome glyph + `icon_as_template(true)` lets AppKit
+            //   tint the icon to match the menubar (white on dark, black on
+            //   light) automatically. The shipped `tray-icon.png` is a black
+            //   luminance mask.
+            // - Windows: no template-image concept. We ship two pre-rendered
+            //   variants (light/dark) and pick the right one at startup based
+            //   on the current `SystemUsesLightTheme` registry value, then
+            //   spawn a watcher that swaps the icon on theme change.
+            #[cfg(not(target_os = "windows"))]
             const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../icons/tray-icon.png");
-            let tray_image = tauri::image::Image::from_bytes(TRAY_ICON_BYTES)
+            #[cfg(target_os = "windows")]
+            let tray_icon_bytes: &[u8] = crate::platform::windows::pick_tray_icon_bytes();
+            #[cfg(not(target_os = "windows"))]
+            let tray_icon_bytes: &[u8] = TRAY_ICON_BYTES;
+            let tray_image = tauri::image::Image::from_bytes(tray_icon_bytes)
                 .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(tray_image)
+                // `icon_as_template(true)` is mac-only behavior; on Windows
+                // it's a no-op so leaving it unconditional is fine.
                 .icon_as_template(true)
                 .on_tray_icon_event(move |tray, event| {
                     use tauri::tray::{MouseButton, MouseButtonState};
@@ -284,6 +301,12 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // Windows-only: poll the OS theme every 5s and swap the tray
+            // icon when the user toggles light/dark in Settings. macOS
+            // handles this for us via icon-as-template.
+            #[cfg(target_os = "windows")]
+            crate::platform::windows::install_tray_theme_watcher(app.handle().clone());
 
             // FireService — needs an AppHandle, so it's constructed at setup time.
             let fire = FireService::new(ctx_for_setup.clone(), app.handle().clone());
