@@ -3,7 +3,11 @@
 /src-tauri/target/
 /guest-helper/target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed — Prompt Player ships as a binary (an end product),
+# not a library. Per Cargo guidance, end-product binaries pin their full
+# dependency graph so CI builds are reproducible. Without this, every CI
+# run picks up the latest crates and can break (e.g. `tauri 2.11.0` vs
+# `@tauri-apps/api 2.10.1` minor-skew error).
 
 # Node
 node_modules/
