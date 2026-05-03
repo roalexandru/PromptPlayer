@@ -1,11 +1,18 @@
 //! §8.4 — keyboard listener with suppression.
 //!
-//! On macOS we use a native `CGEventTap` (see `macos.rs`) because rdev's
-//! `string_from_code` calls `TSMGetInputSourceProperty` from the tap callback
-//! thread and SIGTRAPs on newer macOS.
+//! Each platform owns a native low-level hook so we can filter out our own
+//! injected events at the hook layer — without that, the typer's body chars
+//! would loop back through the listener and trip the §2.6 panic ring,
+//! self-cancelling playback after ~3 chars.
 //!
-//! On Windows we keep `rdev::grab` (which uses `SetWindowsHookEx` under the
-//! hood and doesn't have the same TSM issue).
+//! - macOS: custom `CGEventTap` (see `macos.rs`) — also avoids rdev's
+//!   `string_from_code` which calls `TSMGetInputSourceProperty` from the
+//!   tap callback thread and SIGTRAPs on newer macOS. Filters by source PID
+//!   (`kCGEventSourceUnixProcessID`).
+//! - Windows: custom `SetWindowsHookExW(WH_KEYBOARD_LL)` (see `windows.rs`).
+//!   Filters by `LLKHF_INJECTED`. We previously used `rdev::grab` here, but
+//!   rdev's `Event` API hides the injection flag so we couldn't tell our
+//!   own keystrokes apart from the user's.
 //!
 //! Both platforms translate their native event into a `KeyEvent`, then the
 //! shared `process_event` function decides Pass / Suppress. This is the
@@ -279,66 +286,18 @@ fn spawn_windows(
     on_undo: Arc<dyn Fn() + Send + Sync>,
     on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
 ) {
-    let status = app_state.clone();
-    std::thread::Builder::new()
-        .name("prompt-player-hook".into())
-        .spawn(move || {
-            tracing::info!("hook thread starting (rdev/Win)");
-            // SetWindowsHookEx doesn't have an explicit "installed" callback —
-            // by the time `rdev::grab` returns, the hook was already running
-            // in its own message pump. Mark alive immediately; if `grab`
-            // returns an error below we flip back to false.
-            status.set_hook_alive(true);
-            let result = rdev::grab(move |event: rdev::Event| {
-                let key = translate_rdev(&event);
-                let deps = HookDeps {
-                    matcher: &matcher,
-                    undo: &undo,
-                    app_state: &app_state,
-                    on_fire: &on_fire,
-                    on_undo: &on_undo,
-                    on_commit_observed: &on_commit_observed,
-                };
-                match process_event(&key, &deps) {
-                    HookDecision::Pass => Some(event),
-                    HookDecision::Suppress => None,
-                }
-            });
-            if let Err(e) = result {
-                tracing::error!("hook errored: {:?}", e);
-            }
-            status.set_hook_alive(false);
-        })
-        .expect("spawn hook thread");
-}
-
-#[cfg(target_os = "windows")]
-fn translate_rdev(event: &rdev::Event) -> KeyEvent {
-    let key = match &event.event_type {
-        rdev::EventType::KeyPress(k) => Some(*k),
-        _ => None,
-    };
-    let is_backspace = matches!(key, Some(rdev::Key::Backspace));
-    let is_pure_modifier = matches!(
-        key,
-        Some(rdev::Key::ShiftLeft)
-            | Some(rdev::Key::ShiftRight)
-            | Some(rdev::Key::ControlLeft)
-            | Some(rdev::Key::ControlRight)
-            | Some(rdev::Key::Alt)
-            | Some(rdev::Key::AltGr)
-            | Some(rdev::Key::MetaLeft)
-            | Some(rdev::Key::MetaRight)
+    // Native `WH_KEYBOARD_LL` hook — see `hook/windows.rs` for the full
+    // architecture rationale. Mirrors the macOS `CGEventTap` design,
+    // including filtering out our own injected events at the hook layer
+    // (via `LLKHF_INJECTED`) so the panic-ring doesn't see playback chars.
+    windows::spawn(
+        matcher,
+        undo,
+        app_state,
+        on_fire,
+        on_undo,
+        on_commit_observed,
     );
-    let typed = match (&event.event_type, &event.name) {
-        (rdev::EventType::KeyPress(_), Some(name)) => name.chars().find(|c| !c.is_control()),
-        _ => None,
-    };
-    KeyEvent {
-        typed,
-        is_backspace,
-        is_pure_modifier,
-    }
 }
 
 #[cfg(test)]
