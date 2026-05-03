@@ -7,8 +7,14 @@
 # Env:
 #   TARGET_TRIPLE — defaults to aarch64-apple-darwin
 #
-# Exit non-zero on any check failure. Sets PROMPT_PLAYER_E2E=1 during launch
-# so telemetry is dropped (CI launches must not pollute real-user metrics).
+# Tauri 2 cleans the standalone .app after rolling it into the .dmg, so the
+# only artifact that survives `tauri build` is the .dmg. This script mounts
+# it (read-only) to read Info.plist + the bundled binary, then launches a
+# COPY of the .app from /tmp (because launching directly off a read-only
+# DMG mount can fail with TCC permission noise on CI runners).
+#
+# Sets PROMPT_PLAYER_E2E=1 during launch so the in-process telemetry init
+# drops events instead of pinging Aptabase as a real user.
 
 set -euo pipefail
 
@@ -17,28 +23,41 @@ if [ -z "$EXPECTED_VERSION" ]; then
   EXPECTED_VERSION=$(node -p "require('./package.json').version")
 fi
 TARGET="${TARGET_TRIPLE:-aarch64-apple-darwin}"
-BUNDLE_DIR="src-tauri/target/$TARGET/release/bundle"
-APP="$BUNDLE_DIR/macos/Prompt Player.app"
+# Workspace target dir lives at the repo root (Cargo.toml at ./), NOT under
+# src-tauri/. Tauri's `--target` flag preserves the per-triple subdir.
+BUNDLE_DIR="target/$TARGET/release/bundle"
 DMG_GLOB="$BUNDLE_DIR/dmg/Prompt Player_${EXPECTED_VERSION}_*.dmg"
 
 echo "==> E2E target: $TARGET, expected version: $EXPECTED_VERSION"
 
-# 1. .app bundle exists
-if [ ! -d "$APP" ]; then
-  echo "::error::missing .app bundle at $APP"
-  exit 1
-fi
-echo "  [ok] .app bundle exists"
-
-# 2. DMG exists and is non-empty
+# 1. DMG exists and is non-empty
 DMG=$(ls $DMG_GLOB 2>/dev/null | head -1 || true)
 if [ -z "$DMG" ] || [ ! -s "$DMG" ]; then
   echo "::error::missing or empty DMG matching $DMG_GLOB"
-  ls -la "$BUNDLE_DIR/dmg/" || true
+  ls -la "$BUNDLE_DIR/dmg/" 2>/dev/null || true
+  echo "tree under target/:"
+  find target -maxdepth 5 -type d -name bundle 2>/dev/null || true
   exit 1
 fi
 DMG_SIZE=$(stat -f%z "$DMG")
 echo "  [ok] DMG: $(basename "$DMG") ($DMG_SIZE bytes)"
+
+# 2. Mount the DMG read-only and copy the .app to /tmp for inspection
+MOUNT_DIR="/tmp/pp-e2e-mount"
+mkdir -p "$MOUNT_DIR"
+trap 'hdiutil detach "$MOUNT_DIR" -quiet 2>/dev/null || true; rm -rf /tmp/pp-e2e-app' EXIT
+hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT_DIR" >/dev/null
+APP_IN_DMG="$MOUNT_DIR/Prompt Player.app"
+if [ ! -d "$APP_IN_DMG" ]; then
+  echo "::error::DMG mounted but no Prompt Player.app inside"
+  ls -la "$MOUNT_DIR" || true
+  exit 1
+fi
+APP="/tmp/pp-e2e-app/Prompt Player.app"
+mkdir -p /tmp/pp-e2e-app
+cp -R "$APP_IN_DMG" "$APP"
+hdiutil detach "$MOUNT_DIR" -quiet
+echo "  [ok] .app extracted to $APP"
 
 # 3. Info.plist: bundle identifier matches the locked value
 PLIST="$APP/Contents/Info.plist"
@@ -79,9 +98,10 @@ fi
 file "$EXE" | grep -q "Mach-O" || { echo "::error::$EXE is not Mach-O"; exit 1; }
 echo "  [ok] Mach-O binary"
 
-# 7. Launch test — clear quarantine (unsigned), launch, verify alive after 5s,
-# kill cleanly. CI runners have no Accessibility approval; the app must still
-# stay alive (hook init may fail to attach but must not panic).
+# 7. Launch test — clear quarantine (unsigned) on the copy, launch, verify
+# alive after 5s, kill cleanly. CI runners have no Accessibility approval;
+# the app must still stay alive (hook init may fail to attach but must not
+# panic).
 xattr -cr "$APP" || true
 
 echo "==> Launching with PROMPT_PLAYER_E2E=1"

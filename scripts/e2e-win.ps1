@@ -19,9 +19,12 @@ if ([string]::IsNullOrEmpty($ExpectedVersion)) {
   $ExpectedVersion = (node -p "require('./package.json').version").Trim()
 }
 
-$BundleDir = "src-tauri/target/$Target/release/bundle"
+# Workspace target dir lives at the repo root (Cargo.toml at ./), NOT under
+# src-tauri/. Both Mac and Win matrix legs pass --target so the per-triple
+# subdir is always present.
+$BundleDir = "target/$Target/release/bundle"
 $MsiDir = "$BundleDir/msi"
-$ExeAfterBuild = "src-tauri/target/$Target/release/prompt-player.exe"
+$ExeAfterBuild = "target/$Target/release/prompt-player.exe"
 
 Write-Host "==> E2E target: $Target, expected version: $ExpectedVersion"
 
