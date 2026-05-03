@@ -4,6 +4,7 @@
 // `src-tauri/src/app/setup.rs::generate_typescript_bindings`).
 // Treat it as source-controlled but auto-managed — do not edit by hand.
 
+import { invoke } from "@tauri-apps/api/core";
 import { commands, type Prompt, type ProfileKind, type TypingOverrides, type SearchHit, type IpcError, type UpdateInfo, type ForegroundAppInfo, type Result } from "./ipc.gen";
 
 export type { Prompt, ProfileKind, TypingOverrides, SearchHit, IpcError, UpdateInfo, ForegroundAppInfo };
@@ -58,4 +59,14 @@ export const ipc = {
   importPrompt: (sourcePath: string) => unwrap(commands.importPrompt(sourcePath)),
   exportPrompt: (promptId: string, destPath: string) =>
     unwrap(commands.exportPrompt(promptId, destPath)),
+  // shell — direct invoke instead of going through the auto-generated
+  // bindings: the bindings file is regenerated on the next debug `cargo run`,
+  // so until that happens this IPC isn't visible to `commands`.
+  openExternal: (url: string) =>
+    invoke<{ status: "ok"; data: null } | { status: "error"; error: IpcError }>(
+      "open_external",
+      { url },
+    ).then((r) => {
+      if (r.status === "error") throw r.error;
+    }),
 };

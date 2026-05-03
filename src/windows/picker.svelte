@@ -171,6 +171,13 @@
       await loadPrompts();
       q = "";
       selected = 0;
+      // Run search() explicitly: the reactive `$effect` only re-runs when
+      // `q` actually changes, so if the user dismissed the previous open
+      // with q already empty (the common case), the effect would no-op
+      // and `hits` would stay frozen at its last value. That's the empty
+      // "Nothing here yet" bug — first open happened before any prompts
+      // existed, every subsequent open kept the cached empty array.
+      await search();
       // Yield to the microtask queue so the q="" reactive update + search
       // effect have flushed before we start the focus poll. Otherwise
       // focus could be stolen by the list re-render that follows.

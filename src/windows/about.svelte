@@ -47,11 +47,15 @@
     }
   }
 
-  // Open the GitHub project page in the user's browser. We don't have a
-  // shell-open IPC plumbed; use window.open which Tauri intercepts and
-  // routes via the OS default handler.
-  function openProject() {
-    window.open("https://github.com/roalexandru/PromptPlayer", "_blank");
+  // Open the GitHub project page in the user's default browser. WebView2
+  // (Windows) and WKWebView (macOS) both no-op `window.open(url, "_blank")`
+  // by default; the `open_external` IPC shells out to the OS handler.
+  async function openProject() {
+    try {
+      await ipc.openExternal("https://github.com/roalexandru/PromptPlayer");
+    } catch (e) {
+      console.error("openExternal failed", e);
+    }
   }
 
   async function close() {
@@ -97,12 +101,6 @@
   <h1 class="name">Prompt Player</h1>
   <div class="version">Version {version || "—"}</div>
   <p class="tagline">Stealth keyboard utility for live demos.</p>
-  <p class="desc">
-    Type a trigger word + <span class="kbd">&gt;</span> in any text field and Prompt Player
-    silently continues typing the rest of a stored prompt with statistically realistic
-    human cadence. The picker (<span class="kbd">⌘⇧V</span>) lets you fire prompts from
-    a fuzzy-searched palette that's hidden from screen recordings.
-  </p>
 
   <div class="actions">
     <button class="btn" onclick={onPrimary} disabled={primaryDisabled} class:accent={checkState.kind === "available"}>
@@ -111,10 +109,7 @@
     <button class="btn ghost" onclick={openProject}>View on GitHub</button>
   </div>
 
-  <div class="meta">
-    <div>© 2026 Alexandru Roman</div>
-    <div>com.roalexandru.promptplayer</div>
-  </div>
+  <div class="meta">© 2026 Alexandru Roman</div>
 </div>
 
 <style>
@@ -164,23 +159,8 @@
   .tagline {
     font-size: 13px;
     font-weight: 500;
-    margin: 0 0 8px 0;
-    color: rgba(255, 255, 255, 0.85);
-  }
-  .desc {
-    font-size: 12px;
-    line-height: 1.5;
-    color: rgba(255, 255, 255, 0.7);
     margin: 0 0 18px 0;
-    max-width: 360px;
-  }
-  .kbd {
-    font-family: "SF Mono", Menlo, Consolas, monospace;
-    font-size: 11px;
-    background: rgba(255, 255, 255, 0.12);
-    border-radius: 3px;
-    padding: 1px 5px;
-    color: rgba(255, 255, 255, 0.92);
+    color: rgba(255, 255, 255, 0.85);
   }
   .actions {
     display: flex;
@@ -231,11 +211,6 @@
     .icon { filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.12)); }
     .version { color: rgba(0, 0, 0, 0.5); }
     .tagline { color: rgba(0, 0, 0, 0.85); }
-    .desc { color: rgba(0, 0, 0, 0.7); }
-    .kbd {
-      background: rgba(0, 0, 0, 0.08);
-      color: rgba(0, 0, 0, 0.85);
-    }
     .btn {
       border-color: rgba(0, 0, 0, 0.15);
       background: rgba(0, 0, 0, 0.05);

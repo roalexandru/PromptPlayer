@@ -23,8 +23,10 @@
 //!   exits cleanly.
 
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 use windows::Win32::Foundation::{HMODULE, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -33,6 +35,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCLBUTTONDOWN, WM_QUIT, WM_RBUTTONDOWN,
 };
 
+/// Anti-bounce window: if the outside-click hook hides the popup within this
+/// many millis of a tray icon click, the click was the dismissal — not a
+/// re-open. `toggle_popup` checks `recently_dismissed()` before re-showing.
+const DISMISS_DEBOUNCE_MS: i64 = 250;
+
 /// Per-process state shared between the hook thread and the rest of the app.
 /// `OutsideClickMonitor::shared()` returns an `Arc` we register as Tauri
 /// managed state; the hook thread reads from a static `MONITOR_GLOBAL` (set
@@ -40,6 +47,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// can't capture closures.
 pub struct OutsideClickMonitor {
     inner: Mutex<Option<HookHandle>>,
+    /// UNIX millis when the hook last hid the popup. Read by `toggle_popup`
+    /// to suppress the immediately-following tray click that would otherwise
+    /// re-show the popup (race: WH_MOUSE_LL fires before TrayIconEvent::Click).
+    last_hidden_ms: AtomicI64,
 }
 
 struct HookHandle {
@@ -54,8 +65,31 @@ impl OutsideClickMonitor {
     pub fn shared() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(None),
+            last_hidden_ms: AtomicI64::new(0),
         })
     }
+
+    fn mark_hidden_now(&self) {
+        self.last_hidden_ms.store(now_millis(), Ordering::Release);
+    }
+
+    /// True if the hook hid the popup within `DISMISS_DEBOUNCE_MS`. Callers
+    /// (tray-icon click handler) should treat this as "user just dismissed —
+    /// don't re-open."
+    pub fn recently_dismissed(&self) -> bool {
+        let last = self.last_hidden_ms.load(Ordering::Acquire);
+        if last == 0 {
+            return false;
+        }
+        now_millis() - last < DISMISS_DEBOUNCE_MS
+    }
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl Drop for OutsideClickMonitor {
@@ -165,6 +199,13 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     if let Some(app) = global_slot().lock().clone() {
         let inside = is_cursor_inside_popup(&app, cursor);
         if !inside {
+            // Stamp the dismissal time BEFORE posting the hide. The
+            // TrayIconEvent::Click that fires next (when the click was on
+            // the tray icon itself) reads this in toggle_popup and bails
+            // instead of re-showing the popup.
+            if let Some(monitor) = app.try_state::<Arc<OutsideClickMonitor>>() {
+                monitor.mark_hidden_now();
+            }
             // Hop to the main thread to call window.hide(). Cannot do it
             // here — Tauri's window ops aren't safe to call from a hook
             // proc. This call is non-blocking.

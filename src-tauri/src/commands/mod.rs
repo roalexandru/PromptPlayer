@@ -5,6 +5,7 @@ pub mod armed;
 pub mod library;
 pub mod picker;
 pub mod prompts;
+pub mod shell;
 pub mod tray;
 pub mod updater;
 
@@ -46,6 +47,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "expand_prompt_text",
     "import_prompt",
     "export_prompt",
+    "open_external",
 ];
 
 #[cfg(test)]

@@ -125,6 +125,23 @@ pub fn toggle_popup(app: &AppHandle, rect: tauri::Rect) {
         remove_outside_click_monitor_if_present(app);
         return;
     }
+    // Windows-only race guard: when the user clicks the tray icon to dismiss
+    // the open popup, the WH_MOUSE_LL hook fires first and hides the window
+    // (cursor is outside the popup rect). The TrayIconEvent::Click that
+    // follows then sees `is_visible() == false` and would re-show the popup
+    // on the same spot, defeating the dismiss. The monitor stamps a timestamp
+    // on hide; we treat any open within DISMISS_DEBOUNCE_MS as "user
+    // dismissed, don't re-open."
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::Arc;
+        if let Some(monitor) = app.try_state::<Arc<crate::platform::windows::OutsideClickMonitor>>()
+        {
+            if monitor.recently_dismissed() {
+                return;
+            }
+        }
+    }
     position_popup(&window, rect);
     use tauri::Emitter;
     let _ = window.emit("tray-popup-show", ());

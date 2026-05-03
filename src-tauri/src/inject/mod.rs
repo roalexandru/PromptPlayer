@@ -27,8 +27,25 @@ impl EnigoInjector {
 
 impl Injector for EnigoInjector {
     fn type_char(&mut self, c: char) {
-        let s = c.to_string();
-        let _ = self.enigo.text(&s);
+        // macOS: enigo's `text()` uses `CGEventCreateKeyboardEvent` +
+        // `setUnicodeString`, which works correctly.
+        // Windows: enigo 0.2 mis-synthesizes single-char `text()` calls
+        // (every ASCII char comes out as 'a'). Use direct `SendInput` with
+        // `KEYEVENTF_UNICODE` instead — see `windows::type_char_unicode`.
+        #[cfg(target_os = "macos")]
+        {
+            let s = c.to_string();
+            let _ = self.enigo.text(&s);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows::type_char_unicode(c);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let s = c.to_string();
+            let _ = self.enigo.text(&s);
+        }
     }
     fn press_backspace(&mut self) {
         let _ = self.enigo.key(EnigoKey::Backspace, Direction::Click);

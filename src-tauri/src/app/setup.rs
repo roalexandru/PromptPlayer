@@ -252,6 +252,7 @@ pub fn run() {
             commands::library::expand_prompt_text,
             commands::library::import_prompt,
             commands::library::export_prompt,
+            commands::shell::open_external,
         ])
         .setup(move |app| {
             // Tray icon — left-click toggles the WiFi-style stay-open popover.
@@ -544,6 +545,7 @@ fn generate_typescript_bindings() -> Result<(), String> {
         crate::commands::library::expand_prompt_text,
         crate::commands::library::import_prompt,
         crate::commands::library::export_prompt,
+        crate::commands::shell::open_external,
     ]);
 
     // Resolve the workspace root reliably from CARGO_MANIFEST_DIR (baked in
