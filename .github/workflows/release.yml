@@ -334,10 +334,9 @@ jobs:
           done < <(find "$BUNDLE_ROOT" -type f \( \
             -name "*.dmg" -o \
             -name "*.msi" -o \
+            -name "*.msi.sig" -o \
             -name "*.app.tar.gz" -o \
-            -name "*.app.tar.gz.sig" -o \
-            -name "*.msi.zip" -o \
-            -name "*.msi.zip.sig" \
+            -name "*.app.tar.gz.sig" \
           \))
           if [ "$found" = "0" ]; then
             echo "::error::no artifacts under $BUNDLE_ROOT"
@@ -378,10 +377,15 @@ jobs:
           # release are "Prompt.Player_..." not "Prompt Player_...".
           # (Local file on disk still has the space; the rename happens
           # server-side during gh release upload.)
+          #
+          # Tauri 2's updater format:
+          #   - Mac: .app.tar.gz archive + .app.tar.gz.sig signature
+          #   - Win: the .msi itself + .msi.sig signature (NO .msi.zip
+          #     wrapper — Tauri 2 dropped that vs v1)
           mac_sig_asset="Prompt.Player.app.tar.gz.sig"
-          win_sig_asset="Prompt.Player_${version}_x64_en-US.msi.zip.sig"
+          win_sig_asset="Prompt.Player_${version}_x64_en-US.msi.sig"
           mac_archive="Prompt.Player.app.tar.gz"
-          win_archive="Prompt.Player_${version}_x64_en-US.msi.zip"
+          win_archive="Prompt.Player_${version}_x64_en-US.msi"
 
           # `gh release download` errors if the asset is missing. We do not
           # tolerate missing signatures — better to fail the manifest than
