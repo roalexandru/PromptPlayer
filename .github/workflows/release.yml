@@ -85,30 +85,12 @@ jobs:
       - name: Frontend unit tests (Vitest)
         run: pnpm test
 
-      # The IPC-registry cross-checks (commands::registry_tests) parse
-      # setup.rs as a string and don't touch any Tauri runtime — but they
-      # live in the prompt-player lib, so the crate has to link before
-      # they can run. On Linux that needs Tauri's WebKit/GTK system deps.
-      - name: Install Tauri Linux system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libsoup-3.0-dev \
-            libssl-dev libayatana-appindicator3-dev \
-            librsvg2-dev libxdo-dev
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo (smoke)
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            .
-            src-tauri
-          shared-key: smoke
-      - name: Frontend production build (needed for tauri::generate_context!)
-        run: pnpm build
-      - name: Rust IPC-registry cross-check unit tests
-        run: cargo test -p prompt-player --lib commands::registry_tests
+      # The IPC-registry cross-checks (commands::registry_tests) catch drift
+      # between COMMAND_NAMES, generate_handler!, and collect_commands!.
+      # They CAN'T run on Linux: the lib transitively pulls in `crate::inject`
+      # and `crate::hook`, both of which are cfg-gated to macos/windows.
+      # The Mac/Win matrix below runs them via `cargo test --workspace`, so
+      # drift is still caught — just 5min later instead of 90s.
 
   # Create the empty Release shell up-front so the per-platform legs can each
   # `gh release upload` independently without racing on creation. Release is
