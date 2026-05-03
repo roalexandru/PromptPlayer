@@ -99,6 +99,14 @@ fn show_window(app: &AppHandle, label: &str) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+        // On macOS `.accessory` apps, focus transfer to a regular NSWindow
+        // sometimes silently fails (no Dock icon for the OS to fall back on),
+        // leaving the window buried behind whichever app the user clicked
+        // from. `orderFrontRegardless` raises the z-order without requiring
+        // activation — this is the AppKit-blessed "I really mean it" surface
+        // path. No-op on Windows and on non-AppKit Mac contexts.
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::order_window_front_regardless(&w);
     }
 }
 

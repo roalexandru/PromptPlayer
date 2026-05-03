@@ -131,9 +131,12 @@ fn apply_options(window: &tauri::WebviewWindow, opts: &PanelOptions) {
     }
 }
 
-/// Apply `CanJoinAllSpaces | FullScreenAuxiliary` to the library window so
-/// when our app is activated to summon the picker, macOS doesn't switch the
-/// user back to whatever Space the library lives on.
+/// Apply `CanJoinAllSpaces | FullScreenAuxiliary` to the library / about
+/// windows so when our app is activated, macOS surfaces the window on the
+/// CURRENT Space instead of switching the user back to the Space where the
+/// app was launched. Without this, regular `NSWindow`s on an `.accessory`
+/// app get bound to the launch Space and look "invisible" when shown from
+/// a tray-popover click on a different Space.
 pub fn make_window_space_neutral(window: &tauri::WebviewWindow) {
     let Ok(ns_window_ptr) = window.ns_window() else {
         return;
@@ -142,6 +145,24 @@ pub fn make_window_space_neutral(window: &tauri::WebviewWindow) {
         let ns_window: id = ns_window_ptr as id;
         let collection: u64 = COLLECTION_CAN_JOIN_ALL_SPACES | COLLECTION_FULL_SCREEN_AUXILIARY;
         let _: () = msg_send![ns_window, setCollectionBehavior: collection];
+    }
+}
+
+/// Force a regular (non-panel) window to the very front of the window
+/// stack, regardless of who currently has key focus. Tauri's `show()` +
+/// `set_focus()` sequence is enough when the app is the foreground app,
+/// but on `.accessory` apps the OS sometimes refuses focus transfer and
+/// the window stays buried behind whichever app the user clicked from.
+/// `orderFrontRegardless` is the AppKit-blessed way out — it raises the
+/// window's z-order without requiring activation. Used by `show_window`
+/// after the standard `set_focus()` so library / about always surface.
+pub fn order_window_front_regardless(window: &tauri::WebviewWindow) {
+    let Ok(ns_window_ptr) = window.ns_window() else {
+        return;
+    };
+    unsafe {
+        let ns_window: id = ns_window_ptr as id;
+        let _: () = msg_send![ns_window, orderFrontRegardless];
     }
 }
 

@@ -20,7 +20,6 @@
         "minWidth": 720,
         "minHeight": 480,
         "visible": false,
-        "transparent": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "url": "index.html"

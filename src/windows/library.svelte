@@ -888,11 +888,16 @@
                  "Helvetica Neue", sans-serif;
     font-size: 13px;
     -webkit-font-smoothing: antialiased;
+    /* Was previously `transparent` on html/body + `border-radius: 12px` on
+       #app — that left the rounded-rect's corners showing the desktop
+       behind the window (transparent flag in tauri.conf.json paired with
+       a CSS-rounded content layer). macOS already provides a window-level
+       rounded mask + shadow for plain (non-transparent) NSWindows; let it
+       handle that and paint the content edge-to-edge here. */
+    background: var(--bg-window);
   }
-  :global(html), :global(body) { background: transparent; }
   :global(#app) {
     background: var(--bg-window);
-    border-radius: 12px;
   }
   :global(*) { box-sizing: border-box; }
 

@@ -631,7 +631,12 @@ fn apply_macos_chrome(label: &str, w: &tauri::WebviewWindow) {
             );
             configure_popover_window(w);
         }
-        "library" => {
+        // Library and About are plain NSWindow (not panels). Both need
+        // `CanJoinAllSpaces | FullScreenAuxiliary` so they surface on
+        // whatever Space is current when shown — without this, `.accessory`
+        // apps anchor regular windows to the launch Space and "About"
+        // clicked from the tray on a different Space looks invisible.
+        "library" | "about" => {
             make_window_space_neutral(w);
         }
         _ => {}
