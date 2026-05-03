@@ -13,10 +13,18 @@ name: Release
 #                              fmt+clippy+                  ↳ win (~11min)
 #                              cargo test --workspace)        each: pnpm + tauri build
 #                                                              + e2e + gh upload
-#                                                              (per-leg, parallel)
-#                              ↓
+#                                                              (per-leg, parallel;
+#                                                               .dmg/.msi + signed
+#                                                               .app.tar.gz/.msi.zip
+#                                                               + .sig sidecars)
+#                                                                  ↓
+#                                                          compose-updater-manifest
+#                                                          (ubuntu, ~10s — downloads
+#                                                           .sig files, writes +
+#                                                           uploads latest.json)
+#                              ↓                                   ↓
 #                       publish-finalize  (ubuntu, ~5s)
-#                       needs: [rust-tests, build-platform]
+#                       needs: [rust-tests, release-platform, compose-updater-manifest]
 #                       if: success() — flips draft → published
 #                              ↓
 #                       populate-changelog  (ubuntu, ~30s)
@@ -212,8 +220,9 @@ jobs:
             os: macos-latest
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
-            artifact_dir: "target/aarch64-apple-darwin/release/bundle/dmg"
-            artifact_pattern: "Prompt Player_*.dmg"
+            # Walk the entire bundle/ subtree — DMG lives in dmg/, the
+            # updater archive (.app.tar.gz + .sig) lives in macos/.
+            bundle_root: "target/aarch64-apple-darwin/release/bundle"
             # Matrix-selected e2e command, invoked from a single non-conditional
             # step below. Keeps the leg's step list clean (one E2E line, not
             # two with conditional skips).
@@ -222,8 +231,8 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             args: --target x86_64-pc-windows-msvc
-            artifact_dir: "target/x86_64-pc-windows-msvc/release/bundle/msi"
-            artifact_pattern: "Prompt Player_*.msi"
+            # MSI + updater archive (.msi.zip + .sig) all sit in msi/.
+            bundle_root: "target/x86_64-pc-windows-msvc/release/bundle"
             # Git Bash on the Windows runner has pwsh on PATH, so calling
             # pwsh from a bash shell works. Keeps the step shell uniform.
             e2e_cmd: "pwsh scripts/e2e-win.ps1 -Target x86_64-pc-windows-msvc"
@@ -301,15 +310,20 @@ jobs:
       # word-split on the space. The `while read` loop instead of `mapfile`
       # is for bash 3.2 compatibility — macOS runners ship Apple's bash
       # 3.2 (no GPLv3), and `mapfile` was added in bash 4.
+      #
+      # We walk the entire bundle/ subtree and match by extension. Wrong-OS
+      # patterns (e.g. *.dmg on a Win runner) just match nothing. Updater
+      # archives + .sig sidecars are picked up too — they only get produced
+      # when TAURI_SIGNING_PRIVATE_KEY is set, but the find call doesn't
+      # care if they're missing.
       - name: Upload artifact to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ART_DIR: ${{ matrix.platform.artifact_dir }}
-          ART_PATTERN: ${{ matrix.platform.artifact_pattern }}
+          BUNDLE_ROOT: ${{ matrix.platform.bundle_root }}
         shell: bash
         run: |
-          if [ ! -d "$ART_DIR" ]; then
-            echo "::error::artifact dir $ART_DIR does not exist"
+          if [ ! -d "$BUNDLE_ROOT" ]; then
+            echo "::error::bundle root $BUNDLE_ROOT does not exist"
             exit 1
           fi
           found=0
@@ -317,10 +331,17 @@ jobs:
             found=1
             echo "uploading $f"
             gh release upload "${{ github.ref_name }}" "$f" --clobber
-          done < <(find "$ART_DIR" -maxdepth 1 -type f -name "$ART_PATTERN")
+          done < <(find "$BUNDLE_ROOT" -type f \( \
+            -name "*.dmg" -o \
+            -name "*.msi" -o \
+            -name "*.app.tar.gz" -o \
+            -name "*.app.tar.gz.sig" -o \
+            -name "*.msi.zip" -o \
+            -name "*.msi.zip.sig" \
+          \))
           if [ "$found" = "0" ]; then
-            echo "::error::no artifact in $ART_DIR matching $ART_PATTERN"
-            ls -la "$ART_DIR"
+            echo "::error::no artifacts under $BUNDLE_ROOT"
+            find "$BUNDLE_ROOT" -type f | head -50
             exit 1
           fi
 
@@ -331,19 +352,10 @@ jobs:
   # The signature is the raw content of the `.sig` file Tauri emitted next
   # to the updater archive; the URL is the GitHub release-asset download URL.
   # Skipped on platform-leg failure — partial manifests would brick clients.
-  # DISABLED until updater signing is wired up. The job downloads `.sig`
-  # files from the release to compose latest.json, but those files only
-  # exist when TAURI_SIGNING_PRIVATE_KEY is set as a repo secret AND
-  # tauri-plugin-updater is configured with the matching public key.
-  # To enable: (1) generate a keypair via `pnpm tauri signer generate`,
-  # (2) add TAURI_SIGNING_PRIVATE_KEY + _PASSWORD as GitHub secrets,
-  # (3) re-add `.app.tar.gz`, `.msi.zip`, and their `.sig` siblings to
-  # the artifact_pattern above (or split into a second find call), and
-  # (4) flip the `if:` below to the original `success() && startsWith(...)`.
   compose-updater-manifest:
     name: compose updater latest.json
     needs: release-platform
-    if: false  # see comment above
+    if: success() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -361,12 +373,15 @@ jobs:
           base="https://github.com/${repo}/releases/download/${tag}"
 
           mkdir -p sigs
-          # Asset-name conventions match the artifact_glob entries above.
-          # If you rename a bundle, update both places together.
-          mac_sig_asset="Prompt Player.app.tar.gz.sig"
-          win_sig_asset="Prompt Player_${version}_x64_en-US.msi.zip.sig"
-          mac_archive="Prompt Player.app.tar.gz"
-          win_archive="Prompt Player_${version}_x64_en-US.msi.zip"
+          # IMPORTANT: GitHub replaces the space in "Prompt Player" with a
+          # period when assets are uploaded — so the asset names on the
+          # release are "Prompt.Player_..." not "Prompt Player_...".
+          # (Local file on disk still has the space; the rename happens
+          # server-side during gh release upload.)
+          mac_sig_asset="Prompt.Player.app.tar.gz.sig"
+          win_sig_asset="Prompt.Player_${version}_x64_en-US.msi.zip.sig"
+          mac_archive="Prompt.Player.app.tar.gz"
+          win_archive="Prompt.Player_${version}_x64_en-US.msi.zip"
 
           # `gh release download` errors if the asset is missing. We do not
           # tolerate missing signatures — better to fail the manifest than
@@ -379,9 +394,9 @@ jobs:
           notes=$(gh release view "$tag" --json body -q .body)
           pub_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          # url-encode spaces in the asset filenames.
-          mac_url="${base}/${mac_archive// /%20}"
-          win_url="${base}/${win_archive// /%20}"
+          # No space-encoding needed — asset names already use periods.
+          mac_url="${base}/${mac_archive}"
+          win_url="${base}/${win_archive}"
 
           jq -n \
             --arg version "$version" \
@@ -409,7 +424,11 @@ jobs:
   # inspect, decide whether to publish, or kick a new tag.
   publish-finalize:
     name: publish finalize (draft → published)
-    needs: [rust-tests, release-platform]
+    # Also gate on compose-updater-manifest so the release doesn't flip
+    # to published BEFORE latest.json is uploaded — otherwise existing
+    # installs that auto-check during the gap would see the new version
+    # without the manifest and skip the update.
+    needs: [rust-tests, release-platform, compose-updater-manifest]
     if: success() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
