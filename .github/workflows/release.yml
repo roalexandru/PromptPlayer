@@ -148,22 +148,22 @@ jobs:
           # uniformly target/<triple>/release/bundle/... — same shape for
           # the e2e scripts and gh release upload globs. Workspace root is
           # the repo root (Cargo.toml at ./), so target/ is at the repo
-          # root, NOT under src-tauri/.
+          # root, NOT under src-tauri/. Updater-bundle artifacts
+          # (.app.tar.gz, .msi.zip, .sig) are intentionally NOT listed —
+          # those only get produced when TAURI_SIGNING_PRIVATE_KEY is set,
+          # which it isn't yet.
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
-            # DMG = primary distributable; .app.tar.gz + .sig = updater bundle
-            # consumed by tauri-plugin-updater. Both must be uploaded for
-            # in-app updates to work. (Tauri cleans the standalone .app after
-            # rolling it into the .dmg, so we don't try to upload it.)
-            artifact_glob: "target/aarch64-apple-darwin/release/bundle/{dmg/Prompt Player_*.dmg,macos/Prompt Player.app.tar.gz,macos/Prompt Player.app.tar.gz.sig}"
+            artifact_dir: "target/aarch64-apple-darwin/release/bundle/dmg"
+            artifact_pattern: "Prompt Player_*.dmg"
           - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             args: --target x86_64-pc-windows-msvc
-            # MSI = primary; .msi.zip + .sig = updater bundle.
-            artifact_glob: "target/x86_64-pc-windows-msvc/release/bundle/msi/Prompt Player_*.{msi,msi.zip,msi.zip.sig}"
+            artifact_dir: "target/x86_64-pc-windows-msvc/release/bundle/msi"
+            artifact_pattern: "Prompt Player_*.msi"
     runs-on: ${{ matrix.platform.os }}
 
     steps:
@@ -237,16 +237,25 @@ jobs:
         shell: pwsh
         run: pwsh scripts/e2e-win.ps1 -Target ${{ matrix.platform.target }}
 
-      # Upload only after e2e passes. `--clobber` so re-runs replace the asset.
+      # Upload only after e2e passes. `--clobber` so re-runs replace the
+      # asset. We use `find` (NOT bash globs) because the bundle filenames
+      # contain a literal space ("Prompt Player_..."), and unquoted globs
+      # word-split on the space — uploading a path that doesn't exist.
       - name: Upload artifact to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ART_DIR: ${{ matrix.platform.artifact_dir }}
+          ART_PATTERN: ${{ matrix.platform.artifact_pattern }}
         shell: bash
         run: |
-          shopt -s nullglob
-          files=( ${{ matrix.platform.artifact_glob }} )
+          if [ ! -d "$ART_DIR" ]; then
+            echo "::error::artifact dir $ART_DIR does not exist"
+            exit 1
+          fi
+          mapfile -t files < <(find "$ART_DIR" -maxdepth 1 -type f -name "$ART_PATTERN")
           if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::no artifact matched ${{ matrix.platform.artifact_glob }}"
+            echo "::error::no artifact in $ART_DIR matching $ART_PATTERN"
+            ls -la "$ART_DIR"
             exit 1
           fi
           for f in "${files[@]}"; do
@@ -261,10 +270,19 @@ jobs:
   # The signature is the raw content of the `.sig` file Tauri emitted next
   # to the updater archive; the URL is the GitHub release-asset download URL.
   # Skipped on platform-leg failure — partial manifests would brick clients.
+  # DISABLED until updater signing is wired up. The job downloads `.sig`
+  # files from the release to compose latest.json, but those files only
+  # exist when TAURI_SIGNING_PRIVATE_KEY is set as a repo secret AND
+  # tauri-plugin-updater is configured with the matching public key.
+  # To enable: (1) generate a keypair via `pnpm tauri signer generate`,
+  # (2) add TAURI_SIGNING_PRIVATE_KEY + _PASSWORD as GitHub secrets,
+  # (3) re-add `.app.tar.gz`, `.msi.zip`, and their `.sig` siblings to
+  # the artifact_pattern above (or split into a second find call), and
+  # (4) flip the `if:` below to the original `success() && startsWith(...)`.
   compose-updater-manifest:
     name: compose updater latest.json
     needs: release-platform
-    if: success() && startsWith(github.ref, 'refs/tags/v')
+    if: false  # see comment above
     runs-on: ubuntu-latest
     permissions:
       contents: write

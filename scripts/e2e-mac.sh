@@ -26,14 +26,14 @@ TARGET="${TARGET_TRIPLE:-aarch64-apple-darwin}"
 # Workspace target dir lives at the repo root (Cargo.toml at ./), NOT under
 # src-tauri/. Tauri's `--target` flag preserves the per-triple subdir.
 BUNDLE_DIR="target/$TARGET/release/bundle"
-DMG_GLOB="$BUNDLE_DIR/dmg/Prompt Player_${EXPECTED_VERSION}_*.dmg"
 
 echo "==> E2E target: $TARGET, expected version: $EXPECTED_VERSION"
 
-# 1. DMG exists and is non-empty
-DMG=$(ls $DMG_GLOB 2>/dev/null | head -1 || true)
+# 1. DMG exists and is non-empty. `find` (instead of `ls $glob`) so the
+# space in "Prompt Player" doesn't word-split the path into two args.
+DMG=$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -type f -name "Prompt Player_${EXPECTED_VERSION}_*.dmg" 2>/dev/null | head -1)
 if [ -z "$DMG" ] || [ ! -s "$DMG" ]; then
-  echo "::error::missing or empty DMG matching $DMG_GLOB"
+  echo "::error::missing or empty DMG under $BUNDLE_DIR/dmg/"
   ls -la "$BUNDLE_DIR/dmg/" 2>/dev/null || true
   echo "tree under target/:"
   find target -maxdepth 5 -type d -name bundle 2>/dev/null || true
