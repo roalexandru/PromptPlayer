@@ -8,15 +8,16 @@ name: Release
 #                       ubuntu
 #                   ┌─── smoke ───┐                          (60s; gates everything)
 #                   ↓             ↓                          ↓
-#         create-release      rust-tests                build-platform [matrix]
+#         create-release      rust-tests                release-platform [matrix]
 #         (ubuntu, 5s)        (macos, ~4min:                ↳ mac (~6min)
 #                              fmt+clippy+                  ↳ win (~11min)
-#                              cargo test --workspace)        each: pnpm + tauri build
-#                                                              + e2e + gh upload
-#                                                              (per-leg, parallel;
-#                                                               .dmg/.msi + signed
-#                                                               .app.tar.gz/.msi.zip
-#                                                               + .sig sidecars)
+#                              cargo test)                    each leg:
+#                                                              - tauri-apps/tauri-action
+#                                                                (build + sign + upload
+#                                                                 .dmg/.msi/.app.tar.gz
+#                                                                 + .sig to draft Release)
+#                                                              - e2e (validates the
+#                                                                bundle Tauri just built)
 #                                                                  ↓
 #                                                          compose-updater-manifest
 #                                                          (ubuntu, ~10s — downloads
@@ -29,6 +30,12 @@ name: Release
 #                              ↓
 #                       populate-changelog  (ubuntu, ~30s)
 #                       if: always() — appends auto-changelog
+#
+# Why tauri-action: it knows the per-Tauri-version artifact layout (asset
+# names, signature formats) so we don't have to track every format change.
+# Earlier custom build+upload tripped over .msi.zip vs .msi.sig naming,
+# space-in-path globs, bash 3.2 mapfile compat, etc. tauri-action handles
+# all of that.
 #
 # Why this shape:
 # - Rust tests are ONE job on macOS (most platform-agnostic) running in
@@ -208,33 +215,22 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          # IMPORTANT: BOTH platforms pass --target so the output path is
-          # uniformly target/<triple>/release/bundle/... — same shape for
-          # the e2e scripts and gh release upload globs. Workspace root is
-          # the repo root (Cargo.toml at ./), so target/ is at the repo
-          # root, NOT under src-tauri/. Updater-bundle artifacts
-          # (.app.tar.gz, .msi.zip, .sig) are intentionally NOT listed —
-          # those only get produced when TAURI_SIGNING_PRIVATE_KEY is set,
-          # which it isn't yet.
+          # Both legs pass --target so the build output sits in a uniform
+          # target/<triple>/release/bundle/... path — same shape for the
+          # e2e scripts on either OS.
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
-            # Walk the entire bundle/ subtree — DMG lives in dmg/, the
-            # updater archive (.app.tar.gz + .sig) lives in macos/.
-            bundle_root: "target/aarch64-apple-darwin/release/bundle"
             # Matrix-selected e2e command, invoked from a single non-conditional
-            # step below. Keeps the leg's step list clean (one E2E line, not
-            # two with conditional skips).
+            # step below.
             e2e_cmd: "bash scripts/e2e-mac.sh"
           - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             args: --target x86_64-pc-windows-msvc
-            # MSI + updater archive (.msi.zip + .sig) all sit in msi/.
-            bundle_root: "target/x86_64-pc-windows-msvc/release/bundle"
             # Git Bash on the Windows runner has pwsh on PATH, so calling
-            # pwsh from a bash shell works. Keeps the step shell uniform.
+            # pwsh from a bash shell works.
             e2e_cmd: "pwsh scripts/e2e-win.ps1 -Target x86_64-pc-windows-msvc"
     runs-on: ${{ matrix.platform.os }}
 
@@ -280,69 +276,47 @@ jobs:
       - name: Frontend build
         run: pnpm build
 
-      # NB: NO clippy / cargo test here. Those run in the parallel `rust-tests`
-      # job. This leg's job is to PRODUCE the bundle as fast as possible.
-      # Direct `tauri build` (not tauri-action) so we control the upload step
-      # and gate it on e2e green. Signing env vars cause Tauri to emit the
-      # updater archive (.app.tar.gz on Mac, .msi.zip on Win) plus a `.sig`
-      # next to it; the in-app updater verifies that signature against the
-      # public key embedded in tauri.conf.json before installing.
-      - name: Tauri build (${{ matrix.platform.name }})
+      # NB: NO clippy / cargo test here. Those run in the parallel
+      # `rust-tests` job. This leg only PRODUCES the bundle.
+      #
+      # tauri-action does build + sign + upload to the draft Release in one
+      # step. It knows the per-Tauri-version artifact layout (which has
+      # changed between v1 and v2 — .msi.zip vs .msi.sig, etc.), so we
+      # don't have to track every format change ourselves like we did when
+      # rolling our own find/upload loop. Signing env vars trigger emission
+      # of .app.tar.gz (Mac) / .msi.sig (Win) updater sidecars.
+      #
+      # Releases are uploaded as draft. publish-finalize flips them to
+      # published only when rust-tests + e2e + compose-updater-manifest
+      # all pass downstream.
+      - name: Build + upload via tauri-action
+        uses: tauri-apps/tauri-action@v0.6.2
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm tauri build ${{ matrix.platform.args }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Prompt Player ${{ github.ref_name }}"
+          releaseDraft: true
+          # `prerelease` here only sets the flag at create-time. We let
+          # publish-finalize own the final draft/prerelease/latest decision
+          # since that depends on the tag suffix (-rc.X vs stable).
+          prerelease: false
+          args: ${{ matrix.platform.args }}
 
-      # Single inline E2E step. The matrix selects the actual command via
-      # `e2e_cmd` (bash on Mac, `pwsh` invoked from bash on Windows — Git
-      # Bash on the Win runner has pwsh on PATH). No conditional-skip
-      # noise in the step list.
+      # E2E runs AFTER tauri-action. The bundle is already on disk in
+      # target/<triple>/release/bundle/ (tauri-action just ran the build),
+      # AND already in the draft Release. If e2e fails, the matrix job
+      # fails → publish-finalize won't run → the artifacts that did upload
+      # stay in the draft for human inspection. Matches the "leave the
+      # artefacts on test failure" rule.
       - name: E2E (${{ matrix.platform.name }})
         env:
           TARGET_TRIPLE: ${{ matrix.platform.target }}
           PROMPT_PLAYER_E2E: "1"
         shell: bash
         run: ${{ matrix.platform.e2e_cmd }}
-
-      # Upload only after e2e passes. `--clobber` so re-runs replace the
-      # asset. We use `find` (NOT bash globs) because the bundle filenames
-      # contain a literal space ("Prompt Player_..."), and unquoted globs
-      # word-split on the space. The `while read` loop instead of `mapfile`
-      # is for bash 3.2 compatibility — macOS runners ship Apple's bash
-      # 3.2 (no GPLv3), and `mapfile` was added in bash 4.
-      #
-      # We walk the entire bundle/ subtree and match by extension. Wrong-OS
-      # patterns (e.g. *.dmg on a Win runner) just match nothing. Updater
-      # archives + .sig sidecars are picked up too — they only get produced
-      # when TAURI_SIGNING_PRIVATE_KEY is set, but the find call doesn't
-      # care if they're missing.
-      - name: Upload artifact to Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BUNDLE_ROOT: ${{ matrix.platform.bundle_root }}
-        shell: bash
-        run: |
-          if [ ! -d "$BUNDLE_ROOT" ]; then
-            echo "::error::bundle root $BUNDLE_ROOT does not exist"
-            exit 1
-          fi
-          found=0
-          while IFS= read -r f; do
-            found=1
-            echo "uploading $f"
-            gh release upload "${{ github.ref_name }}" "$f" --clobber
-          done < <(find "$BUNDLE_ROOT" -type f \( \
-            -name "*.dmg" -o \
-            -name "*.msi" -o \
-            -name "*.msi.sig" -o \
-            -name "*.app.tar.gz" -o \
-            -name "*.app.tar.gz.sig" \
-          \))
-          if [ "$found" = "0" ]; then
-            echo "::error::no artifacts under $BUNDLE_ROOT"
-            find "$BUNDLE_ROOT" -type f | head -50
-            exit 1
-          fi
 
   # Compose `latest.json` (the manifest tauri-plugin-updater fetches) once
   # all platform legs have uploaded their signed bundles. Format per
