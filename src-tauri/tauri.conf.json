@@ -65,7 +65,7 @@
       "endpoints": [
         "https://github.com/roalexandru/PromptPlayer/releases/latest/download/latest.json"
       ],
-      "pubkey": "ZFc1MGNuVnpkR1ZrSUdOdmJXMWxiblE2SUcxcGJtbHphV2R1SUhCMVlteHBZeUJyWlhrNklEZEJOVGRDTkRnelJUSTFOekV3T0RZS1VsZFRSMFZHWm1sbk4xSllaV3hSUVdNNE9HNWFObkJ0Ym1sRldUSjRhMlpGTTA5NlZuUkNPVzF2VkU1b2RrNU5ObFJOTW01emJYY0s=",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdBNTdCNDgzRTI1NzEwODYKUldTR0VGZmlnN1JYZWxRQWM4OG5aNnBtbmlFWTJ4a2ZFM096VnRCOW1vVE5odk5NNlRNMm5zbXcK",
       "windows": {
         "installMode": "passive"
       }
