@@ -85,14 +85,34 @@ pub struct NativeKeyEvent {
 const KEY_CODE_DELETE: u16 = 51; // backspace on US layout
 
 /// Spawn the CGEventTap on a dedicated thread with its own CFRunLoop.
-pub fn spawn(handler: EventHandler) {
+///
+/// `status` flips true once the tap is installed and listening, false on failure
+/// or when the run loop exits. The frontend reads this through `AppState` to
+/// surface a "grant Accessibility" row in the tray; the watcher thread re-spawns
+/// us when permission flips on. Returns true iff the tap installed successfully
+/// — caller can use that to decide whether to retry without consulting `status`.
+pub fn spawn(handler: EventHandler, status: std::sync::Arc<crate::state::AppState>) -> bool {
+    // Pre-flight: CGEventTapCreate is the slow path (3-5s on permission denial
+    // because the system shows its own diagnostic dialog). Skip it cleanly when
+    // we already know permission is missing — the watcher will respawn us when
+    // it's granted.
+    if !crate::tcc::is_accessibility_trusted() {
+        tracing::warn!("Accessibility not trusted — CGEventTap install skipped");
+        status.set_hook_alive(false);
+        return false;
+    }
+    let status_for_thread = status.clone();
     std::thread::Builder::new()
         .name("prompt-player-cgevent-tap".into())
-        .spawn(move || run_tap_thread(handler))
+        .spawn(move || run_tap_thread(handler, status_for_thread))
         .expect("spawn cgevent tap thread");
+    // Tap install happens asynchronously on the spawned thread; status flips
+    // true inside `run_tap_thread`. We treat the spawn itself as success — the
+    // watcher polls `hook_alive` and re-spawns if it doesn't flip true.
+    true
 }
 
-fn run_tap_thread(handler: EventHandler) {
+fn run_tap_thread(handler: EventHandler, status: std::sync::Arc<crate::state::AppState>) {
     // Box the handler to a stable address; pass to the C callback via user_info.
     let handler_ptr = Box::into_raw(Box::new(handler)) as *mut c_void;
     let mask = (1u64 << KCG_EVENT_KEY_DOWN) | (1u64 << KCG_EVENT_FLAGS_CHANGED);
@@ -108,7 +128,22 @@ fn run_tap_thread(handler: EventHandler) {
         )
     };
     if tap_port.is_null() {
-        tracing::error!("CGEventTapCreate returned null — Accessibility permission likely missing");
+        // Surface as ERROR so the level gets through any `info` filter and
+        // shows up in Console.app even if the user hasn't tweaked subsystem
+        // filters. The Accessibility hint covers the 95% case but other
+        // failure modes (MDM endpoint protection, sandbox restrictions) hit
+        // the same branch — make that explicit so we don't gaslight users
+        // whose permission is genuinely granted.
+        tracing::error!(
+            "CGEventTapCreate returned null. Likely causes: \
+             (1) Accessibility permission denied, \
+             (2) endpoint-protection software (e.g. JamfProtect) intercepting \
+             low-level event taps, \
+             (3) stale TCC entry (try `tccutil reset Accessibility com.roalexandru.promptplayer` and re-toggle)."
+        );
+        status.set_hook_alive(false);
+        // Reclaim the boxed handler since no run loop will own it.
+        unsafe { drop(Box::from_raw(handler_ptr as *mut EventHandler)) };
         return;
     }
 
@@ -126,8 +161,10 @@ fn run_tap_thread(handler: EventHandler) {
     unsafe { CGEventTapEnable(tap_port, true) };
 
     tracing::info!("CGEventTap installed; entering run loop");
+    status.set_hook_alive(true);
     unsafe { CFRunLoopRun() };
     tracing::warn!("CFRunLoopRun returned — tap thread exiting");
+    status.set_hook_alive(false);
 
     // Reclaim the boxed handler.
     unsafe { drop(Box::from_raw(handler_ptr as *mut EventHandler)) };

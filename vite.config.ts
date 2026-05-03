@@ -33,6 +33,7 @@ export default defineConfig({
         library: resolve(__dirname, "index.html"),
         picker: resolve(__dirname, "picker.html"),
         "tray-popup": resolve(__dirname, "tray-popup.html"),
+        about: resolve(__dirname, "about.html"),
       },
     },
   },

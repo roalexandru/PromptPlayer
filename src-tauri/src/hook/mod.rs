@@ -57,6 +57,11 @@ pub struct HookDeps<'a> {
     pub app_state: &'a Arc<AppState>,
     pub on_fire: &'a Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
     pub on_undo: &'a Arc<dyn Fn() + Send + Sync>,
+    /// Fires every time the user types the commit char while armed, regardless
+    /// of whether a trigger matched. Used to plumb the `commit_observed`
+    /// telemetry event without forcing the hook crate to know about the
+    /// telemetry pipeline. `(matched, matcher_index_size)`.
+    pub on_commit_observed: &'a Arc<dyn Fn(bool, usize) + Send + Sync>,
 }
 
 /// Shared event-handling pipeline used by both macOS and Windows hooks.
@@ -119,10 +124,37 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
             return HookDecision::Pass;
         }
         let candidates = deps.matcher.try_match_all(c, now);
-        if !candidates.is_empty() {
+        // Single high-signal diagnostic line on the commit-char path. Fires
+        // at most once per `>` typed by the user (rare, never spammy) and
+        // tells us in one log entry whether the matcher saw any candidates.
+        // If `candidates=0` here while the user *expected* a hit, the next
+        // place to look is the matcher index size (logged at startup) —
+        // a 0/0 means the prompt wasn't loaded; a 0/N means the trigger
+        // text doesn't match what's in the buffer.
+        let buf_len = deps.matcher.buffer.read().len();
+        let index_len = deps.matcher.index.read().len();
+        let matched = !candidates.is_empty();
+        tracing::info!(
+            "commit char '{}' observed: candidates={} buffer_len={} matcher_triggers={}",
+            c,
+            candidates.len(),
+            buf_len,
+            index_len,
+        );
+        // Notify the host (telemetry hook) that a commit was observed. This is
+        // separate from the on_fire callback because we need the no-match case
+        // too — `matched=false` is the most actionable signal for "user
+        // expected a fire that never happened".
+        (deps.on_commit_observed)(matched, index_len);
+        if matched {
             let typed_form = candidates[0].typed_form.clone();
             let trigger_chars = candidates[0].trigger_chars;
             let candidate_ids: Vec<String> = candidates.into_iter().map(|m| m.prompt_id).collect();
+            tracing::info!(
+                "fire: trigger='{}' candidates={:?}",
+                typed_form,
+                candidate_ids
+            );
             deps.matcher.pop_last_chars(trigger_chars);
             (deps.on_fire)(candidate_ids, typed_form);
             return HookDecision::Suppress;
@@ -141,18 +173,19 @@ pub fn spawn_grabbing_hook(
     app_state: Arc<AppState>,
     on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
     on_undo: Arc<dyn Fn() + Send + Sync>,
+    on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
 ) -> HookHandle {
     #[cfg(target_os = "macos")]
     {
-        spawn_macos(matcher, undo, app_state, on_fire, on_undo);
+        spawn_macos(matcher, undo, app_state, on_fire, on_undo, on_commit_observed);
     }
     #[cfg(target_os = "windows")]
     {
-        spawn_windows(matcher, undo, app_state, on_fire, on_undo);
+        spawn_windows(matcher, undo, app_state, on_fire, on_undo, on_commit_observed);
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (matcher, undo, app_state, on_fire, on_undo);
+        let _ = (matcher, undo, app_state, on_fire, on_undo, on_commit_observed);
     }
     HookHandle {
         _t: std::marker::PhantomData,
@@ -166,8 +199,10 @@ fn spawn_macos(
     app_state: Arc<AppState>,
     on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
     on_undo: Arc<dyn Fn() + Send + Sync>,
+    on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
 ) {
     use macos::EventHandler;
+    let app_state_for_handler = app_state.clone();
     let handler: EventHandler = Arc::new(move |evt: macos::NativeKeyEvent| {
         let key = KeyEvent {
             typed: evt.typed,
@@ -177,16 +212,34 @@ fn spawn_macos(
         let deps = HookDeps {
             matcher: &matcher,
             undo: &undo,
-            app_state: &app_state,
+            app_state: &app_state_for_handler,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_commit_observed: &on_commit_observed,
         };
         match process_event(&key, &deps) {
             HookDecision::Pass => Some(()),
             HookDecision::Suppress => None,
         }
     });
-    macos::spawn(handler);
+    macos::spawn(handler, app_state);
+}
+
+/// Re-spawn the macOS keyboard hook. Called from the Accessibility-status
+/// watcher when permission flips false→true after launch. Idempotent: if the
+/// previous tap is still alive, this is a no-op (caller checks `hook_alive`
+/// first, but we don't trust that — `macos::spawn` itself checks Accessibility
+/// before spawning).
+#[cfg(target_os = "macos")]
+pub fn respawn_macos(
+    matcher: Arc<MatcherState>,
+    undo: Arc<UndoLog>,
+    app_state: Arc<AppState>,
+    on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
+    on_undo: Arc<dyn Fn() + Send + Sync>,
+    on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
+) {
+    spawn_macos(matcher, undo, app_state, on_fire, on_undo, on_commit_observed);
 }
 
 #[cfg(target_os = "windows")]
@@ -196,11 +249,18 @@ fn spawn_windows(
     app_state: Arc<AppState>,
     on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
     on_undo: Arc<dyn Fn() + Send + Sync>,
+    on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
 ) {
+    let status = app_state.clone();
     std::thread::Builder::new()
         .name("prompt-player-hook".into())
         .spawn(move || {
             tracing::info!("hook thread starting (rdev/Win)");
+            // SetWindowsHookEx doesn't have an explicit "installed" callback —
+            // by the time `rdev::grab` returns, the hook was already running
+            // in its own message pump. Mark alive immediately; if `grab`
+            // returns an error below we flip back to false.
+            status.set_hook_alive(true);
             let result = rdev::grab(move |event: rdev::Event| {
                 let key = translate_rdev(&event);
                 let deps = HookDeps {
@@ -209,6 +269,7 @@ fn spawn_windows(
                     app_state: &app_state,
                     on_fire: &on_fire,
                     on_undo: &on_undo,
+                    on_commit_observed: &on_commit_observed,
                 };
                 match process_event(&key, &deps) {
                     HookDecision::Pass => Some(event),
@@ -218,6 +279,7 @@ fn spawn_windows(
             if let Err(e) = result {
                 tracing::error!("hook errored: {:?}", e);
             }
+            status.set_hook_alive(false);
         })
         .expect("spawn hook thread");
 }
@@ -281,6 +343,10 @@ mod tests {
         Arc::new(|| {})
     }
 
+    fn no_op_commit_callback() -> Arc<dyn Fn(bool, usize) + Send + Sync> {
+        Arc::new(|_, _| {})
+    }
+
     fn ke(c: char) -> KeyEvent {
         KeyEvent {
             typed: Some(c),
@@ -294,12 +360,14 @@ mod tests {
         let (matcher, undo, app_state) = make_deps_default();
         let (on_fire, count) = fire_count_callback();
         let on_undo = no_op_undo_callback();
+        let on_commit_observed = no_op_commit_callback();
         let deps = HookDeps {
             matcher: &matcher,
             undo: &undo,
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_commit_observed: &on_commit_observed,
         };
         // Disarmed (default) — every event is Pass and never matches.
         for ch in ['b', 'u', 'i', 'l', 'd', '>'] {
@@ -315,12 +383,14 @@ mod tests {
         app_state.set_armed(true);
         let (on_fire, count) = fire_count_callback();
         let on_undo = no_op_undo_callback();
+        let on_commit_observed = no_op_commit_callback();
         let deps = HookDeps {
             matcher: &matcher,
             undo: &undo,
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_commit_observed: &on_commit_observed,
         };
         for ch in ['x', 'y', '>'] {
             let _ = process_event(&ke(ch), &deps);
@@ -343,12 +413,14 @@ mod tests {
 
         let (on_fire, count) = fire_count_callback();
         let on_undo = no_op_undo_callback();
+        let on_commit_observed = no_op_commit_callback();
         let deps = HookDeps {
             matcher: &matcher,
             undo: &undo,
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_commit_observed: &on_commit_observed,
         };
         for ch in ['B', 'u', 'i', 'l', 'd'] {
             let d = process_event(&ke(ch), &deps);
@@ -368,12 +440,14 @@ mod tests {
         app_state.set_armed(true);
         let (on_fire, count) = fire_count_callback();
         let on_undo = no_op_undo_callback();
+        let on_commit_observed = no_op_commit_callback();
         let deps = HookDeps {
             matcher: &matcher,
             undo: &undo,
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_commit_observed: &on_commit_observed,
         };
         // Type `\` then `>` — the `>` should pass through without firing.
         let _ = process_event(&ke('\\'), &deps);
@@ -392,6 +466,7 @@ mod tests {
         let on_undo: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             undo_count2.fetch_add(1, Ordering::Relaxed);
         });
+        let on_commit_observed = no_op_commit_callback();
         // Seed the undo log with a recent expansion.
         undo.record("Build".into(), 50);
         let deps = HookDeps {
@@ -400,6 +475,7 @@ mod tests {
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_commit_observed: &on_commit_observed,
         };
         let key = KeyEvent {
             typed: None,
@@ -418,12 +494,14 @@ mod tests {
         let _cancel = app_state.begin_playback();
         let (on_fire, _) = fire_count_callback();
         let on_undo = no_op_undo_callback();
+        let on_commit_observed = no_op_commit_callback();
         let deps = HookDeps {
             matcher: &matcher,
             undo: &undo,
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_commit_observed: &on_commit_observed,
         };
         // Three pure-modifier events in fast succession should NOT trigger
         // the panic-cancel.

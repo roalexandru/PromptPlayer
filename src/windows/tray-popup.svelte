@@ -7,6 +7,12 @@
 
   let armed = $state(false);
   let prompts = $state<Prompt[]>([]);
+  // hookAlive == false on macOS means the CGEventTap couldn't install (almost
+  // always Accessibility permission). The tray surfaces a red banner row that
+  // deep-links to System Settings. The Rust-side watcher respawns the hook
+  // when permission flips on, so the banner disappears automatically — we
+  // re-poll on every popover show to pick that up without a heavier event bus.
+  let hookAlive = $state(true);
   let unlisten: UnlistenFn | null = null;
   let unlistenUpdate: UnlistenFn | null = null;
   let rootEl = $state<HTMLDivElement | null>(null);
@@ -49,6 +55,22 @@
   async function refresh() {
     armed = await ipc.getArmed();
     prompts = await ipc.listPrompts();
+    try {
+      hookAlive = await ipc.isHookAlive();
+    } catch {
+      // If the IPC fails (shouldn't happen) assume alive — better to under-
+      // report than spam the user with a false-positive permission banner.
+      hookAlive = true;
+    }
+  }
+
+  async function fixAccessibility() {
+    try {
+      await ipc.openAccessibilitySettings();
+    } catch (e) {
+      console.error("open accessibility failed", e);
+    }
+    await dismiss();
   }
 
   async function toggleArmed() {
@@ -118,30 +140,24 @@
     }
   }
 
-  // Map the current state to the menu-entry label. Single source of truth so
-  // the keyboard/click handler and rendering stay in sync.
+  // The tray menu only surfaces the updater row when there's actually something
+  // to act on (an available update, or an in-progress install). Manual "Check
+  // for Updates" lives in the About window; the 6h background poller flips
+  // checkState to `available` when a new release publishes, and that's when
+  // the row appears.
+  const showUpdateRow = $derived(
+    checkState.kind === "available" || checkState.kind === "installing"
+  );
   const updateLabel = $derived.by(() => {
     switch (checkState.kind) {
-      case "idle":       return "Check for Updates…";
-      case "checking":   return "Checking for Updates…";
-      case "up-to-date": return "Prompt Player is Up to Date";
-      case "error":      return "Update Check Failed — Retry?";
       case "available":  return `Install Update v${checkState.version}`;
       case "installing": return "Installing Update — Restarting…";
+      default:           return "";
     }
   });
-  const updateClickable = $derived(
-    checkState.kind === "idle" ||
-    checkState.kind === "up-to-date" ||
-    checkState.kind === "error" ||
-    checkState.kind === "available"
-  );
+  const updateClickable = $derived(checkState.kind === "available");
   function onUpdateClick() {
-    if (checkState.kind === "available") {
-      installUpdate();
-    } else {
-      checkForUpdates();
-    }
+    if (checkState.kind === "available") installUpdate();
   }
 
   function onKey(e: KeyboardEvent) {
@@ -374,6 +390,23 @@
 
   <div class="sep"></div>
 
+  {#if !hookAlive && IS_MAC}
+    <!-- Surface the silent-fail mode where Accessibility wasn't granted (or
+         was revoked). Without this banner the user sees toggle=on, types a
+         trigger, and nothing happens — the worst kind of silent failure. -->
+    <button
+      class="row warn"
+      class:hover={hoverKey === "ax"}
+      data-hkey="ax"
+      onclick={fixAccessibility}
+      title="The keyboard listener is not running"
+    >
+      <span class="warn-dot"></span>
+      <span class="label">Grant Accessibility…</span>
+    </button>
+    <div class="sep"></div>
+  {/if}
+
   <!-- Pinned prompts. Empty state surfaces the Quick Start hint (#9). -->
   {#if pinnedPrompts.length === 0}
     <div class="empty">
@@ -430,24 +463,26 @@
 
   <div class="sep"></div>
 
-  <button
-    class="row plain"
-    class:hover={hoverKey === "update" && updateClickable}
-    class:disabled={!updateClickable}
-    class:accent={checkState.kind === "available"}
-    data-hkey="update"
-    onclick={onUpdateClick}
-    disabled={!updateClickable}
-  >
-    <span class="label">{updateLabel}</span>
-  </button>
+  {#if showUpdateRow}
+    <button
+      class="row plain"
+      class:hover={hoverKey === "update" && updateClickable}
+      class:disabled={!updateClickable}
+      class:accent={checkState.kind === "available"}
+      data-hkey="update"
+      onclick={onUpdateClick}
+      disabled={!updateClickable}
+    >
+      <span class="label">{updateLabel}</span>
+    </button>
+  {/if}
   <button
     class="row plain"
     class:hover={hoverKey === "about"}
     data-hkey="about"
     onclick={() => action("about")}
   >
-    <span class="label">About Prompt Player{currentVersion ? ` v${currentVersion}` : ""}</span>
+    <span class="label">About Prompt Player</span>
   </button>
   <button
     class="row plain"
@@ -612,6 +647,21 @@
   .row.accent .label {
     color: rgba(48, 209, 88, 1);
     font-weight: 600;
+  }
+
+  /* Warning state for the "Grant Accessibility" banner. macOS-y orange. */
+  .row.warn .label {
+    color: rgba(255, 159, 10, 1);
+    font-weight: 600;
+  }
+  .warn-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: rgba(255, 159, 10, 1);
+    margin-right: 8px;
+    flex-shrink: 0;
+    box-shadow: 0 0 6px rgba(255, 159, 10, 0.6);
   }
 
   .label {

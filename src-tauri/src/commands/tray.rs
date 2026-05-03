@@ -41,15 +41,12 @@ pub fn tray_open(
             Ok(())
         }
         "about" => {
-            use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
-            app.dialog()
-                .message(format!(
-                    "Prompt Player v{}\n\nStealth keyboard utility for live demos.\nBundle ID: com.roalexandru.promptplayer",
-                    env!("CARGO_PKG_VERSION")
-                ))
-                .kind(MessageDialogKind::Info)
-                .title("About Prompt Player")
-                .show(|_| {});
+            // Custom branded window — replaces the system MessageDialog
+            // (which renders the generic warning bubble icon and gives no
+            // room for proper layout / version / "Check for updates"). The
+            // window is registered as `about` in tauri.conf.json with fixed
+            // size and no resizing.
+            show_window(&app, "about");
             Ok(())
         }
         other => into_ipc(Err(AppError::InvalidArg(format!(

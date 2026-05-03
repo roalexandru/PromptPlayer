@@ -23,6 +23,8 @@ export const ipc = {
   toggleArmed: () => commands.toggleArmed(),
   kill: () => commands.kill(),
   isPlaying: () => commands.isPlaying(),
+  isHookAlive: () => commands.isHookAlive(),
+  openAccessibilitySettings: () => commands.openAccessibilitySettings(),
   // prompts
   listPrompts: () => commands.listPrompts(),
   libraryRoot: () => unwrap(commands.libraryRoot()),

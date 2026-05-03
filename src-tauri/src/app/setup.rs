@@ -62,6 +62,13 @@ pub fn run() {
     // available — we plumb it through via a shared Arc<RwLock<Option<...>>>.
     let fire_holder: Arc<parking_lot::RwLock<Option<FireService>>> =
         Arc::new(parking_lot::RwLock::new(None));
+    // The AppHandle isn't constructed until inside Tauri's setup() callback,
+    // but we need to capture it from closures (telemetry callback, hot-reload
+    // watcher) that run earlier or on different threads. Same pattern as
+    // fire_holder. Declared up here so the on_commit_observed closure below
+    // can capture it before Tauri builds.
+    let app_handle_holder: Arc<parking_lot::RwLock<Option<AppHandle>>> =
+        Arc::new(parking_lot::RwLock::new(None));
 
     let on_fire = {
         let h = fire_holder.clone();
@@ -81,18 +88,77 @@ pub fn run() {
         })
     };
 
+    // Telemetry callback for the commit-char path. Plumbs through
+    // app_handle_holder because the AppHandle isn't constructed yet at this
+    // point (Tauri builds it inside setup()). We do nothing if the AppHandle
+    // isn't ready; that only applies to events fired in the milliseconds
+    // before Tauri's setup() runs, which is well before the user can type.
+    let on_commit_observed = {
+        let h = app_handle_holder.clone();
+        Arc::new(move |matched: bool, index_size: usize| {
+            if let Some(app) = h.read().clone() {
+                telemetry::send(
+                    &app,
+                    TelemetryEvent::CommitObserved {
+                        matched,
+                        index_size_bucket: crate::telemetry::IndexSizeBucket::classify(index_size),
+                    },
+                );
+            }
+        })
+    };
+
     let _hook = spawn_grabbing_hook(
         ctx.matcher.clone(),
         ctx.undo.clone(),
         ctx.state.clone(),
-        on_fire,
-        on_undo,
+        on_fire.clone(),
+        on_undo.clone(),
+        on_commit_observed.clone(),
     );
+
+    // §9.1 — Accessibility-status watcher (mac only). The first hook spawn
+    // fails silently if Accessibility wasn't pre-granted (common on a fresh
+    // DMG install at /Applications/Prompt Player.app — TCC keys approval by
+    // path+cdhash for unsigned apps and the new path has none). When the user
+    // finally toggles Accessibility on in System Settings, this poller detects
+    // the transition and respawns the hook without requiring an app restart.
+    //
+    // Kept narrow: 5s cadence, only does work on transitions, exits as soon
+    // as the hook reports alive (we re-arm only if it dies again).
+    #[cfg(target_os = "macos")]
+    {
+        let matcher = ctx.matcher.clone();
+        let undo = ctx.undo.clone();
+        let app_state = ctx.state.clone();
+        let on_fire2 = on_fire.clone();
+        let on_undo2 = on_undo.clone();
+        let on_commit2 = on_commit_observed.clone();
+        thread::Builder::new()
+            .name("prompt-player-ax-watch".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if app_state.hook_alive() {
+                    continue;
+                }
+                if !crate::tcc::is_accessibility_trusted() {
+                    continue;
+                }
+                tracing::info!("Accessibility granted — respawning keyboard hook");
+                crate::hook::respawn_macos(
+                    matcher.clone(),
+                    undo.clone(),
+                    app_state.clone(),
+                    on_fire2.clone(),
+                    on_undo2.clone(),
+                    on_commit2.clone(),
+                );
+            })
+            .expect("spawn ax watch thread");
+    }
 
     // Hot-reload watcher: re-load prompts on file changes, rebuild trigger
     // index + per-prompt hotkeys, refresh tray popup.
-    let app_handle_holder: Arc<parking_lot::RwLock<Option<AppHandle>>> =
-        Arc::new(parking_lot::RwLock::new(None));
     if let Ok(watcher) = library::watch(&library_root) {
         let ctx2 = ctx.clone();
         let handle2 = app_handle_holder.clone();
@@ -162,6 +228,8 @@ pub fn run() {
             commands::armed::toggle_armed,
             commands::armed::kill,
             commands::armed::is_playing,
+            commands::armed::is_hook_alive,
+            commands::armed::open_accessibility_settings,
             commands::prompts::list_prompts,
             commands::prompts::library_root,
             commands::prompts::save_prompt,
@@ -199,8 +267,12 @@ pub fn run() {
                 .icon_as_template(true)
                 .on_tray_icon_event(move |tray, event| {
                     use tauri::tray::{MouseButton, MouseButtonState};
+                    // Both left- and right-click open the popover. Native menu-bar
+                    // utilities (Things, Bartender, 1Password) all do this so the
+                    // user never has to remember "wrong button". macOS sends Right
+                    // for Control-click too, so this also covers that path.
                     if let tauri::tray::TrayIconEvent::Click {
-                        button: MouseButton::Left,
+                        button: MouseButton::Left | MouseButton::Right,
                         button_state: MouseButtonState::Down,
                         rect,
                         ..
@@ -228,15 +300,68 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             crate::platform::macos::nsworkspace::set_accessory_activation_policy();
 
-            // §9.1 first-run permission check on macOS.
+            // §9.1 first-run permission check on macOS. Use the PROMPTING
+            // variant so this app gets registered in the Accessibility list
+            // (the system pane is empty for unsigned apps on first launch
+            // unless we explicitly prompt — that's how AppleScript editors,
+            // BetterTouchTool, etc. all bootstrap their entries). After the
+            // prompt, open Settings so the user lands on the right pane with
+            // a row that actually has a toggle.
             #[cfg(target_os = "macos")]
             {
-                if !crate::tcc::is_accessibility_trusted() {
+                let trusted = crate::tcc::prompt_for_accessibility();
+                let hook_alive = ctx_for_setup.state.hook_alive();
+                let exe_path = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unknown>".into());
+                // Single-line state dump of the boot decision triangle:
+                // (a) Accessibility check, (b) hook install, (c) binary path.
+                // If a user reports "trigger doesn't fire" this line tells us
+                // immediately whether to chase TCC, the tap, or the bundle.
+                tracing::info!(
+                    "boot state: accessibility_trusted={} hook_alive={} exe={}",
+                    trusted,
+                    hook_alive,
+                    exe_path
+                );
+                telemetry::send(
+                    app.handle(),
+                    TelemetryEvent::HookInstallResult {
+                        success: hook_alive,
+                        accessibility_trusted: trusted,
+                    },
+                );
+                if !trusted {
                     tracing::warn!(
                         "macOS Accessibility permission not granted — opening System Settings pane"
                     );
                     crate::tcc::open_accessibility_settings();
                 }
+            }
+
+            // Windows doesn't gate keyboard hooks behind a permission like TCC —
+            // SetWindowsHookEx (via rdev::grab) just works for any user-mode
+            // process. We still emit a HookInstallResult so dashboards have
+            // parity across platforms; `accessibility_trusted` is hard-coded
+            // true since the concept doesn't apply.
+            #[cfg(target_os = "windows")]
+            {
+                let hook_alive = ctx_for_setup.state.hook_alive();
+                let exe_path = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unknown>".into());
+                tracing::info!(
+                    "boot state: hook_alive={} exe={}",
+                    hook_alive,
+                    exe_path
+                );
+                telemetry::send(
+                    app.handle(),
+                    TelemetryEvent::HookInstallResult {
+                        success: hook_alive,
+                        accessibility_trusted: true,
+                    },
+                );
             }
 
             // Secure-Input poller — 2s cadence (was 500ms; battery friendlier).
@@ -399,6 +524,8 @@ fn generate_typescript_bindings() -> Result<(), String> {
         crate::commands::armed::toggle_armed,
         crate::commands::armed::kill,
         crate::commands::armed::is_playing,
+        crate::commands::armed::is_hook_alive,
+        crate::commands::armed::open_accessibility_settings,
         crate::commands::prompts::list_prompts,
         crate::commands::prompts::library_root,
         crate::commands::prompts::save_prompt,
@@ -455,13 +582,23 @@ fn rebuild_match_index(ctx: &AppContext) {
             });
         }
     }
+    let entry_count = entries.len();
     if let Err(e) = ctx.matcher.rebuild_index(entries) {
         tracing::error!("trigger conflict: {}", e);
+        return;
     }
+    // Single-line diagnostic so a Console.app filter on subsystem catches
+    // the actual trigger count without needing to grep across multiple lines.
+    // Empty index here = no triggers will ever match, regardless of hook state.
+    tracing::info!(
+        "matcher index rebuilt: prompts={} triggers={}",
+        prompts.len(),
+        entry_count
+    );
 }
 
 fn apply_window_chrome(app: &tauri::App) {
-    for label in ["library", "picker", "tray-popup"] {
+    for label in ["library", "picker", "tray-popup", "about"] {
         if let Some(w) = app.get_webview_window(label) {
             #[cfg(target_os = "macos")]
             apply_macos_chrome(label, &w);

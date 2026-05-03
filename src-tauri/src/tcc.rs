@@ -7,7 +7,7 @@
 //! and walks the user back through the System Settings approval flow.
 
 #[cfg(target_os = "macos")]
-pub fn is_accessibility_trusted() -> bool {
+fn ax_is_trusted(prompt: bool) -> bool {
     use core_foundation::base::TCFType;
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::string::CFString;
@@ -16,14 +16,39 @@ pub fn is_accessibility_trusted() -> bool {
     }
     unsafe {
         let key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
-        let val = core_foundation::boolean::CFBoolean::false_value();
+        let val = if prompt {
+            core_foundation::boolean::CFBoolean::true_value()
+        } else {
+            core_foundation::boolean::CFBoolean::false_value()
+        };
         let dict = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), val.as_CFType())]);
         AXIsProcessTrustedWithOptions(dict.as_concrete_TypeRef() as *const _)
     }
 }
 
+/// Read-only check — does NOT add the app to the Accessibility list and does NOT
+/// show the system prompt. Use this from the polling watcher.
+#[cfg(target_os = "macos")]
+pub fn is_accessibility_trusted() -> bool {
+    ax_is_trusted(false)
+}
+
+/// First-launch probe. Setting `prompt=true` makes macOS register this app in
+/// the Accessibility list (so the System Settings pane has something to toggle)
+/// and surfaces the system permission prompt. Idempotent — safe to call on every
+/// launch; if already trusted it just returns true with no UI.
+#[cfg(target_os = "macos")]
+pub fn prompt_for_accessibility() -> bool {
+    ax_is_trusted(true)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn is_accessibility_trusted() -> bool {
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn prompt_for_accessibility() -> bool {
     true
 }
 

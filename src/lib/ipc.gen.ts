@@ -22,6 +22,20 @@ async kill() : Promise<void> {
 async isPlaying() : Promise<boolean> {
     return await TAURI_INVOKE("is_playing");
 },
+/**
+ * True iff the platform keyboard hook is currently installed and dispatching
+ * events. False on macOS when Accessibility permission is missing.
+ */
+async isHookAlive() : Promise<boolean> {
+    return await TAURI_INVOKE("is_hook_alive");
+},
+/**
+ * Open System Settings → Privacy & Security → Accessibility (macOS) and
+ * re-prompt to add the app to the list. No-op on Windows.
+ */
+async openAccessibilitySettings() : Promise<void> {
+    await TAURI_INVOKE("open_accessibility_settings");
+},
 async listPrompts() : Promise<Prompt[]> {
     return await TAURI_INVOKE("list_prompts");
 },

@@ -82,6 +82,14 @@ notify = "6"
 # async runtime
 tokio = { version = "1", features = ["full"] }
 
+# Rolling log-file appender — cross-platform sink for `tracing` so Windows
+# (no os_log equivalent) and Mac (Console.app users who want a tail) can both
+# diagnose runtime issues without a Terminal-launched debug build. Writes
+# under `dirs::data_local_dir()/PromptPlayer/logs/` (mac:
+# `~/Library/Application Support/PromptPlayer/logs/`; win:
+# `%LOCALAPPDATA%\PromptPlayer\logs\`).
+tracing-appender = "0.2"
+
 # misc
 once_cell = "1"
 parking_lot = "0.12"
@@ -130,6 +138,13 @@ objc2-app-kit = { version = "0.2", features = [
     "libc",
 ] }
 block2 = "0.5"
+# Pipe `tracing` events into Apple Unified Logging so Console.app and
+# `log stream --predicate 'subsystem == "com.roalexandru.promptplayer"'`
+# show what the app is doing at runtime. Release-mode .app bundles route
+# stdout/stderr to /dev/null, so without this the only way to debug a shipped
+# build is to launch from Terminal — which is fine for devs, useless for users
+# on a managed Mac who hit a "trigger doesn't fire" silent failure.
+tracing-oslog = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rdev = { version = "0.5", features = ["unstable_grab"] }

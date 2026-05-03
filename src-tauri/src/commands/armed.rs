@@ -35,3 +35,30 @@ pub fn kill(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) {
 pub fn is_playing(state: tauri::State<'_, Arc<AppState>>) -> bool {
     state.is_playing()
 }
+
+/// True iff the platform keyboard hook is currently installed and dispatching
+/// events. False on macOS when Accessibility permission is missing or the tap
+/// failed to install. The tray popup uses this to surface a "Grant Accessibility"
+/// row instead of silently failing.
+#[tauri::command]
+#[specta::specta]
+pub fn is_hook_alive(state: tauri::State<'_, Arc<AppState>>) -> bool {
+    state.hook_alive()
+}
+
+/// Open the macOS System Settings → Privacy & Security → Accessibility pane and
+/// re-prompt. The prompt call adds this app to the Accessibility list (if not
+/// already present) so the user has something to toggle when the pane opens.
+/// On Windows this is a no-op (no equivalent permission system).
+#[tauri::command]
+#[specta::specta]
+pub fn open_accessibility_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        // Trigger the prompt first — this adds us to the Accessibility list if
+        // we aren't already there, so the System Settings pane has the right
+        // entry visible when the user lands on it.
+        let _ = crate::tcc::prompt_for_accessibility();
+        crate::tcc::open_accessibility_settings();
+    }
+}

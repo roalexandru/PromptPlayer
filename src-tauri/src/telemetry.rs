@@ -58,6 +58,47 @@ pub enum TelemetryEvent {
     },
     SecureInputDetected,
     RdpDetected,
+    /// Boot-time decision triangle: did Accessibility check pass? did the
+    /// keyboard hook actually install? Lets us see — across all installs —
+    /// the rate of "Accessibility says yes but tap fails to install" (the
+    /// MDM/JamfProtect class of bug) vs straightforward Accessibility-denied
+    /// vs healthy. NO PII, only structural booleans.
+    HookInstallResult {
+        success: bool,
+        accessibility_trusted: bool,
+    },
+    /// User typed the commit char while armed. `matched=false` here aggregates
+    /// every "I expected this to fire and it didn't" instance across the whole
+    /// install base — the single most actionable trigger-pipeline metric. No
+    /// trigger text included; only structural counts.
+    CommitObserved {
+        matched: bool,
+        index_size_bucket: IndexSizeBucket,
+    },
+}
+
+/// Coarse bucket for matcher index size in CommitObserved. Avoids leaking
+/// user prompt counts as a precise number while still letting us tell
+/// "0 triggers loaded" (config issue) from "many loaded" (matcher logic
+/// issue) at the aggregate level.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IndexSizeBucket {
+    Empty, // 0
+    Few,   // 1..5
+    Some,  // 5..20
+    Many,  // 20+
+}
+
+impl IndexSizeBucket {
+    pub fn classify(n: usize) -> Self {
+        match n {
+            0 => Self::Empty,
+            1..=4 => Self::Few,
+            5..=19 => Self::Some,
+            _ => Self::Many,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,6 +240,8 @@ impl TelemetryEvent {
             Self::UpdateApplied { .. } => "update_applied",
             Self::SecureInputDetected => "secure_input_detected",
             Self::RdpDetected => "rdp_detected",
+            Self::HookInstallResult { .. } => "hook_install_result",
+            Self::CommitObserved { .. } => "commit_observed",
         }
     }
 }

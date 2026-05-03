@@ -25,6 +25,12 @@ pub struct AppState {
     cancel_strokes: Mutex<[Option<Instant>; PANIC_KEY_COUNT]>,
     /// Configurable global commit char (default `>`, §2.3).
     commit_char: Mutex<char>,
+    /// True while the platform keyboard hook is installed and dispatching events.
+    /// On macOS this flips false when `CGEventTapCreate` fails (Accessibility
+    /// missing) or the run loop exits. The frontend reads this to surface a
+    /// "grant Accessibility" row in the tray; an Accessibility-status poller
+    /// respawns the hook when permission is granted.
+    hook_alive: AtomicBool,
 }
 
 impl Default for AppState {
@@ -42,7 +48,16 @@ impl AppState {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             cancel_strokes: Mutex::new([None; PANIC_KEY_COUNT]),
             commit_char: Mutex::new('>'),
+            hook_alive: AtomicBool::new(false),
         }
+    }
+
+    pub fn hook_alive(&self) -> bool {
+        self.hook_alive.load(Ordering::Relaxed)
+    }
+
+    pub fn set_hook_alive(&self, alive: bool) {
+        self.hook_alive.store(alive, Ordering::Relaxed);
     }
 
     pub fn shared() -> Arc<Self> {

@@ -22,6 +22,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "toggle_armed",
     "kill",
     "is_playing",
+    "is_hook_alive",
+    "open_accessibility_settings",
     "list_prompts",
     "library_root",
     "save_prompt",
