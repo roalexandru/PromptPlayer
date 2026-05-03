@@ -5,17 +5,31 @@ name: Release
 #
 # Topology:
 #
-#   smoke (~60s ubuntu) ─┐
-#                        ├─► create-release (5s) ──► release-platform[mac]   ─┐
-#                        │                          release-platform[win]   ─┤
-#                        │                                                   │
-#                        └────────────────────────────────────────────► populate-changelog
+#                       ubuntu
+#                   ┌─── smoke ───┐                          (60s; gates everything)
+#                   ↓             ↓                          ↓
+#         create-release      rust-tests                build-platform [matrix]
+#         (ubuntu, 5s)        (macos, ~4min:                ↳ mac (~6min)
+#                              fmt+clippy+                  ↳ win (~11min)
+#                              cargo test --workspace)        each: pnpm + tauri build
+#                                                              + e2e + gh upload
+#                                                              (per-leg, parallel)
+#                              ↓
+#                       publish-finalize  (ubuntu, ~5s)
+#                       needs: [rust-tests, build-platform]
+#                       if: success() — flips draft → published
+#                              ↓
+#                       populate-changelog  (ubuntu, ~30s)
+#                       if: always() — appends auto-changelog
 #
-# Each release-platform leg is fully independent: rust tests → tauri build →
-# e2e (install + launch + verify) → upload its own artifact to the Release.
-# Mac (~6m) doesn't wait for Windows (~11m); Windows e2e failure doesn't pull
-# the Mac DMG. populate-changelog runs `if: always()` so it appends notes to
-# whatever artifacts made it.
+# Why this shape:
+# - Rust tests are ONE job on macOS (most platform-agnostic) running in
+#   parallel to the slow Mac/Win builds — not duplicated inside each leg.
+# - Each build leg uploads its bundle independently as soon as its own
+#   e2e passes. Mac DMG ships at ~6min even while Win is still building.
+# - publish-finalize is the gate: if rust-tests fails OR a build fails,
+#   the artifacts that DID succeed stay in the draft Release — they
+#   just don't get flipped to published. Manual review possible.
 on:
   push:
     tags: ["v*"]
@@ -130,10 +144,52 @@ jobs:
           EOF
           )"
 
-  # Per-OS independent leg. Mac and Windows run in parallel and DO NOT block
-  # each other: Mac (~6m) uploads its DMG as soon as its e2e is green; Windows
-  # (~11m) uploads its MSI when ready. If one leg's e2e fails, only that
-  # leg's artifact is missing from the Release — the other still ships.
+  # ONE rust-tests job on macOS, parallel to the slow Mac/Win builds. Covers
+  # all platform-agnostic tests (typer, prompts, store, matcher, undo, scopes,
+  # commands::registry_tests). The handful of macos-only tests run too. We
+  # don't run a Windows variant — `tests/ipc_registry.rs` is cfg-skipped on
+  # Win anyway, and the rest of the suite is platform-independent.
+  rust-tests:
+    name: rust-tests (macos)
+    needs: smoke
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo (rust-tests)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            src-tauri
+            guest-helper
+          shared-key: rust-tests
+      - name: Install pnpm deps
+        run: pnpm install --frozen-lockfile
+      - name: Frontend build (needed for tauri::generate_context!)
+        run: pnpm build
+      - name: Rust format
+        run: cargo fmt --all -- --check
+      - name: Clippy (correctness only)
+        run: cargo clippy --workspace --all-targets -- -D clippy::correctness
+      - name: Rust workspace tests
+        run: cargo test --workspace --all-targets
+
+  # Per-OS independent build leg. Mac and Windows run in parallel and DO NOT
+  # block each other: Mac (~6m) uploads its DMG as soon as its e2e is green;
+  # Windows (~11m) uploads its MSI when ready. NO rust workspace tests in
+  # here — those are in `rust-tests` above so they don't double-run AND so a
+  # test failure doesn't sink the bundle production.
   release-platform:
     name: release (${{ matrix.platform.name }})
     needs: create-release
@@ -158,12 +214,19 @@ jobs:
             args: --target aarch64-apple-darwin
             artifact_dir: "target/aarch64-apple-darwin/release/bundle/dmg"
             artifact_pattern: "Prompt Player_*.dmg"
+            # Matrix-selected e2e command, invoked from a single non-conditional
+            # step below. Keeps the leg's step list clean (one E2E line, not
+            # two with conditional skips).
+            e2e_cmd: "bash scripts/e2e-mac.sh"
           - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             args: --target x86_64-pc-windows-msvc
             artifact_dir: "target/x86_64-pc-windows-msvc/release/bundle/msi"
             artifact_pattern: "Prompt Player_*.msi"
+            # Git Bash on the Windows runner has pwsh on PATH, so calling
+            # pwsh from a bash shell works. Keeps the step shell uniform.
+            e2e_cmd: "pwsh scripts/e2e-win.ps1 -Target x86_64-pc-windows-msvc"
     runs-on: ${{ matrix.platform.os }}
 
     steps:
@@ -191,7 +254,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform.target }}
-          components: clippy
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -209,12 +271,8 @@ jobs:
       - name: Frontend build
         run: pnpm build
 
-      - name: Clippy (correctness only)
-        run: cargo clippy --workspace --all-targets -- -D clippy::correctness
-
-      - name: Rust workspace tests
-        run: cargo test --workspace --all-targets
-
+      # NB: NO clippy / cargo test here. Those run in the parallel `rust-tests`
+      # job. This leg's job is to PRODUCE the bundle as fast as possible.
       # Direct `tauri build` (not tauri-action) so we control the upload step
       # and gate it on e2e green. Signing env vars cause Tauri to emit the
       # updater archive (.app.tar.gz on Mac, .msi.zip on Win) plus a `.sig`
@@ -226,21 +284,23 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build ${{ matrix.platform.args }}
 
-      - name: E2E (macOS)
-        if: runner.os == 'macOS'
+      # Single inline E2E step. The matrix selects the actual command via
+      # `e2e_cmd` (bash on Mac, `pwsh` invoked from bash on Windows — Git
+      # Bash on the Win runner has pwsh on PATH). No conditional-skip
+      # noise in the step list.
+      - name: E2E (${{ matrix.platform.name }})
         env:
           TARGET_TRIPLE: ${{ matrix.platform.target }}
-        run: bash scripts/e2e-mac.sh
-
-      - name: E2E (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: pwsh scripts/e2e-win.ps1 -Target ${{ matrix.platform.target }}
+          PROMPT_PLAYER_E2E: "1"
+        shell: bash
+        run: ${{ matrix.platform.e2e_cmd }}
 
       # Upload only after e2e passes. `--clobber` so re-runs replace the
       # asset. We use `find` (NOT bash globs) because the bundle filenames
       # contain a literal space ("Prompt Player_..."), and unquoted globs
-      # word-split on the space — uploading a path that doesn't exist.
+      # word-split on the space. The `while read` loop instead of `mapfile`
+      # is for bash 3.2 compatibility — macOS runners ship Apple's bash
+      # 3.2 (no GPLv3), and `mapfile` was added in bash 4.
       - name: Upload artifact to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -252,16 +312,17 @@ jobs:
             echo "::error::artifact dir $ART_DIR does not exist"
             exit 1
           fi
-          mapfile -t files < <(find "$ART_DIR" -maxdepth 1 -type f -name "$ART_PATTERN")
-          if [ ${#files[@]} -eq 0 ]; then
+          found=0
+          while IFS= read -r f; do
+            found=1
+            echo "uploading $f"
+            gh release upload "${{ github.ref_name }}" "$f" --clobber
+          done < <(find "$ART_DIR" -maxdepth 1 -type f -name "$ART_PATTERN")
+          if [ "$found" = "0" ]; then
             echo "::error::no artifact in $ART_DIR matching $ART_PATTERN"
             ls -la "$ART_DIR"
             exit 1
           fi
-          for f in "${files[@]}"; do
-            echo "uploading $f"
-            gh release upload "${{ github.ref_name }}" "$f" --clobber
-          done
 
   # Compose `latest.json` (the manifest tauri-plugin-updater fetches) once
   # all platform legs have uploaded their signed bundles. Format per
@@ -342,12 +403,41 @@ jobs:
 
           gh release upload "$tag" latest.json --clobber
 
-  # Runs once after all platform legs complete, regardless of pass/fail. If
-  # both legs failed, this still runs but does nothing useful — the release
-  # stays in draft with the canned notes from create-release.
+  # The publish gate. Flips the draft Release to published ONLY if rust-tests
+  # AND every build-platform leg succeeded. If either fails, the release
+  # stays as a draft with whatever artifacts did land — you can manually
+  # inspect, decide whether to publish, or kick a new tag.
+  publish-finalize:
+    name: publish finalize (draft → published)
+    needs: [rust-tests, release-platform]
+    if: success() && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Mark release as published (if currently draft)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          # Pre-releases (rc/alpha/beta) get the prerelease flag set true so
+          # the `latest` redirect skips them. Stable releases publish as
+          # latest.
+          if [[ "$tag" == *-* ]]; then
+            echo "tag $tag is a pre-release"
+            gh release edit "$tag" --draft=false --prerelease
+          else
+            echo "tag $tag is a stable release — publishing as latest"
+            gh release edit "$tag" --draft=false --latest
+          fi
+
+  # Runs once after publish-finalize, regardless of pass/fail. If publish
+  # was skipped (rust-tests or a build failed) the release is still draft
+  # but we still append auto-changelog so reviewers see what's in it.
   populate-changelog:
     name: populate auto-changelog
-    needs: release-platform
+    needs: [release-platform, publish-finalize]
     if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
