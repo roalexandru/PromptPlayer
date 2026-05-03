@@ -63,9 +63,16 @@ jobs:
         run: pnpm test
 
       # The IPC-registry cross-checks (commands::registry_tests) parse
-      # setup.rs as a string — no Cocoa / WebView2 needed, so they run on
-      # Linux. Catches generate_handler! / collect_commands! / .manage()
-      # drift before any platform-specific work runs.
+      # setup.rs as a string — no Cocoa / WebView2 logic — but they live
+      # in the prompt-player lib, so the crate has to link before they
+      # can run. On Linux that needs Tauri's WebKit/GTK system deps.
+      - name: Install Tauri Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libssl-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo (smoke)
