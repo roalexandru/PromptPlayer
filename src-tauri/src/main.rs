@@ -60,8 +60,7 @@ fn init_tracing() {
     {
         // `os_log` is keyed by subsystem; matching our bundle ID makes
         // filtering in Console.app intuitive (just type the bundle ID).
-        let oslog_layer =
-            tracing_oslog::OsLogger::new("com.roalexandru.promptplayer", "general");
+        let oslog_layer = tracing_oslog::OsLogger::new("com.roalexandru.promptplayer", "general");
         tracing_subscriber::registry()
             .with(env_filter)
             .with(fmt_layer)

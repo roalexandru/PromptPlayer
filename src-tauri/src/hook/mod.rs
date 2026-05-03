@@ -177,15 +177,36 @@ pub fn spawn_grabbing_hook(
 ) -> HookHandle {
     #[cfg(target_os = "macos")]
     {
-        spawn_macos(matcher, undo, app_state, on_fire, on_undo, on_commit_observed);
+        spawn_macos(
+            matcher,
+            undo,
+            app_state,
+            on_fire,
+            on_undo,
+            on_commit_observed,
+        );
     }
     #[cfg(target_os = "windows")]
     {
-        spawn_windows(matcher, undo, app_state, on_fire, on_undo, on_commit_observed);
+        spawn_windows(
+            matcher,
+            undo,
+            app_state,
+            on_fire,
+            on_undo,
+            on_commit_observed,
+        );
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (matcher, undo, app_state, on_fire, on_undo, on_commit_observed);
+        let _ = (
+            matcher,
+            undo,
+            app_state,
+            on_fire,
+            on_undo,
+            on_commit_observed,
+        );
     }
     HookHandle {
         _t: std::marker::PhantomData,
@@ -239,7 +260,14 @@ pub fn respawn_macos(
     on_undo: Arc<dyn Fn() + Send + Sync>,
     on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
 ) {
-    spawn_macos(matcher, undo, app_state, on_fire, on_undo, on_commit_observed);
+    spawn_macos(
+        matcher,
+        undo,
+        app_state,
+        on_fire,
+        on_undo,
+        on_commit_observed,
+    );
 }
 
 #[cfg(target_os = "windows")]

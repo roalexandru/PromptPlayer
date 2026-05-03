@@ -350,11 +350,7 @@ pub fn run() {
                 let exe_path = std::env::current_exe()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| "<unknown>".into());
-                tracing::info!(
-                    "boot state: hook_alive={} exe={}",
-                    hook_alive,
-                    exe_path
-                );
+                tracing::info!("boot state: hook_alive={} exe={}", hook_alive, exe_path);
                 telemetry::send(
                     app.handle(),
                     TelemetryEvent::HookInstallResult {
