@@ -16,8 +16,8 @@ use tauri::{AppHandle, Manager};
 
 #[cfg(target_os = "macos")]
 use crate::platform::macos::OutsideClickMonitor;
-#[cfg(target_os = "windows")]
-use crate::platform::windows::OutsideClickMonitor;
+// Windows doesn't have an OutsideClickMonitor — its tray uses a native
+// HMENU via `TrackPopupMenuEx`, where the OS owns dismissal entirely.
 
 /// Build and run the Tauri application. Called once from `main.rs`.
 pub fn run() {
@@ -217,7 +217,7 @@ pub fn run() {
         .manage(ctx.state.clone())
         .manage(ctx.prompts.clone())
         .manage(ctx.clone());
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
         builder = builder.manage(OutsideClickMonitor::shared());
     }
@@ -706,11 +706,12 @@ pub fn manage_state<R: tauri::Runtime>(
     builder: tauri::Builder<R>,
     ctx: AppContext,
 ) -> tauri::Builder<R> {
+    #[allow(unused_mut)] // Windows path doesn't reassign — the `mut` is for the Mac branch below.
     let mut builder = builder
         .manage(ctx.state.clone())
         .manage(ctx.prompts.clone())
         .manage(ctx);
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
         builder = builder.manage(OutsideClickMonitor::shared());
     }

@@ -13,8 +13,9 @@ use tauri::{AppHandle, Manager, WebviewWindow, WindowEvent};
 
 #[cfg(target_os = "macos")]
 use crate::platform::macos::OutsideClickMonitor;
-#[cfg(target_os = "windows")]
-use crate::platform::windows::OutsideClickMonitor;
+// Windows uses a native `TrackPopupMenuEx` HMENU for the tray popup — the
+// `tray-popup` webview is never shown on Windows, so the focus-loss handler
+// below is mac-only.
 
 pub fn install(app: &tauri::App) {
     for label in ["library", "picker", "tray-popup", "about"] {
@@ -37,10 +38,6 @@ fn install_window_handlers(app: AppHandle, label: &str, window: WebviewWindow) {
             #[cfg(target_os = "macos")]
             if let Some(monitor) = app.try_state::<Arc<OutsideClickMonitor>>() {
                 crate::platform::macos::remove_outside_click_monitor(monitor.inner());
-            }
-            #[cfg(target_os = "windows")]
-            if let Some(monitor) = app.try_state::<Arc<OutsideClickMonitor>>() {
-                crate::platform::windows::remove_outside_click_monitor(monitor.inner());
             }
         }
         WindowEvent::Focused(false) if label_owned == "picker" => {
