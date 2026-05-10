@@ -42,7 +42,6 @@ pub enum PickMode {
     Human,
     Fast,
     Paste,
-    Run,
 }
 
 impl PickMode {
@@ -50,17 +49,12 @@ impl PickMode {
         match s {
             "fast" => Self::Fast,
             "paste" => Self::Paste,
-            "run" => Self::Run,
             _ => Self::Human,
         }
     }
 
     pub fn is_paste(&self) -> bool {
         matches!(self, Self::Paste)
-    }
-
-    pub fn is_run(&self) -> bool {
-        matches!(self, Self::Run)
     }
 }
 
@@ -294,7 +288,6 @@ fn run_fire_pipeline(
     };
     let mut paste_mode = false;
     if let Some(mode) = pick_mode {
-        profile.send_final_enter = mode.is_run();
         opts.include_pre_typing_pause = false;
         match mode {
             PickMode::Fast => {
@@ -355,9 +348,6 @@ fn run_fire_pipeline(
                 break;
             }
             inj.type_char(c);
-        }
-        if ok && pick_mode.map(|m| m.is_run()).unwrap_or(false) {
-            inj.press_enter();
         }
         ok
     } else {

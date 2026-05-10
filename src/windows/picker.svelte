@@ -22,7 +22,7 @@
     selected = 0;
   }
 
-  async function pick(mode: "human" | "fast" | "paste" | "run") {
+  async function pick(mode: "human" | "fast" | "paste") {
     const hit = hits[selected];
     if (!hit) return;
     await ipc.pickerSelect(hit.prompt_id, mode);
@@ -93,13 +93,12 @@
     }
     if (e.key === "Enter") {
       e.preventDefault();
-      // Primary modifier for "run": Cmd on Mac, Ctrl on Windows. Win key
-      // (e.metaKey on Windows) intentionally not accepted — that's the OS,
-      // not the user's "run this" intent.
-      const primary = IS_MAC ? e.metaKey : e.ctrlKey;
+      // Stop propagation so other listeners (and Win32 default `Enter` =
+      // form-submit semantics, which on Windows can race the modifier read)
+      // can't override our mode classification.
+      e.stopPropagation();
       if (e.shiftKey) pick("fast");
       else if (e.altKey) pick("paste");
-      else if (primary) pick("run");
       else pick("human");
       return;
     }
@@ -161,7 +160,19 @@
     focusPollHandle = setInterval(tryGrab, 30);
   }
 
+  // Capture-phase keydown handler at document level. The previous
+  // `<svelte:window on:keydown>` worked on Mac but Alt+Enter never fired
+  // its handler on Windows. Capturing on `document` runs the listener
+  // before WebView2's bubble-phase processing of system-key events
+  // (WM_SYSKEYDOWN, which is what tao routes Alt-modified keystrokes
+  // through), so we see Alt+Enter regardless of any later handler that
+  // might consume it.
+  function onKeyCapture(e: KeyboardEvent) {
+    onKey(e);
+  }
+
   onMount(async () => {
+    document.addEventListener("keydown", onKeyCapture, true);
     await loadPrompts();
     await search();
     await focusInput();
@@ -188,13 +199,12 @@
   });
 
   onDestroy(() => {
+    document.removeEventListener("keydown", onKeyCapture, true);
     unlistenShown?.();
   });
 </script>
 
-<svelte:window on:keydown={onKey} />
-
-<div class="root">
+<div class="root" class:opaque={!IS_MAC}>
   <div class="search">
     <span class="icon" aria-hidden="true">⌕</span>
     <input
@@ -254,11 +264,9 @@
     {#if IS_MAC}
       <span><kbd>⇧↵</kbd> fast</span>
       <span><kbd>⌥↵</kbd> paste</span>
-      <span><kbd>⌘↵</kbd> run</span>
     {:else}
       <span><kbd>Shift+↵</kbd> fast</span>
       <span><kbd>Alt+↵</kbd> paste</span>
-      <span><kbd>Ctrl+↵</kbd> run</span>
     {/if}
     <span class="grow"></span>
     <span><kbd>esc</kbd></span>
@@ -285,6 +293,15 @@
     height: 100vh;
     box-sizing: border-box;
     padding: 0;
+  }
+  /* Windows fallback: WebView2 on Win11 24H2 sometimes ignores Tauri's
+     `transparent: true` and paints solid white, and apply_mica can no-op
+     in light-mode + decorationless setups — either way the white-on-
+     transparent CSS goes invisible. Paint our own near-opaque dark
+     surface so the palette is readable regardless. Mica still composites
+     when it works; this is a safety net, not a replacement. */
+  .root.opaque {
+    background: rgba(28, 28, 30, 0.96);
   }
 
   /* Search bar — large, Raycast-style, transparent so vibrancy shows. */

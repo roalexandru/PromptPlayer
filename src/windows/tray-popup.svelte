@@ -368,6 +368,7 @@
 
 <div
   class="root"
+  class:opaque={!IS_MAC}
   bind:this={rootEl}
   onmousemove={updateHoverFromEvent}
   onmouseover={updateHoverFromEvent}
@@ -551,6 +552,14 @@
   .root {
     box-sizing: border-box;
     padding: 4px 0;
+  }
+  /* Windows fallback — see picker.svelte for the full rationale. WebView2
+     on Win11 24H2 can render the transparent body as solid white, making
+     white-on-transparent text invisible. Paint our own dark surface so
+     the popup is always readable; Mica still composites when it works. */
+  .root.opaque {
+    background: rgba(28, 28, 30, 0.97);
+    border-radius: 8px;
   }
 
   /* Compact header — single row, native scale (~28px). */
