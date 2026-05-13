@@ -196,9 +196,7 @@ fn set_unicode_clipboard(text: &str) -> Result<(), String> {
         // and we rely on the Result itself to gate the success path.
         let hglobal = match GlobalAlloc(GMEM_MOVEABLE, bytes) {
             Ok(h) => h,
-            Err(_) => {
-                return Err(format!("GlobalAlloc failed: {:?}", GetLastError()))
-            }
+            Err(_) => return Err(format!("GlobalAlloc failed: {:?}", GetLastError())),
         };
         let dst = GlobalLock(hglobal) as *mut u16;
         if dst.is_null() {
