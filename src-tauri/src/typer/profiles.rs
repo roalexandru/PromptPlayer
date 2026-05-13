@@ -52,10 +52,10 @@ impl Profile {
     /// lower bound for sustained human typing (faster than that = "presenter").
     pub const SALES_ENGINEER: Profile = Profile {
         kind: ProfileKind::SalesEngineer,
-        iki_scale: 0.50,        // median ~70 ms
+        iki_scale: 0.50, // median ~70 ms
         iki_min_ms: 60.0,
         typo_rate: 1.0 / 90.0,
-        pause_scale: 0.9,       // word pauses ~160 ms median
+        pause_scale: 0.9, // word pauses ~160 ms median
         pause_variance_scale: 1.0,
         burst_enabled: true,
         typos_enabled: true,
@@ -68,10 +68,10 @@ impl Profile {
     /// was silently clamped to the global 60 ms floor on the bulk of chars.
     pub const FAST_PRESENTER: Profile = Profile {
         kind: ProfileKind::FastPresenter,
-        iki_scale: 0.22,        // median ~31 ms
+        iki_scale: 0.22, // median ~31 ms
         iki_min_ms: 22.0,
         typo_rate: 1.0 / 200.0,
-        pause_scale: 0.4,       // word ~72 ms, sentence ~240 ms
+        pause_scale: 0.4, // word ~72 ms, sentence ~240 ms
         pause_variance_scale: 0.4,
         burst_enabled: true,
         typos_enabled: true,
@@ -83,10 +83,10 @@ impl Profile {
     /// boundaries. Target ~45 WPM.
     pub const THOUGHTFUL_CEO: Profile = Profile {
         kind: ProfileKind::ThoughtfulCeo,
-        iki_scale: 0.85,        // median ~119 ms
+        iki_scale: 0.85, // median ~119 ms
         iki_min_ms: 60.0,
         typo_rate: 1.0 / 120.0,
-        pause_scale: 1.3,       // longer boundary pauses
+        pause_scale: 1.3, // longer boundary pauses
         pause_variance_scale: 1.5,
         burst_enabled: true,
         typos_enabled: true,

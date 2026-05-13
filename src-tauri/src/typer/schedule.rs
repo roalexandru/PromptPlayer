@@ -91,9 +91,7 @@ pub fn schedule<R: Rng + ?Sized>(
             cursor += profile.pause_scale
                 * match b {
                     Boundary::Word => sample_word_pause(rng, profile.pause_variance_scale),
-                    Boundary::Sentence => {
-                        sample_sentence_pause(rng, profile.pause_variance_scale)
-                    }
+                    Boundary::Sentence => sample_sentence_pause(rng, profile.pause_variance_scale),
                     Boundary::Paragraph => {
                         sample_paragraph_pause(rng, profile.pause_variance_scale)
                     }
