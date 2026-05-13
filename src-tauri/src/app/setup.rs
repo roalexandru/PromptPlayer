@@ -197,6 +197,18 @@ pub fn run() {
     }
 
     let mut builder = tauri::Builder::default()
+        // Single-instance MUST be the first plugin so a duplicate launch is
+        // intercepted before any other plugin's setup hook runs — that's
+        // what prevents the second process from registering its own tray
+        // icon (the reported Windows bug: launching from Start menu while
+        // already running adds a duplicate tray icon and a duplicate hook
+        // listener). The callback fires in the FIRST process with the
+        // second launcher's argv/cwd; we use it to surface the picker so
+        // "launch the app" still feels like it did something.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tracing::info!("duplicate launch detected — surfacing picker");
+            crate::commands::picker::show_picker_window(app);
+        }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,

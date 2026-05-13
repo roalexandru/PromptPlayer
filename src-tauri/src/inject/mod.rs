@@ -4,9 +4,49 @@
 //! (`CGEventCreateKeyboardEvent` + `setUnicodeString` on Mac, `KEYEVENTF_UNICODE`
 //! on Win). enigo handles both transparently; longer non-ASCII runs fall back to
 //! clipboard paste in Phase 9 (RDP mode disables that fallback).
+//!
+//! Paste mode (`paste_via_clipboard`) takes a different path entirely: save the
+//! clipboard, set it to the body, synthesize Ctrl/Cmd+V once, restore the
+//! clipboard. That sidesteps the per-char drop modes (stuck Alt during the
+//! picker hand-off, IME coalescing, focus-race against the first chars, surrogate
+//! pair splitting) that bite a per-key SendInput stream with no inter-key cadence.
 
 use crate::typer::Injector;
 use enigo::{Direction, Enigo, Key as EnigoKey, Keyboard, Settings};
+
+/// Result of a clipboard-paste delivery. Surfaces failures to the caller so it
+/// can fall back to per-char injection (RDP, clipboard locked by another app,
+/// etc.) without silently dropping the prompt.
+#[derive(Debug)]
+pub enum PasteError {
+    Clipboard(String),
+    Injection(String),
+}
+
+/// Save the current clipboard, set it to `body`, synthesize Ctrl/Cmd+V, then
+/// restore the clipboard. Synchronous: returns only after the paste keystroke
+/// has been dispatched AND the original clipboard contents are back.
+///
+/// Focus must already be on the target window — paste sends the keystroke to
+/// whoever is foreground. The caller is responsible for that (see
+/// `picker::FocusStore::restore_and_wait`).
+pub fn paste_via_clipboard(body: &str) -> Result<(), PasteError> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::paste_via_clipboard(body)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::paste_via_clipboard(body)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = body;
+        Err(PasteError::Injection(
+            "paste_via_clipboard not implemented on this platform".into(),
+        ))
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub mod macos;
