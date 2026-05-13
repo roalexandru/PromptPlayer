@@ -136,11 +136,11 @@ fn capture_foreground() -> ForegroundSnapshot {
 #[cfg(target_os = "windows")]
 fn restore_to(hwnd: u64) -> bool {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        AttachThreadInput, BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId,
-        IsIconic, SetForegroundWindow, ShowWindow, SHOW_WINDOW_CMD,
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,
+        SetForegroundWindow, ShowWindow, SHOW_WINDOW_CMD,
     };
     const SW_RESTORE: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(9);
     let target = HWND(hwnd as _);
