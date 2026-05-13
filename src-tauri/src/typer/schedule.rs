@@ -82,14 +82,22 @@ pub fn schedule<R: Rng + ?Sized>(
     let mut typed_so_far: usize = 0; // counts emitted CHARACTERS (excluding backspaces)
 
     while text_pos < chars.len() {
-        // Boundary pause BEFORE this char (if any).
+        // Boundary pause BEFORE this char (if any). Both the mean (via
+        // `profile.pause_scale`) and the σ (via `pause_variance_scale`) are
+        // attenuated independently — Fast Presenter wants smaller and tighter
+        // pauses, CEO wants larger and looser.
         let boundary = classify_boundary(&chars, text_pos);
         if let Some(b) = boundary {
-            cursor += match b {
-                Boundary::Word => sample_word_pause(rng, profile.pause_variance_scale),
-                Boundary::Sentence => sample_sentence_pause(rng, profile.pause_variance_scale),
-                Boundary::Paragraph => sample_paragraph_pause(rng, profile.pause_variance_scale),
-            };
+            cursor += profile.pause_scale
+                * match b {
+                    Boundary::Word => sample_word_pause(rng, profile.pause_variance_scale),
+                    Boundary::Sentence => {
+                        sample_sentence_pause(rng, profile.pause_variance_scale)
+                    }
+                    Boundary::Paragraph => {
+                        sample_paragraph_pause(rng, profile.pause_variance_scale)
+                    }
+                };
         }
 
         // Typo decision (subject to §3.2 skip rules).
@@ -205,7 +213,14 @@ fn apply_iki_adjustments<R: Rng + ?Sized>(
         v = v.max(30.0);
     }
     v += jitter(rng);
-    v.max(distributions::IKI_MIN_MS)
+    // Profile-aware floor; the global `IKI_MIN_MS` is the absolute lower
+    // bound that no profile is allowed to go below (so even an aggressive
+    // override can't ask for 0 ms IKIs that the OS would coalesce). Fast
+    // Presenter sets `iki_min_ms` lower than the global IKI_MIN_MS, so we
+    // take the smaller of the two — i.e., the profile wins as long as
+    // it's still positive. (`IKI_MIN_MS = 60` previously won unconditionally,
+    // which is what made `iki_scale = 0.20` a no-op for the bulk of chars.)
+    v.max(profile.iki_min_ms.max(1.0))
 }
 
 fn update_burst_state<R: Rng + ?Sized>(
@@ -645,6 +660,84 @@ mod tests {
         assert!(backspaces > 0, "high typo rate should produce backspaces");
         let corrections = s.iter().filter(|k| k.is_correction).count();
         assert!(corrections > 0);
+    }
+
+    #[test]
+    fn iki_min_ms_is_profile_aware() {
+        // Regression: the global `IKI_MIN_MS` floor used to clamp every
+        // profile to 60 ms regardless of `iki_scale`. A profile-aware floor
+        // is what makes Fast Presenter actually fast — otherwise the 0.22
+        // scale would silently round up to 60 ms on the bulk of chars.
+        let mut fast = Profile::SALES_ENGINEER;
+        fast.iki_scale = 0.10;
+        fast.iki_min_ms = 15.0;
+        fast.pause_scale = 0.1; // collapse boundary pauses for a clean diff
+        fast.pause_variance_scale = 0.1;
+        fast.typos_enabled = false;
+        fast.pre_submit_pause_enabled = false;
+        fast.burst_enabled = false;
+
+        let mut slow = fast;
+        slow.iki_min_ms = 60.0; // emulate the old global floor
+
+        let opts = ScheduleOptions {
+            rdp_mode: false,
+            include_pre_typing_pause: false,
+        };
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let fast_total = schedule(text, &fast, &opts, &mut det_rng())
+            .last()
+            .unwrap()
+            .absolute_time_ms;
+        let slow_total = schedule(text, &slow, &opts, &mut det_rng())
+            .last()
+            .unwrap()
+            .absolute_time_ms;
+        assert!(
+            (fast_total as f64) < (slow_total as f64) * 0.5,
+            "lowering iki_min_ms must materially speed up the schedule \
+             (fast {} ms vs slow {} ms)",
+            fast_total,
+            slow_total
+        );
+    }
+
+    #[test]
+    fn pause_scale_shrinks_word_boundaries() {
+        // Regression: `pause_scale` exists so Fast modes don't stall on
+        // every space while flying between chars. Two profiles, identical
+        // IKI behavior, differing only in `pause_scale` — the lower one
+        // must finish meaningfully sooner on text with lots of word
+        // boundaries.
+        let mut tight = Profile::SALES_ENGINEER;
+        tight.pause_scale = 0.2;
+        tight.typos_enabled = false;
+        tight.pre_submit_pause_enabled = false;
+
+        let mut loose = tight;
+        loose.pause_scale = 1.0;
+
+        let opts = ScheduleOptions {
+            rdp_mode: false,
+            include_pre_typing_pause: false,
+        };
+        // Word-heavy text amplifies the effect.
+        let text = "a b c d e f g h i j k l m n o p q r s t u v w x y z";
+        let tight_total = schedule(text, &tight, &opts, &mut det_rng())
+            .last()
+            .unwrap()
+            .absolute_time_ms;
+        let loose_total = schedule(text, &loose, &opts, &mut det_rng())
+            .last()
+            .unwrap()
+            .absolute_time_ms;
+        assert!(
+            tight_total < loose_total,
+            "lower pause_scale must shrink the total \
+             (tight {} vs loose {})",
+            tight_total,
+            loose_total
+        );
     }
 
     #[test]
