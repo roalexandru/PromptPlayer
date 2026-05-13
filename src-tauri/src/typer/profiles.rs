@@ -15,14 +15,24 @@ pub enum ProfileKind {
 /// Per-profile parameters. `iki_scale` multiplies sampled IKI to retarget median;
 /// `pause_variance_scale` multiplies the σ of all pause distributions.
 ///
-/// Sales Engineer is the baseline (1.0/1.0/1.0). Fast and CEO derive from there:
-/// - Fast: target IKI median 100 ms → scale 100/140 ≈ 0.714, low variance.
-/// - CEO:  target IKI median 220 ms → scale 220/140 ≈ 1.571, high variance.
+/// `iki_min_ms` is the profile-aware floor applied AFTER scaling; without it,
+/// the global 60 ms floor in `distributions::IKI_MIN_MS` would silently swallow
+/// any `iki_scale < ~0.43` (since base median is ~140 ms). Fast Presenter and
+/// the picker's "Fast" override drop the floor so their scale actually takes
+/// effect; Sales Engineer / CEO keep the realistic 60 ms human-typing floor.
+///
+/// `pause_scale` multiplies the *mean* of all boundary pauses (word, sentence,
+/// paragraph). The old design only scaled σ via `pause_variance_scale`, so even
+/// at low `iki_scale` the chars flew past but every space stalled the same
+/// ~180 ms — visibly choppy. Cutting the mean too is what makes "fast" feel
+/// continuous instead of stuttery.
 #[derive(Debug, Clone, Copy)]
 pub struct Profile {
     pub kind: ProfileKind,
     pub iki_scale: f64,
+    pub iki_min_ms: f64,
     pub typo_rate: f64,
+    pub pause_scale: f64,
     pub pause_variance_scale: f64,
     pub burst_enabled: bool,
     pub typos_enabled: bool,
@@ -37,12 +47,15 @@ impl Default for Profile {
 }
 
 impl Profile {
-    /// Sales Engineer — actual measured throughput ~65 WPM including all pauses.
-    /// Effective IKI median ~77 ms (raw mixture median 140 ms × 0.55 scale).
+    /// Sales Engineer — calm, plausible-human cadence. Target ~75 WPM with
+    /// realistic word/sentence pauses. The 60 ms floor here is the realistic
+    /// lower bound for sustained human typing (faster than that = "presenter").
     pub const SALES_ENGINEER: Profile = Profile {
         kind: ProfileKind::SalesEngineer,
-        iki_scale: 0.55,
+        iki_scale: 0.50, // median ~70 ms
+        iki_min_ms: 60.0,
         typo_rate: 1.0 / 90.0,
+        pause_scale: 0.9, // word pauses ~160 ms median
         pause_variance_scale: 1.0,
         burst_enabled: true,
         typos_enabled: true,
@@ -50,23 +63,30 @@ impl Profile {
         send_final_enter: false,
     };
 
-    /// Fast Presenter — actual measured throughput ~110 WPM. Effective IKI median ~45 ms.
+    /// Fast Presenter — confident demo cadence. Target ~180 WPM. The lower
+    /// `iki_min_ms` is what unblocks the scale: previously `iki_scale=0.32`
+    /// was silently clamped to the global 60 ms floor on the bulk of chars.
     pub const FAST_PRESENTER: Profile = Profile {
         kind: ProfileKind::FastPresenter,
-        iki_scale: 0.32,
-        typo_rate: 1.0 / 150.0,
-        pause_variance_scale: 0.5,
+        iki_scale: 0.22, // median ~31 ms
+        iki_min_ms: 22.0,
+        typo_rate: 1.0 / 200.0,
+        pause_scale: 0.4, // word ~72 ms, sentence ~240 ms
+        pause_variance_scale: 0.4,
         burst_enabled: true,
         typos_enabled: true,
         pre_submit_pause_enabled: true,
         send_final_enter: false,
     };
 
-    /// Thoughtful CEO — actual measured throughput ~50 WPM. Effective IKI median ~109 ms.
+    /// Thoughtful CEO — deliberate cadence with longer reflection at sentence
+    /// boundaries. Target ~45 WPM.
     pub const THOUGHTFUL_CEO: Profile = Profile {
         kind: ProfileKind::ThoughtfulCeo,
-        iki_scale: 0.78,
+        iki_scale: 0.85, // median ~119 ms
+        iki_min_ms: 60.0,
         typo_rate: 1.0 / 120.0,
+        pause_scale: 1.3, // longer boundary pauses
         pause_variance_scale: 1.5,
         burst_enabled: true,
         typos_enabled: true,

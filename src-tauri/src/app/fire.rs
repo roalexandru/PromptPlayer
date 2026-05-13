@@ -291,9 +291,21 @@ fn run_fire_pipeline(
         opts.include_pre_typing_pause = false;
         match mode {
             PickMode::Fast => {
-                profile.iki_scale = 0.20;
+                // Picker "Fast" is more aggressive than the FAST_PRESENTER
+                // named profile: this is "I want the body NOW but still want
+                // it to look typed, not pasted". Numbers are tuned so every
+                // dial actually takes effect (low `iki_min_ms` keeps the
+                // global floor from clamping `iki_scale` away) and so word
+                // / sentence pauses don't visibly stall — they shrink with
+                // the IKI via `pause_scale`. Burst is disabled because at
+                // this floor it adds no perceptual variety.
+                profile.iki_scale = 0.16;
+                profile.iki_min_ms = 12.0;
+                profile.pause_scale = 0.2;
+                profile.pause_variance_scale = 0.3;
                 profile.typos_enabled = false;
                 profile.pre_submit_pause_enabled = false;
+                profile.burst_enabled = false;
             }
             PickMode::Paste => paste_mode = true,
             _ => {}
