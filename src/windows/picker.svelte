@@ -108,7 +108,9 @@
       const idx = parseInt(e.key) - 1;
       if (idx < hits.length) {
         selected = idx;
-        pick("human");
+        // Match the default Enter binding so quick-select keys and a plain
+        // Enter both feel like "just deliver this now".
+        pick("paste");
       }
     }
   }
@@ -230,7 +232,7 @@
           class:disabled={!p.enabled}
         >
           <button
-            onclick={() => { selected = i; pick("human"); }}
+            onclick={() => { selected = i; pick("paste"); }}
             onmousemove={() => (selected = i)}
           >
             <span class="row-left">

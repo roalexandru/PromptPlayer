@@ -299,6 +299,13 @@ fn run_fire_pipeline(
             _ => {}
         }
     }
+    // RDP host-side: clipboard sync to the remote session is unreliable
+    // (spec §9.3), so a real clipboard paste can silently land the body on
+    // the wrong side. Demote paste to the human-typed path in that case.
+    if paste_mode && rdp_mode == RdpMode::HostSide {
+        tracing::info!("paste demoted to typed flow under RDP host-side mode");
+        paste_mode = false;
+    }
 
     let target_app = classify_target_app(&foreground, rdp_mode);
     let scope_match = !matches!(target_app, TargetAppKind::Unknown);
@@ -307,11 +314,12 @@ fn run_fire_pipeline(
     // dispatches in one Ctrl/Cmd+V keystroke, no per-key cadence to build,
     // and the previous code threw the schedule away anyway after computing
     // it. That alone shaves tens of ms off the paste cold-start on big
-    // prompts.
-    let mut rng = ChaCha8Rng::from_entropy();
+    // prompts. The RNG is only seeded when the schedule is actually built,
+    // saving an entropy-pool draw on every paste fire.
     let scheduled = if paste_mode {
         Vec::new()
     } else {
+        let mut rng = ChaCha8Rng::from_entropy();
         schedule(&body, &profile, &opts, &mut rng)
     };
     let body_chars: usize = if paste_mode {
@@ -381,7 +389,13 @@ fn run_fire_pipeline(
             undo.record(form.to_string(), body_chars);
         }
     } else {
-        let pct = if body_chars == 0 {
+        // Paste is effectively atomic — `completed=false` means we never
+        // got past the cancel check or the clipboard/Ctrl+V failed before
+        // any character landed. Report 0% so telemetry doesn't claim a
+        // full paste happened when nothing did. The typed-path estimator
+        // uses `remaining_chars(&scheduled)` (still coarse — see the
+        // function comment).
+        let pct = if paste_mode || body_chars == 0 {
             0
         } else {
             (body_chars.saturating_sub(remaining_chars(&scheduled)) * 100 / body_chars).min(100)

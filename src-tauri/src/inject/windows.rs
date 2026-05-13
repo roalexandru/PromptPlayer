@@ -23,18 +23,20 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
+    VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_V,
+};
 
 // `CF_UNICODETEXT` isn't re-exported by windows-rs 0.58 under any of the
 // feature flags we already pull in (it lived in `Win32_System_SystemServices`
 // in older releases and was moved out before 0.58). The value is stable by
 // definition — wParam=13 is the standard clipboard format identifier.
 const CF_UNICODETEXT: u32 = 13;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
-    VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_V,
-};
 
 /// Synthesize a single character into the focused window using `SendInput`
 /// with `KEYEVENTF_UNICODE`. Sends key-down + key-up per UTF-16 code unit
@@ -137,8 +139,7 @@ fn open_clipboard_retry() -> Result<(), String> {
     // Retry for up to ~250ms.
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
-        let ok = unsafe { OpenClipboard(HWND::default()).is_ok() };
-        if ok {
+        if unsafe { OpenClipboard(HWND::default()).is_ok() } {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -152,7 +153,7 @@ fn open_clipboard_retry() -> Result<(), String> {
 
 fn save_unicode_clipboard() -> Option<String> {
     unsafe {
-        if !IsClipboardFormatAvailable(CF_UNICODETEXT).is_ok() {
+        if IsClipboardFormatAvailable(CF_UNICODETEXT).is_err() {
             return None;
         }
         if open_clipboard_retry().is_err() {
@@ -170,9 +171,13 @@ fn save_unicode_clipboard() -> Option<String> {
         let result = if ptr.is_null() {
             None
         } else {
-            // Walk until NUL.
+            // Walk until NUL, but cap at the alloc size to defend against
+            // a buggy clipboard owner that wrote non-NUL-terminated UTF-16.
+            // GlobalSize returns the rounded-up alloc size, not the exact
+            // byte count, so use it strictly as an upper bound.
+            let max_units = GlobalSize(hglobal).saturating_div(2);
             let mut len = 0usize;
-            while *ptr.add(len) != 0 {
+            while len < max_units && *ptr.add(len) != 0 {
                 len += 1;
             }
             let slice = std::slice::from_raw_parts(ptr, len);
@@ -189,11 +194,8 @@ fn set_unicode_clipboard(text: &str) -> Result<(), String> {
     wide.push(0);
     let bytes = wide.len() * std::mem::size_of::<u16>();
     unsafe {
-        // GlobalAlloc with GMEM_MOVEABLE because SetClipboardData takes
-        // ownership of moveable memory.
-        // GlobalAlloc returns Result<HGLOBAL>: Ok means the alloc
-        // succeeded. HGLOBAL has no `is_invalid()` in this crate version,
-        // and we rely on the Result itself to gate the success path.
+        // GlobalAlloc with GMEM_MOVEABLE: SetClipboardData takes ownership
+        // of moveable memory. The Result already gates success.
         let hglobal = match GlobalAlloc(GMEM_MOVEABLE, bytes) {
             Ok(h) => h,
             Err(_) => return Err(format!("GlobalAlloc failed: {:?}", GetLastError())),
@@ -206,7 +208,13 @@ fn set_unicode_clipboard(text: &str) -> Result<(), String> {
         std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
         let _ = GlobalUnlock(hglobal);
 
-        open_clipboard_retry()?;
+        // From this point until SetClipboardData succeeds, we still own
+        // hglobal — every error path below must call GlobalFree to avoid
+        // leaking a multi-KB block per failed paste attempt.
+        if let Err(e) = open_clipboard_retry() {
+            let _ = GlobalFree(hglobal);
+            return Err(e);
+        }
         let _ = EmptyClipboard();
         let h = HANDLE(hglobal.0 as _);
         let set_ok = SetClipboardData(CF_UNICODETEXT, h).is_ok();

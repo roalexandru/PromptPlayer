@@ -63,7 +63,8 @@ fn read_pasteboard_string() -> Option<String> {
 fn write_pasteboard_string(text: &str) -> Result<(), String> {
     unsafe {
         let pb: Retained<NSPasteboard> = NSPasteboard::generalPasteboard();
-        pb.clearContents();
+        // `clearContents` returns the new change count; we don't track it.
+        let _ = pb.clearContents();
         let ns_text: Retained<NSString> = NSString::from_str(text);
         // `setString:forType:` is the simplest writer that handles a single
         // textual flavor; we don't need writeObjects:'s array shape for one
