@@ -98,8 +98,8 @@
       // can't override our mode classification.
       e.stopPropagation();
       if (e.shiftKey) pick("fast");
-      else if (e.altKey) pick("paste");
-      else pick("human");
+      else if (e.altKey) pick("human");
+      else pick("paste");
       return;
     }
     const primaryDigit = IS_MAC ? e.metaKey : e.ctrlKey;
@@ -108,7 +108,9 @@
       const idx = parseInt(e.key) - 1;
       if (idx < hits.length) {
         selected = idx;
-        pick("human");
+        // Match the default Enter binding so quick-select keys and a plain
+        // Enter both feel like "just deliver this now".
+        pick("paste");
       }
     }
   }
@@ -230,7 +232,7 @@
           class:disabled={!p.enabled}
         >
           <button
-            onclick={() => { selected = i; pick("human"); }}
+            onclick={() => { selected = i; pick("paste"); }}
             onmousemove={() => (selected = i)}
           >
             <span class="row-left">
@@ -260,13 +262,13 @@
 
   <footer>
     <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
-    <span><kbd>↵</kbd> type</span>
+    <span><kbd>↵</kbd> paste</span>
     {#if IS_MAC}
       <span><kbd>⇧↵</kbd> fast</span>
-      <span><kbd>⌥↵</kbd> paste</span>
+      <span><kbd>⌥↵</kbd> type</span>
     {:else}
       <span><kbd>Shift+↵</kbd> fast</span>
-      <span><kbd>Alt+↵</kbd> paste</span>
+      <span><kbd>Alt+↵</kbd> type</span>
     {/if}
     <span class="grow"></span>
     <span><kbd>esc</kbd></span>

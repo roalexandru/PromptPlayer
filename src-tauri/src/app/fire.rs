@@ -20,7 +20,7 @@
 
 use crate::app::context::AppContext;
 use crate::filters;
-use crate::inject::EnigoInjector;
+use crate::inject::{paste_via_clipboard, EnigoInjector};
 use crate::matcher;
 use crate::prompts::expressions::ExprContext;
 use crate::prompts::placeholders::{expand, PlaceholderContext};
@@ -299,23 +299,45 @@ fn run_fire_pipeline(
             _ => {}
         }
     }
+    // RDP host-side: clipboard sync to the remote session is unreliable
+    // (spec §9.3), so a real clipboard paste can silently land the body on
+    // the wrong side. Demote paste to the human-typed path in that case.
+    if paste_mode && rdp_mode == RdpMode::HostSide {
+        tracing::info!("paste demoted to typed flow under RDP host-side mode");
+        paste_mode = false;
+    }
 
     let target_app = classify_target_app(&foreground, rdp_mode);
     let scope_match = !matches!(target_app, TargetAppKind::Unknown);
 
-    // 8 — schedule.
-    let mut rng = ChaCha8Rng::from_entropy();
-    let scheduled = schedule(&body, &profile, &opts, &mut rng);
-    let body_chars: usize = scheduled
-        .iter()
-        .filter(|k| matches!(k.key, Key::Char(_)))
-        .count()
-        .saturating_sub(
-            scheduled
-                .iter()
-                .filter(|k| matches!(k.key, Key::Backspace))
-                .count(),
-        );
+    // 8 — schedule. Skipped entirely in paste mode: a clipboard paste
+    // dispatches in one Ctrl/Cmd+V keystroke, no per-key cadence to build,
+    // and the previous code threw the schedule away anyway after computing
+    // it. That alone shaves tens of ms off the paste cold-start on big
+    // prompts. The RNG is only seeded when the schedule is actually built,
+    // saving an entropy-pool draw on every paste fire.
+    let scheduled = if paste_mode {
+        Vec::new()
+    } else {
+        let mut rng = ChaCha8Rng::from_entropy();
+        schedule(&body, &profile, &opts, &mut rng)
+    };
+    let body_chars: usize = if paste_mode {
+        // Paste path: report the body's char count directly. No corrections,
+        // no backspaces, no schedule to scan.
+        body.chars().count()
+    } else {
+        scheduled
+            .iter()
+            .filter(|k| matches!(k.key, Key::Char(_)))
+            .count()
+            .saturating_sub(
+                scheduled
+                    .iter()
+                    .filter(|k| matches!(k.key, Key::Backspace))
+                    .count(),
+            )
+    };
 
     telemetry::send(
         &app,
@@ -329,29 +351,37 @@ fn run_fire_pipeline(
     );
 
     // 9 — play.
-    let mut inj = match EnigoInjector::new() {
-        Ok(i) => i,
-        Err(e) => {
-            tracing::error!("enigo init failed: {:?}", e);
-            app_state.end_playback();
-            return;
-        }
-    };
-
     let completed = if paste_mode {
-        // Paste flow: spam chars without cadence. Honors cancel.
-        let mut ok = true;
-        for c in body.chars() {
-            if cancel.load(Ordering::Relaxed) {
-                inj.release_all_modifiers();
-                ok = false;
-                break;
+        // Clipboard paste: save → set → Ctrl/Cmd+V → wait → restore.
+        // Focus was confirmed by the caller (`picker_select` →
+        // `FocusStore::restore_and_wait`), so the synthesized paste
+        // keystroke lands on the right window. Cancel is checked once
+        // before we touch the clipboard — once Ctrl/Cmd+V is in flight
+        // the paste is effectively atomic, so per-char cancellation
+        // doesn't apply.
+        if cancel.load(Ordering::Relaxed) {
+            false
+        } else {
+            match paste_via_clipboard(&body) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!("clipboard paste failed: {:?}", e);
+                    false
+                }
             }
-            inj.type_char(c);
         }
-        ok
     } else {
-        play(&scheduled, &mut inj, cancel)
+        let mut inj = match EnigoInjector::new() {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::error!("enigo init failed: {:?}", e);
+                app_state.end_playback();
+                return;
+            }
+        };
+        let result = play(&scheduled, &mut inj, cancel.clone());
+        drop(inj);
+        result
     };
 
     if completed {
@@ -359,7 +389,13 @@ fn run_fire_pipeline(
             undo.record(form.to_string(), body_chars);
         }
     } else {
-        let pct = if body_chars == 0 {
+        // Paste is effectively atomic — `completed=false` means we never
+        // got past the cancel check or the clipboard/Ctrl+V failed before
+        // any character landed. Report 0% so telemetry doesn't claim a
+        // full paste happened when nothing did. The typed-path estimator
+        // uses `remaining_chars(&scheduled)` (still coarse — see the
+        // function comment).
+        let pct = if paste_mode || body_chars == 0 {
             0
         } else {
             (body_chars.saturating_sub(remaining_chars(&scheduled)) * 100 / body_chars).min(100)
@@ -373,7 +409,6 @@ fn run_fire_pipeline(
             },
         );
     }
-    drop(inj);
     app_state.end_playback();
 }
 

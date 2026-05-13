@@ -3,7 +3,7 @@
 use crate::app::context::AppContext;
 use crate::app::fire::{FireService, PickMode};
 use crate::error::IpcResult;
-use crate::picker::{SearchHit, RESTORATION_DELAY};
+use crate::picker::{SearchHit, RESTORATION_DELAY, RESTORATION_TIMEOUT};
 use crate::telemetry::{self, TelemetryEvent};
 use tauri::{AppHandle, Manager};
 
@@ -47,10 +47,19 @@ pub fn picker_select(
     if let Some(w) = app.get_webview_window("picker") {
         let _ = w.hide();
     }
-    if !ctx.focus.restore() {
-        tracing::warn!("focus restore failed");
+    // Restore focus and wait until the OS actually reports the previously-
+    // foreground window as foreground again. Paste mode synthesizes Ctrl/Cmd+V
+    // which dispatches to *whoever* has focus right now, so guessing with a
+    // blind sleep is what produced "first chars land in the wrong window".
+    // The wait returns as soon as the transfer is observed (usually <20ms)
+    // and falls back to a small nap only if the verify loop times out.
+    if !ctx.focus.restore_and_wait(RESTORATION_TIMEOUT) {
+        tracing::warn!(
+            "focus restore did not confirm within {:?}; falling back to blind delay",
+            RESTORATION_TIMEOUT
+        );
+        std::thread::sleep(RESTORATION_DELAY);
     }
-    std::thread::sleep(RESTORATION_DELAY);
     let fire = FireService::new(ctx.inner().clone(), app.clone());
     fire.fire_from_picker(&prompt_id, PickMode::parse(&mode));
     Ok(())
