@@ -216,6 +216,58 @@ Zoom Desktop → Settings → Share Screen → check **"Use TCP connection for s
 
 ---
 
+## §8 — How other tools handle this (May 2026 survey)
+
+Surveyed 20+ open-source projects that use `SetWindowDisplayAffinity` / `WDA_EXCLUDEFROMCAPTURE` (or its abstractions). Three patterns emerged.
+
+### Pattern A — Top-level HWND only (the industry default)
+
+Every project below applies the flag to one HWND and walks no children:
+
+| Project | Stack | Flag | File |
+|---|---|---|---|
+| [tauri-apps/tauri](https://github.com/tauri-apps/tauri) (`Window::set_content_protected`) | Tauri / Wry | `WDA_EXCLUDEFROMCAPTURE` | `crates/tauri-runtime-wry/src/lib.rs` |
+| [raphamorim/rio](https://github.com/raphamorim/rio) | Rust terminal | `WDA_EXCLUDEFROMCAPTURE` | `rio-window/src/platform_impl/windows/window.rs` |
+| [iamsrikanthnani/pluely](https://github.com/iamsrikanthnani/pluely) | Tauri (Cluely alt) | via Tauri `content_protected(true)` | `src-tauri/src/window.rs` |
+| [dan0dev/ScreenPrompt](https://github.com/dan0dev/ScreenPrompt) | Tauri | `WDA_EXCLUDEFROMCAPTURE` | `screenprompt-tauri/src-tauri/src/windows_api.rs` |
+| [slopedrop/contop](https://github.com/slopedrop/contop) | Tauri | `WDA_EXCLUDEFROMCAPTURE` | `contop-desktop/src-tauri/src/away_mode.rs` |
+| [kiskaserver/interactive_assistent](https://github.com/kiskaserver/interactive_assistent) | Tauri | `WDA_EXCLUDEFROMCAPTURE` | `src-tauri/src/commands/vision.rs` |
+| [ddsha441981/GodseYe_WinX64](https://github.com/ddsha441981/GodseYe_WinX64) | Tauri | `WDA_EXCLUDEFROMCAPTURE` | `src-tauri/src/stealth.rs` |
+| [electron/electron](https://github.com/electron/electron) (`setContentProtection`) | Electron | `WDA_EXCLUDEFROMCAPTURE` | platform code |
+| [varun-singhh/Vysper](https://github.com/varun-singhh/Vysper) | Electron (Cluely alt) | `setContentProtection(true)` | `main.js` |
+| [shubhamshnd/Open-Cluely](https://github.com/shubhamshnd/Open-Cluely) | Electron (Cluely alt) | `setContentProtection(true)` | — |
+| [radiantly/Invisiwind](https://github.com/radiantly/Invisiwind) | Rust DLL inject | `WDA_EXCLUDEFROMCAPTURE` | `payload/src/lib.rs` |
+| [myexistences/WindowCaptureHider](https://github.com/myexistences/WindowCaptureHider) | C++ DLL inject | `WDA_EXCLUDEFROMCAPTURE` | — |
+| [aamitn/winhider](https://github.com/aamitn/winhider) | C++ | `WDA_EXCLUDEFROMCAPTURE` | — |
+| [shalzuth/WindowSharingHider](https://github.com/shalzuth/WindowSharingHider) | C# | `WDA_EXCLUDEFROMCAPTURE` | — |
+| [hyowonbernabe/Kuroko](https://github.com/hyowonbernabe/Kuroko) | C#/WPF stealth AI | `WDA_EXCLUDEFROMCAPTURE` | — |
+| [godotengine/godot](https://github.com/godotengine/godot) (game engine) | C++ | `WDA_EXCLUDEFROMCAPTURE` | `platform/windows/display_server_windows.cpp` |
+| [Redot-Engine/redot-engine](https://github.com/Redot-Engine/redot-engine) | C++ | `WDA_EXCLUDEFROMCAPTURE` | `platform/windows/display_server_windows.cpp` |
+| [obsproject/obs-studio](https://github.com/obsproject/obs-studio) (hides own UI from its own capture) | C++ | `WDA_EXCLUDEFROMCAPTURE` | `frontend/widgets/OBSBasic.cpp` |
+| [winsiderss/systeminformer](https://github.com/winsiderss/systeminformer) (Process Hacker) | C++ | `WDA_EXCLUDEFROMCAPTURE` | `phlib/directdraw.cpp` |
+| [joncampbell123/dosbox-x](https://github.com/joncampbell123/dosbox-x) | C++ | `WDA_MONITOR \| WDA_EXCLUDEFROMCAPTURE` | `src/dosbox.cpp` |
+| [salihcantekin/RustFrame](https://github.com/salihcantekin/RustFrame) | Rust | `WDA_EXCLUDEFROMCAPTURE` | `src/destination_window/windows.rs` |
+| [AleqsSilagadze/Amnesia-Chat](https://github.com/AleqsSilagadze/Amnesia-Chat) | Rust | `WDA_EXCLUDEFROMCAPTURE` | `src/main.rs` |
+| [raycast/extensions](https://github.com/raycast/extensions) color-picker | Rust | `WDA_EXCLUDEFROMCAPTURE` | `extensions/color-picker/rust/color-picker/src/color_picker.rs` |
+
+**Implication:** the recursive descendant walk in this PR is **not** the industry-standard approach — it's a more defensive variant that addresses [WebView2Feedback #4544](https://github.com/MicrosoftEdge/WebView2Feedback/issues/4544) (Microsoft-confirmed: child HWNDs don't inherit the flag). The bug those projects ship — picker invisible to user during full-screen Zoom share on Win11 24H2 — is open and unfixed in Tauri itself ([tauri #14189](https://github.com/tauri-apps/tauri/issues/14189), filed Sep 2025, no engineering analysis, no PR).
+
+### Pattern B — Chromium's choice: `WDA_MONITOR` over `WDA_EXCLUDEFROMCAPTURE`
+
+[Chromium's `desktop_window_tree_host_win.cc`](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc) deliberately uses `WDA_MONITOR` instead, with this comment:
+
+> "When screenshots are not allowed, set the affinity to WDA_MONITOR. This is used instead of WDA_EXCLUDEFROMCAPTURE because the latter renders the window with 'no content', which appears as a black rectangle on the screen, whereas the former completely removes the window from the screen."
+
+Chromium accepts "black rectangle visible in the capture" as a trade-off for "renders correctly on the local screen." This is the same trade-off [Electron #45990](https://github.com/electron/electron/issues/45990) wrestled with in March 2026 (regression that re-introduced the black rectangle). Electron fixed it via [PR #47020](https://github.com/electron/electron/pull/47020) by overriding Chromium's `ElectronDesktopWindowTreeHostWin` methods — but Tauri's wry has no equivalent abstraction.
+
+**This PR's auto-fallback to `WDA_MONITOR`** (in `capture.rs::apply_affinity_recursive`, only triggered when `WDA_EXCLUDEFROMCAPTURE` returns `ERROR_NOT_ENOUGH_MEMORY`) implements Chromium's strategy as the failure-mode escape hatch.
+
+### Pattern C — Nobody walks child HWNDs
+
+A targeted GitHub search (`EnumChildWindows SetWindowDisplayAffinity`) returns **zero matches** combining both calls. The recursive HWND walk in this PR is, as best I can determine, an original solution to the WebView2 child-inheritance bug.
+
+---
+
 ## Appendix — known caveats
 
 - **Zoom 5.x vs 6.x**: 5.x is more lenient about `WDA_EXCLUDEFROMCAPTURE`. The bug repros most reliably on 6.x + Win11 24H2 + an integrated GPU. If you can't repro on a dGPU machine, that's still informative — note it.

@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowDisplayAffinity,
     GetWindowTextW, IsIconic, IsWindowVisible, SetWindowDisplayAffinity, GW_HWNDNEXT,
-    WINDOW_DISPLAY_AFFINITY,
+    WDA_MONITOR, WINDOW_DISPLAY_AFFINITY,
 };
 
 // --------------------------------------------------------------------------
@@ -168,6 +168,27 @@ pub fn apply_affinity_recursive(
                     hresult = format!("0x{hr:08X}"),
                     "win11_legacy_display_affinity_bug: SetWindowDisplayAffinity returned ERROR_NOT_ENOUGH_MEMORY (win32k bug). Capture-exclusion will NOT work until the LegacyDisplayAffinity Application Compatibility shim is applied. See https://learn.microsoft.com/en-us/answers/questions/700122/setwindowdisplayaffinity-on-windows-11"
                 );
+                // Defense-in-depth: try WDA_MONITOR as a fallback. Chromium's
+                // own desktop_window_tree_host_win.cc uses WDA_MONITOR
+                // instead of WDA_EXCLUDEFROMCAPTURE for similar reasons —
+                // the win32k bug class often spares WDA_MONITOR even when
+                // it rejects WDA_EXCLUDEFROMCAPTURE. Picker becomes a
+                // black rectangle to the audience instead of being fully
+                // excluded, which is a strictly-better failure mode than
+                // "picker fully visible in the share."
+                if affinity.0 == 0x11
+                /* WDA_EXCLUDEFROMCAPTURE */
+                {
+                    if let Ok(()) = unsafe { SetWindowDisplayAffinity(parent, WDA_MONITOR) } {
+                        applied += 1;
+                        tracing::warn!(
+                            target: "prompt_player::capture",
+                            hwnd = parent.0 as usize,
+                            class = %class_name_of(parent),
+                            "fell back to WDA_MONITOR after WDA_EXCLUDEFROMCAPTURE rejected by win32k bug; audience sees a black rectangle instead of see-through"
+                        );
+                    }
+                }
             } else {
                 tracing::warn!(
                     target: "prompt_player::capture",
