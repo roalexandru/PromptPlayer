@@ -91,37 +91,6 @@ fn is_cloaked(hwnd: HWND) -> bool {
     res.is_ok() && cloaked != 0
 }
 
-/// Walk z-order from `start` looking for the first top-level window that is
-/// a plausible focus target: visible, not cloaked, not minimized, not one of
-/// our own windows, not a Zoom share-helper. Bounded at 10 iterations to keep
-/// the call cheap and avoid pathological z-order loops.
-pub fn next_visible_top_level(start: HWND) -> Option<HWND> {
-    let mut cur = start;
-    for _ in 0..10 {
-        let next = match unsafe { GetWindow(cur, GW_HWNDNEXT) } {
-            Ok(h) => h,
-            Err(_) => return None,
-        };
-        if next.0.is_null() {
-            return None;
-        }
-        if !unsafe { IsWindowVisible(next) }.as_bool()
-            || unsafe { IsIconic(next) }.as_bool()
-            || is_cloaked(next)
-        {
-            cur = next;
-            continue;
-        }
-        let class = class_name_of(next);
-        if is_known_share_helper(&class) || is_own_window_class(&class) {
-            cur = next;
-            continue;
-        }
-        return Some(next);
-    }
-    None
-}
-
 /// Collect every descendant HWND under `parent`. `EnumChildWindows` walks the
 /// full tree (children, grandchildren, …) per MSDN, so a single call is enough.
 pub fn enumerate_descendants(parent: HWND) -> Vec<HWND> {
@@ -129,6 +98,9 @@ pub fn enumerate_descendants(parent: HWND) -> Vec<HWND> {
         return Vec::new();
     }
     let mut collected: Vec<HWND> = Vec::new();
+    // SAFETY: `lparam` is a pointer to a `Vec<HWND>` owned by this stack frame.
+    // `EnumChildWindows` is synchronous — the callback only runs while we're
+    // blocked on this call below, so the pointer is live for the duration.
     unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let v = &mut *(lparam.0 as *mut Vec<HWND>);
         v.push(hwnd);
