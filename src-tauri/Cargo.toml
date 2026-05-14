@@ -160,6 +160,7 @@ windows = { version = "0.58", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_UI_Shell",
 ] }
 
@@ -176,3 +177,7 @@ tauri = { version = "2", features = [
     "test",
 ] }
 http = "1"
+# Captures `tracing` events for assertions in unit/integration tests.
+# Used by the screen-capture-exclusion + foreground-filter test suites to
+# pin diagnostic log lines (so a future refactor can't silently drop them).
+tracing-test = { version = "0.2", features = ["no-env-filter"] }

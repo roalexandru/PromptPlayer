@@ -90,5 +90,33 @@ pub fn show_picker_window(app: &AppHandle) {
         let _ = w.set_focus();
         use tauri::Emitter;
         let _ = w.emit("picker-shown", ());
+
+        // Windows-only: WebView2 lazily creates its GPU swap-chain child
+        // HWND on first paint, not at window-show. The synchronous
+        // `prepare_picker` call only saw HWNDs that existed at that
+        // moment; the swap chain that appears moments later misses the
+        // recursive `WDA_EXCLUDEFROMCAPTURE` walk. Re-apply once after a
+        // single paint cycle so any late-spawned descendants get the
+        // flag too. 150 ms is conservative — typical WebView2 first-paint
+        // is <50 ms even on cold start. No-op if the window is gone.
+        //
+        // Use `std::thread::spawn` rather than `tokio::spawn`: this
+        // function is invoked from global-shortcut + tray-menu callbacks
+        // that don't always run inside a tokio runtime context, and
+        // `tokio::spawn` panics outside one. A short-lived sleep thread
+        // is fine — the cost is one thread that lives ~150ms.
+        #[cfg(target_os = "windows")]
+        {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                if let Some(w) = app.get_webview_window("picker") {
+                    if let Err(e) = crate::picker::window::apply_screen_capture_exclusion(&w, true)
+                    {
+                        tracing::warn!("deferred capture-exclusion re-apply failed: {e}");
+                    }
+                }
+            });
+        }
     }
 }

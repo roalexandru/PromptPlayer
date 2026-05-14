@@ -38,11 +38,16 @@ mod plat {
 
 #[cfg(target_os = "windows")]
 mod plat {
+    //! Windows applies `WDA_EXCLUDEFROMCAPTURE` to the picker's parent HWND
+    //! **and every descendant**. WebView2 hosts its GPU swap chain in a
+    //! descendant HWND; setting the flag only on the parent leaves the swap
+    //! chain visible-to-capture on some Win11 24H2 configurations, which is
+    //! the failure mode that produced "picker is invisible during Zoom
+    //! share." See `platform/windows/capture.rs::apply_affinity_recursive`.
+    use crate::platform::windows::capture::apply_affinity_recursive;
     use tauri::WebviewWindow;
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{WDA_EXCLUDEFROMCAPTURE, WDA_NONE};
 
     pub fn set_screen_capture_exclusion(window: &WebviewWindow, hide: bool) -> Result<(), String> {
         let hwnd = HWND(window.hwnd().map_err(|e| format!("hwnd: {}", e))?.0 as _);
@@ -51,11 +56,7 @@ mod plat {
         } else {
             WDA_NONE
         };
-        unsafe {
-            SetWindowDisplayAffinity(hwnd, affinity)
-                .map_err(|e| format!("SetWindowDisplayAffinity: {}", e))?;
-        }
-        Ok(())
+        apply_affinity_recursive(hwnd, affinity).map(|_| ())
     }
 }
 

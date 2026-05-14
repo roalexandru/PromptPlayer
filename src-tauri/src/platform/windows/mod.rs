@@ -4,6 +4,7 @@
 //! All `unsafe` Win32 calls live behind these submodules.
 
 pub mod activation;
+pub mod capture;
 pub mod menu;
 pub mod panel;
 pub mod screen;
