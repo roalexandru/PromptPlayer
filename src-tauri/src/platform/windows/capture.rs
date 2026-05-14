@@ -117,6 +117,21 @@ pub fn enumerate_descendants(parent: HWND) -> Vec<HWND> {
 /// even partial success preserves the prior single-HWND behavior.
 ///
 /// Returns `(applied, attempted)` on success. Errs only when `parent` is null.
+///
+/// **Two known failure modes are surfaced via logging:**
+///
+/// 1. WebView2 hosts its GPU swap chain in a descendant HWND; the parent's
+///    display-affinity flag does not propagate to that child on some
+///    Win11 builds. Microsoft tracks this as WebView2Feedback #4544
+///    (AB#50877897). Recursive application here is the workaround.
+///
+/// 2. On Windows 11, the kernel function `win32kfull.sys::ChangeWindowTreeProtection`
+///    has a bug that makes `SetWindowDisplayAffinity` return
+///    `ERROR_NOT_ENOUGH_MEMORY` (HRESULT `0x80070008`) for "non-traditional
+///    Win32" apps including Chromium / WebView2 / Electron. Microsoft's
+///    official workaround is the `LegacyDisplayAffinity` Application
+///    Compatibility shim (see https://aka.ms/AppCompat). This function
+///    cannot fix that — it can only detect and log it.
 pub fn apply_affinity_recursive(
     parent: HWND,
     affinity: WINDOW_DISPLAY_AFFINITY,
@@ -139,11 +154,29 @@ pub fn apply_affinity_recursive(
             );
         }
         Err(e) => {
-            tracing::warn!(
-                hwnd = parent.0 as usize,
-                class = %class_name_of(parent),
-                "SetWindowDisplayAffinity on parent failed: {e}"
-            );
+            // HRESULT 0x80070008 = Win32 ERROR_NOT_ENOUGH_MEMORY. On Windows
+            // 11, this specific failure is the `ChangeWindowTreeProtection`
+            // kernel bug — not an actual memory exhaustion. Surface it as
+            // its own structured event so log-greppers can distinguish "the
+            // OS rejected us" from "the HWND was destroyed mid-call".
+            let hr = e.code().0 as u32;
+            if hr == 0x8007_0008 {
+                tracing::error!(
+                    target: "prompt_player::capture",
+                    hwnd = parent.0 as usize,
+                    class = %class_name_of(parent),
+                    hresult = format!("0x{hr:08X}"),
+                    "win11_legacy_display_affinity_bug: SetWindowDisplayAffinity returned ERROR_NOT_ENOUGH_MEMORY (win32k bug). Capture-exclusion will NOT work until the LegacyDisplayAffinity Application Compatibility shim is applied. See https://learn.microsoft.com/en-us/answers/questions/700122/setwindowdisplayaffinity-on-windows-11"
+                );
+            } else {
+                tracing::warn!(
+                    target: "prompt_player::capture",
+                    hwnd = parent.0 as usize,
+                    class = %class_name_of(parent),
+                    hresult = format!("0x{hr:08X}"),
+                    "SetWindowDisplayAffinity on parent failed: {e}"
+                );
+            }
         }
     }
 

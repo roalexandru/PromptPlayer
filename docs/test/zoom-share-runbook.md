@@ -168,6 +168,54 @@ Sign-off (release-blocking): the above must be all-green for a release build to 
 
 ---
 
+## §7 — Troubleshooting matrix
+
+Two distinct Windows bugs can cause "picker doesn't function during Zoom share." This PR addresses one of them via code; the other requires deployment-time intervention. Use the log signals below to tell them apart.
+
+### §7.1 — WebView2 child-HWND inheritance (this PR fixes)
+
+**Microsoft-confirmed root cause** for "tooltips and HTML select dropdowns remain visible in screenshots when SetWindowDisplayAffinity is used on a WebView2 host" — WebView2Feedback #4544 (tracked as AB#50877897). Same class of bug surfaces against full screen capture too: the parent HWND gets the flag, the GPU swap-chain child does not, and DWM's compositor mitigation leaves the WebView2 surface blank to the local user.
+
+**Log signal that the fix is engaging:**
+
+```
+display-affinity applied to picker tree  applied=4 attempted=4 parent=...
+display-affinity set (descendant)  class=Chrome_WidgetWin_1 ...
+display-affinity set (descendant)  class=Intermediate D3D Window ...
+```
+
+If `applied >= 2` and the descendant classes look WebView2-ish, this branch of the bug is mitigated.
+
+### §7.2 — Win11 `ChangeWindowTreeProtection` kernel bug (this PR cannot fix)
+
+A Microsoft engineer (Junjie Zhu) confirmed a bug in `win32kfull.sys::ChangeWindowTreeProtection` causes `SetWindowDisplayAffinity` to return `ERROR_NOT_ENOUGH_MEMORY` (HRESULT `0x80070008`) for "non-traditional Win32" applications — Chromium, Firefox, Edge, Teams, and (by extension) WebView2-hosted Tauri windows. See [SetWindowDisplayAffinity on Windows 11](https://learn.microsoft.com/en-us/answers/questions/700122/setwindowdisplayaffinity-on-windows-11).
+
+**Log signal:**
+
+```
+ERROR  win11_legacy_display_affinity_bug: SetWindowDisplayAffinity returned ERROR_NOT_ENOUGH_MEMORY...
+```
+
+**Microsoft's official workaround** (deployment-time, not code-fixable):
+
+1. Install the Windows ADK (Application Compatibility Toolkit).
+2. Open Compatibility Administrator (run as admin).
+3. File → New → Database → Create New → Application Fix.
+4. Target: the installed `Prompt Player.exe` (typically `%ProgramFiles%\Prompt Player\Prompt Player.exe`).
+5. Compatibility Modes → Apply Compatibility Fixes → check **LegacyDisplayAffinity**.
+6. Save the `.sdb` and install with `sdbinst.exe <file>.sdb` (admin).
+7. Restart Prompt Player and re-run §2.1.
+
+A future installer update could ship the `.sdb` automatically. Out of scope for this PR.
+
+### §7.3 — Zoom-side: "Advanced capture with window filtering" must be ON
+
+Zoom Desktop → Settings → Share Screen → check **"Use TCP connection for screen sharing"** AND **"Advanced capture with window filtering"** (sometimes labeled "Capture only specific windows in screen share"). When this is OFF, Zoom uses a capture path that bypasses `SetWindowDisplayAffinity` entirely — no amount of code on our side will hide the picker. This is documented in the [Cluely / Adam Svoboda writeup](https://adamsvoboda.net/how-interview-cheating-tools-hide-from-zoom/).
+
+**Pre-flight checklist for §2/§3:** confirm both Zoom settings are ON before testing. Note the Zoom version when recording the run (the setting's label has moved between 5.x and 6.x).
+
+---
+
 ## Appendix — known caveats
 
 - **Zoom 5.x vs 6.x**: 5.x is more lenient about `WDA_EXCLUDEFROMCAPTURE`. The bug repros most reliably on 6.x + Win11 24H2 + an integrated GPU. If you can't repro on a dGPU machine, that's still informative — note it.
