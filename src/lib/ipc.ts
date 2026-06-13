@@ -4,7 +4,6 @@
 // `src-tauri/src/app/setup.rs::generate_typescript_bindings`).
 // Treat it as source-controlled but auto-managed — do not edit by hand.
 
-import { invoke } from "@tauri-apps/api/core";
 import { commands, type Prompt, type ProfileKind, type TypingOverrides, type SearchHit, type IpcError, type UpdateInfo, type ForegroundAppInfo, type Result } from "./ipc.gen";
 
 export type { Prompt, ProfileKind, TypingOverrides, SearchHit, IpcError, UpdateInfo, ForegroundAppInfo };
@@ -16,6 +15,13 @@ async function unwrap<T>(p: Promise<Result<T, IpcError>>): Promise<T> {
   const r = await p;
   if (r.status === "ok") return r.data;
   throw r.error;
+}
+
+/// Format an unknown thrown value into a user-visible string. `unwrap()`
+/// throws plain `{ kind, message }` IpcError objects, which `String(e)`
+/// renders as "[object Object]" — prefer the structured message when present.
+export function fmtErr(e: unknown): string {
+  return (e as IpcError)?.message ?? String(e);
 }
 
 export const ipc = {
@@ -59,14 +65,6 @@ export const ipc = {
   importPrompt: (sourcePath: string) => unwrap(commands.importPrompt(sourcePath)),
   exportPrompt: (promptId: string, destPath: string) =>
     unwrap(commands.exportPrompt(promptId, destPath)),
-  // shell — direct invoke instead of going through the auto-generated
-  // bindings: the bindings file is regenerated on the next debug `cargo run`,
-  // so until that happens this IPC isn't visible to `commands`.
-  openExternal: (url: string) =>
-    invoke<{ status: "ok"; data: null } | { status: "error"; error: IpcError }>(
-      "open_external",
-      { url },
-    ).then((r) => {
-      if (r.status === "error") throw r.error;
-    }),
+  // shell
+  openExternal: (url: string) => unwrap(commands.openExternal(url)),
 };

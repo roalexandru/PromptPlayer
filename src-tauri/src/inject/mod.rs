@@ -54,6 +54,24 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// Read the system clipboard's plain text, if any. Returns `None` when the
+/// clipboard is empty, holds no text flavor, or can't be read. Used to fill
+/// the `$CLIPBOARD` placeholder / `clipboard` expression builtin at fire time.
+pub fn read_clipboard_text() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::read_clipboard_string()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::read_clipboard_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
 pub struct EnigoInjector {
     enigo: Enigo,
 }
@@ -92,6 +110,14 @@ impl Injector for EnigoInjector {
     }
     fn press_enter(&mut self) {
         let _ = self.enigo.key(EnigoKey::Return, Direction::Click);
+    }
+    fn press_shift_enter(&mut self) {
+        // Hold Shift across the Return so chat apps insert a line break
+        // instead of sending. Release Shift even if the Return errors so we
+        // never leave the modifier stuck (§2.7).
+        let _ = self.enigo.key(EnigoKey::Shift, Direction::Press);
+        let _ = self.enigo.key(EnigoKey::Return, Direction::Click);
+        let _ = self.enigo.key(EnigoKey::Shift, Direction::Release);
     }
     fn release_all_modifiers(&mut self) {
         // Defensive: release the common modifiers that could have been captured.

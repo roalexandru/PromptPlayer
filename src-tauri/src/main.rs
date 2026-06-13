@@ -68,7 +68,6 @@ fn init_tracing() {
             .with(oslog_layer)
             .init();
         eprintln!("Prompt Player logs: {}", log_dir.display());
-        return;
     }
 
     #[cfg(not(target_os = "macos"))]

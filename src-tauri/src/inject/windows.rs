@@ -15,12 +15,10 @@
 //! GlobalAlloc / SetClipboardData dance and synthesizes Ctrl+V via SendInput.
 
 use super::PasteError;
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{GetLastError, GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, OpenClipboard,
     SetClipboardData,
 };
 use windows::Win32::System::Memory::{
@@ -80,23 +78,47 @@ fn send_unicode_unit(unit: u16) {
     }
 }
 
+/// Read the clipboard's CF_UNICODETEXT flavor, if any. Used to populate the
+/// `$CLIPBOARD` placeholder / `clipboard` expression builtin at fire time.
+pub(crate) fn read_clipboard_string() -> Option<String> {
+    unsafe {
+        let _guard = open_clipboard_retry().ok()?;
+        let handle = GetClipboardData(CF_UNICODETEXT).ok()?;
+        if handle.is_invalid() {
+            return None;
+        }
+        let hglobal = HGLOBAL(handle.0 as _);
+        let ptr = GlobalLock(hglobal) as *const u16;
+        if ptr.is_null() {
+            return None;
+        }
+        // CF_UNICODETEXT is a null-terminated UTF-16 string.
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        let s = String::from_utf16_lossy(slice);
+        let _ = GlobalUnlock(hglobal);
+        Some(s)
+    }
+}
+
 // --------------- clipboard paste -----------------
 
 /// Set the system clipboard to `body` (CF_UNICODETEXT), synthesize Ctrl+V on
 /// the foreground window, wait briefly for the paste to be consumed, and
-/// restore the previous clipboard contents. The save/restore covers
-/// CF_UNICODETEXT only — sufficient for ~all stealth-demo scenarios; rich
-/// formats / images are not preserved.
+/// restore the previous clipboard contents. We snapshot every clipboard
+/// format backed by movable global memory. If the clipboard contains a format
+/// we cannot safely copy (for example a bitmap handle), this returns an error
+/// before touching the clipboard so the caller can fall back to typed playback.
 pub(super) fn paste_via_clipboard(body: &str) -> Result<(), PasteError> {
-    // 1. Snapshot the existing clipboard text (best-effort).
-    let saved = save_unicode_clipboard();
+    // 1. Snapshot the existing clipboard formats.
+    let saved = save_clipboard().map_err(PasteError::Clipboard)?;
 
     // 2. Set ours.
     if let Err(e) = set_unicode_clipboard(body) {
-        // Restore whatever we snapshotted (could be None) and bail.
-        if let Some(s) = saved {
-            let _ = set_unicode_clipboard(&s);
-        }
+        let _ = restore_clipboard(&saved);
         return Err(PasteError::Clipboard(e));
     }
 
@@ -108,39 +130,48 @@ pub(super) fn paste_via_clipboard(body: &str) -> Result<(), PasteError> {
     release_user_modifiers();
     if let Err(e) = synth_ctrl_v() {
         // Best-effort restore even on synth failure.
-        if let Some(s) = saved {
-            let _ = set_unicode_clipboard(&s);
-        }
+        let _ = restore_clipboard(&saved);
         return Err(PasteError::Injection(e));
     }
 
     // 4. Give the target app time to consume the paste from the clipboard
     //    BEFORE we restore. Apps read CF_UNICODETEXT on the WM_PASTE
     //    handler synchronously after Ctrl+V, but the keystroke itself is
-    //    delivered asynchronously and the WM_KEYUP for Ctrl needs to
-    //    drain too. 60ms is conservative; users won't notice this delay
-    //    because the text is already on screen.
-    std::thread::sleep(Duration::from_millis(60));
+    //    delivered asynchronously and the WM_KEYUP for Ctrl needs to drain
+    //    too. Under load, Electron/browser chat apps (the main target) can
+    //    read the clipboard well after 60ms — restoring too early makes them
+    //    paste the user's PREVIOUS clipboard (potentially private) mid-demo.
+    //    250ms is imperceptible (text is already on screen) and far safer;
+    //    with playbacks mutually exclusive nothing else needs this thread.
+    std::thread::sleep(Duration::from_millis(250));
 
-    // 5. Restore the original clipboard if we had something to put back.
+    // 5. Restore the original clipboard.
     //    On failure we log and move on — leaving our text on the clipboard
     //    is the lesser evil compared to leaving the clipboard empty.
-    if let Some(s) = saved {
-        if let Err(e) = set_unicode_clipboard(&s) {
-            tracing::warn!("clipboard restore failed: {}", e);
-        }
+    if let Err(e) = restore_clipboard(&saved) {
+        tracing::warn!("clipboard restore failed: {}", e);
     }
     Ok(())
 }
 
-fn open_clipboard_retry() -> Result<(), String> {
+struct ClipboardGuard;
+
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseClipboard();
+        }
+    }
+}
+
+fn open_clipboard_retry() -> Result<ClipboardGuard, String> {
     // The clipboard is a global single-owner mutex; another app
     // (Spotify, browsers, password managers) can hold it briefly.
     // Retry for up to ~250ms.
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         if unsafe { OpenClipboard(HWND::default()).is_ok() } {
-            return Ok(());
+            return Ok(ClipboardGuard);
         }
         if Instant::now() >= deadline {
             return Err(format!("OpenClipboard failed: {:?}", unsafe {
@@ -151,41 +182,64 @@ fn open_clipboard_retry() -> Result<(), String> {
     }
 }
 
-fn save_unicode_clipboard() -> Option<String> {
+struct ClipboardSnapshot {
+    formats: Vec<ClipboardFormatData>,
+}
+
+struct ClipboardFormatData {
+    format: u32,
+    bytes: Vec<u8>,
+}
+
+fn save_clipboard() -> Result<ClipboardSnapshot, String> {
     unsafe {
-        if IsClipboardFormatAvailable(CF_UNICODETEXT).is_err() {
-            return None;
-        }
-        if open_clipboard_retry().is_err() {
-            return None;
-        }
-        let handle = match GetClipboardData(CF_UNICODETEXT) {
-            Ok(h) if !h.is_invalid() => h,
-            _ => {
-                let _ = CloseClipboard();
-                return None;
+        let _guard = open_clipboard_retry()?;
+        let mut formats = Vec::new();
+        let mut format = EnumClipboardFormats(0);
+        while format != 0 {
+            let handle = GetClipboardData(format)
+                .map_err(|_| format!("GetClipboardData({format}) failed: {:?}", GetLastError()))?;
+            if handle.is_invalid() {
+                return Err(format!("clipboard format {format} returned invalid handle"));
             }
-        };
-        let hglobal = HGLOBAL(handle.0 as _);
-        let ptr = GlobalLock(hglobal) as *const u16;
-        let result = if ptr.is_null() {
-            None
-        } else {
-            // Walk until NUL, but cap at the alloc size to defend against
-            // a buggy clipboard owner that wrote non-NUL-terminated UTF-16.
-            // GlobalSize returns the rounded-up alloc size, not the exact
-            // byte count, so use it strictly as an upper bound.
-            let max_units = GlobalSize(hglobal).saturating_div(2);
-            let mut len = 0usize;
-            while len < max_units && *ptr.add(len) != 0 {
-                len += 1;
+            let hglobal = HGLOBAL(handle.0 as _);
+            let size = GlobalSize(hglobal);
+            if size == 0 {
+                return Err(format!(
+                    "clipboard format {format} is not backed by movable global memory"
+                ));
             }
-            let slice = std::slice::from_raw_parts(ptr, len);
-            Some(OsString::from_wide(slice).to_string_lossy().into_owned())
-        };
-        let _ = GlobalUnlock(hglobal);
-        let _ = CloseClipboard();
-        result
+            let ptr = GlobalLock(hglobal) as *const u8;
+            if ptr.is_null() {
+                return Err(format!("GlobalLock({format}) returned null"));
+            }
+            let bytes = std::slice::from_raw_parts(ptr, size).to_vec();
+            let _ = GlobalUnlock(hglobal);
+            formats.push(ClipboardFormatData { format, bytes });
+            format = EnumClipboardFormats(format);
+        }
+        Ok(ClipboardSnapshot { formats })
+    }
+}
+
+fn restore_clipboard(snapshot: &ClipboardSnapshot) -> Result<(), String> {
+    unsafe {
+        let _guard = open_clipboard_retry()?;
+        let _ = EmptyClipboard();
+        for item in &snapshot.formats {
+            let hglobal = alloc_global_bytes(&item.bytes)?;
+            let h = HANDLE(hglobal.0 as _);
+            if SetClipboardData(item.format, h).is_err() {
+                let _ = GlobalFree(hglobal);
+                return Err(format!(
+                    "SetClipboardData({}) failed: {:?}",
+                    item.format,
+                    GetLastError()
+                ));
+            }
+            // Ownership transferred to the clipboard.
+        }
+        Ok(())
     }
 }
 
@@ -194,31 +248,22 @@ fn set_unicode_clipboard(text: &str) -> Result<(), String> {
     wide.push(0);
     let bytes = wide.len() * std::mem::size_of::<u16>();
     unsafe {
-        // GlobalAlloc with GMEM_MOVEABLE: SetClipboardData takes ownership
-        // of moveable memory. The Result already gates success.
-        let hglobal = match GlobalAlloc(GMEM_MOVEABLE, bytes) {
-            Ok(h) => h,
-            Err(_) => return Err(format!("GlobalAlloc failed: {:?}", GetLastError())),
-        };
-        let dst = GlobalLock(hglobal) as *mut u16;
-        if dst.is_null() {
-            let _ = GlobalFree(hglobal);
-            return Err("GlobalLock returned null".into());
-        }
-        std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
-        let _ = GlobalUnlock(hglobal);
+        let data = std::slice::from_raw_parts(wide.as_ptr() as *const u8, bytes);
+        let hglobal = alloc_global_bytes(data)?;
 
         // From this point until SetClipboardData succeeds, we still own
         // hglobal — every error path below must call GlobalFree to avoid
         // leaking a multi-KB block per failed paste attempt.
-        if let Err(e) = open_clipboard_retry() {
-            let _ = GlobalFree(hglobal);
-            return Err(e);
-        }
+        let _guard = match open_clipboard_retry() {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = GlobalFree(hglobal);
+                return Err(e);
+            }
+        };
         let _ = EmptyClipboard();
         let h = HANDLE(hglobal.0 as _);
         let set_ok = SetClipboardData(CF_UNICODETEXT, h).is_ok();
-        let _ = CloseClipboard();
         if !set_ok {
             // Ownership did NOT transfer — we still own the alloc.
             let _ = GlobalFree(hglobal);
@@ -226,6 +271,23 @@ fn set_unicode_clipboard(text: &str) -> Result<(), String> {
         }
         // On success, the system owns hglobal — don't free.
         Ok(())
+    }
+}
+
+fn alloc_global_bytes(bytes: &[u8]) -> Result<HGLOBAL, String> {
+    unsafe {
+        let hglobal = match GlobalAlloc(GMEM_MOVEABLE, bytes.len()) {
+            Ok(h) => h,
+            Err(_) => return Err(format!("GlobalAlloc failed: {:?}", GetLastError())),
+        };
+        let dst = GlobalLock(hglobal) as *mut u8;
+        if dst.is_null() {
+            let _ = GlobalFree(hglobal);
+            return Err("GlobalLock returned null".into());
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        let _ = GlobalUnlock(hglobal);
+        Ok(hglobal)
     }
 }
 

@@ -124,7 +124,8 @@ impl PromptStore {
         Ok(snapshot)
     }
 
-    /// Persist a prompt to its `source_path` (or to a freshly-derived path).
+    /// Persist a prompt to its `source_path` (or, for frontend-originated
+    /// saves, the existing stored source path for the same prompt id).
     /// Returns the path written to.
     pub fn save(&self, prompt: &Prompt) -> AppResult<PathBuf> {
         let root = library::default_library_root().ok_or(AppError::LibraryRootUnresolved)?;
@@ -132,19 +133,34 @@ impl PromptStore {
             path: root.clone(),
             source: e,
         })?;
-        let path = match &prompt.source_path {
+        let existing_path = self
+            .inner
+            .read()
+            .iter()
+            .find(|p| p.id == prompt.id)
+            .and_then(|p| p.source_path.clone());
+        let mut snapshot = prompt.clone();
+        snapshot.typing_overrides = snapshot.typing_overrides.normalized();
+        if snapshot.source_path.is_none() {
+            snapshot.source_path = existing_path;
+        }
+        let path = match &snapshot.source_path {
             Some(p) => p.clone(),
-            None => root.join(format!("{}.pp.md", parser::slugify(&prompt.id))),
+            None => root.join(format!("{}.pp.md", parser::slugify(&snapshot.id))),
         };
-        let serialized = parser::serialize(prompt)?;
+        let serialized = parser::serialize(&snapshot)?;
         std::fs::write(&path, serialized).map_err(|e| AppError::Io {
             path: path.clone(),
             source: e,
         })?;
-        // The file watcher will pick this up and call `replace_all`,
-        // which bumps the generation. We bump eagerly too so callers
-        // observing the store see the change immediately even before
-        // the watcher fires.
+        {
+            let mut all = self.inner.write();
+            if let Some(existing) = all.iter_mut().find(|p| p.id == snapshot.id) {
+                *existing = snapshot;
+            } else {
+                all.push(snapshot);
+            }
+        }
         self.bump_generation();
         Ok(path)
     }
@@ -165,9 +181,11 @@ impl PromptStore {
                 source: e,
             })?;
         }
-        // Removal from the in-memory list happens via the watcher's
-        // load-all reload; we bump the generation so any in-flight
-        // search re-rebuilds against the post-delete state.
+        // Remove from the in-memory list immediately rather than waiting for
+        // the watcher's load-all reload — otherwise a deleted prompt keeps
+        // firing until the next filesystem event (and never, if the watcher
+        // failed to start). The caller reindexes the matcher afterward.
+        self.inner.write().retain(|p| p.id != id);
         self.bump_generation();
         Ok(())
     }
@@ -281,5 +299,45 @@ mod tests {
         assert_eq!(err.kind(), "no-source-path");
         // The in-memory toggle still happened (errored on persistence).
         assert!(!s.find("a").unwrap().enabled);
+    }
+
+    #[test]
+    fn delete_removes_from_memory_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("PROMPT_PLAYER_PROMPTS", dir.path());
+        let path = dir.path().join("gone.pp.md");
+        std::fs::write(&path, "---\nname: Gone\ntriggers: [gone]\n---\nbody").unwrap();
+        let mut p = make_prompt("gone");
+        p.source_path = Some(path.clone());
+        let s = PromptStore::new();
+        s.replace_all(vec![p]);
+        let g = s.generation();
+        s.delete("gone").unwrap();
+        // Removed from memory now, not just from disk via the watcher.
+        assert!(s.find("gone").is_none());
+        assert!(!path.exists());
+        assert!(s.generation() > g);
+    }
+
+    #[test]
+    fn save_uses_existing_source_path_when_client_payload_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("PROMPT_PLAYER_PROMPTS", dir.path());
+        let path = dir.path().join("nested").join("custom.pp.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut existing = make_prompt("stable-id");
+        existing.source_path = Some(path.clone());
+        let s = PromptStore::new();
+        s.replace_all(vec![existing]);
+
+        let mut payload = make_prompt("stable-id");
+        payload.name = "Edited".into();
+        payload.source_path = None;
+        let written = s.save(&payload).unwrap();
+
+        assert_eq!(written, path);
+        assert!(path.exists());
+        assert!(!dir.path().join("stable-id.pp.md").exists());
+        assert_eq!(s.find("stable-id").unwrap().name, "Edited");
     }
 }

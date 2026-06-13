@@ -8,10 +8,16 @@
     prompts = [],
     /** ID of the prompt being edited (excluded from conflict check). */
     selfId,
+    /**
+     * Validity callback — fires with the current conflict/invalid message
+     * (or null when the hotkey is fine) so the parent can gate Save on it.
+     */
+    onvalidity,
   }: {
     value: string | null;
     prompts: Prompt[];
     selfId: string;
+    onvalidity?: (error: string | null) => void;
   } = $props();
 
   let recording = $state(false);
@@ -201,8 +207,27 @@
     cancelRecording();
   }
 
+  // Surface diagnostics to the parent whenever they change.
+  $effect(() => {
+    onvalidity?.(conflict ?? invalid ?? null);
+  });
+
+  // role="button" activation when idle — click / Enter / Space starts a
+  // recording. Inner buttons (Set / Rebind / Clear) keep their own handlers.
+  function onRootClick(e: MouseEvent) {
+    if (recording) return;
+    if ((e.target as HTMLElement | null)?.closest("button")) return;
+    startRecording();
+  }
+
   function onKeyDown(e: KeyboardEvent) {
-    if (!recording) return;
+    if (!recording) {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        startRecording();
+      }
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
 
@@ -317,6 +342,7 @@
   class:recording
   class:has-value={!!value && !recording}
   class:has-error={!!conflict || !!invalid}
+  onclick={onRootClick}
   onkeydown={onKeyDown}
   onblur={() => recording && cancelRecording()}
 >

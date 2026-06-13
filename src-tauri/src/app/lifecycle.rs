@@ -7,12 +7,12 @@
 //! focused app, which on slow machines or apps with activation animations
 //! is visible.
 
-use crate::picker::FocusStore;
-use std::sync::Arc;
 use tauri::{AppHandle, Manager, WebviewWindow, WindowEvent};
 
 #[cfg(target_os = "macos")]
 use crate::platform::macos::OutsideClickMonitor;
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 // Windows uses a native `TrackPopupMenuEx` HMENU for the tray popup — the
 // `tray-popup` webview is never shown on Windows, so the focus-loss handler
 // below is mac-only.
@@ -41,16 +41,14 @@ fn install_window_handlers(app: AppHandle, label: &str, window: WebviewWindow) {
             }
         }
         WindowEvent::Focused(false) if label_owned == "picker" => {
-            // Hide on focus loss. Focus restoration is intentionally NOT done
-            // here — the explicit dismiss path (Esc / outside click handled
-            // elsewhere) calls `FocusStore::restore`. Doing it here too would
-            // double-activate the previously-focused app.
+            // Hide ONLY — never restore focus here. The explicit Esc/select
+            // IPC paths (`picker_dismiss` / `picker_select`) own restoration;
+            // restoring here too double-activated the previous app on every
+            // dismiss. And when the picker loses focus because the user
+            // clicked into a *different* app, the OS already moved focus
+            // there — restoring would yank it back to the stale snapshot,
+            // stealing focus from the app the user just chose.
             let _ = w_clone.hide();
-            // Single restore here covers the click-outside-the-picker case
-            // where no explicit IPC dismiss fires.
-            if let Some(focus) = app.try_state::<Arc<FocusStore>>() {
-                let _ = focus.restore();
-            }
         }
         _ => {}
     });

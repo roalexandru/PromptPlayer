@@ -41,6 +41,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+url = "2"
 rand = { workspace = true }
 rand_distr = { workspace = true }
 rand_chacha = { workspace = true }
@@ -54,7 +55,7 @@ enigo = "0.2"
 # rdev compiled on Mac builds.
 
 # expressions sandbox
-boa_engine = "0.19"
+rquickjs = "0.11"
 
 # fuzzy search
 nucleo-matcher = "0.3"
@@ -119,6 +120,7 @@ block = "0.1"
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = [
     "NSString",
+    "NSData",
     "NSGeometry",
     "NSArray",
     "NSEnumerator",
@@ -161,6 +163,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Memory",
     "Win32_Graphics_Gdi",
     "Win32_UI_Shell",
+    "Win32_Media",
 ] }
 
 [features]

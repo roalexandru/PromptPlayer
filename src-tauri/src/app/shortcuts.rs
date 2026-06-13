@@ -125,23 +125,13 @@ pub fn register(
 fn summon_picker(app: &AppHandle, ctx: &AppContext) {
     // Picker open path used by both global shortcut and tray menu. We hop to
     // the main thread because the AppKit calls (NSEvent.mouseLocation,
-    // NSScreen.screens, setFrameOrigin:) require it.
+    // NSScreen.screens, setFrameOrigin:) require it. The actual sequence
+    // (capture-if-not-visible, rebuild search, position, show) lives in
+    // `commands::picker::summon_picker` so every entry point behaves alike.
     let app_for_main = app.clone();
     let ctx_for_main = ctx.clone();
     let _ = app.run_on_main_thread(move || {
-        ctx_for_main.focus.capture();
-        // Rebuild search index lazily — only if our generation lags the
-        // PromptStore generation.
-        ctx_for_main.search.lock().rebuild_if_stale(
-            ctx_for_main.prompts.generation(),
-            &ctx_for_main.prompts.read(),
-        );
-        #[cfg(target_os = "macos")]
-        crate::platform::macos::position_picker_on_cursor_screen(&app_for_main);
-        #[cfg(target_os = "windows")]
-        crate::platform::windows::position_picker_on_cursor_screen(&app_for_main);
-        crate::commands::picker::show_picker_window(&app_for_main);
-        telemetry::send(&app_for_main, TelemetryEvent::PickerOpened);
+        crate::commands::picker::summon_picker(&app_for_main, &ctx_for_main);
     });
 }
 

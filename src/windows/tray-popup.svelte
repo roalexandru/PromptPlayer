@@ -2,11 +2,15 @@
   import { onMount, onDestroy, tick } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+  import { confirm } from "@tauri-apps/plugin-dialog";
   import { ipc, type Prompt } from "$lib/ipc";
   import { IS_MAC } from "$lib/platform";
 
   let armed = $state(false);
   let prompts = $state<Prompt[]>([]);
+  // True while a typing playback is in flight — drives the emergency
+  // "Stop typing" row at the top of the popup.
+  let playing = $state(false);
   // hookAlive == false on macOS means the CGEventTap couldn't install (almost
   // always Accessibility permission). The tray surfaces a red banner row that
   // deep-links to System Settings. The Rust-side watcher respawns the hook
@@ -56,6 +60,11 @@
     armed = await ipc.getArmed();
     prompts = await ipc.listPrompts();
     try {
+      playing = await ipc.isPlaying();
+    } catch {
+      playing = false;
+    }
+    try {
       hookAlive = await ipc.isHookAlive();
     } catch {
       // If the IPC fails (shouldn't happen) assume alive — better to under-
@@ -104,15 +113,26 @@
   // leaves the user's target app with a half-typed prompt.
   async function quit() {
     try {
-      const playing = await ipc.isPlaying();
-      if (playing) {
-        const ok = window.confirm(
+      const inFlight = await ipc.isPlaying();
+      if (inFlight) {
+        const ok = await confirm(
           "A prompt is currently typing. Quit anyway? The remaining text will not be delivered.",
         );
         if (!ok) return;
       }
     } catch {}
     await ipc.trayQuit();
+  }
+
+  // Emergency stop — abort the in-flight playback, then re-read state so the
+  // row disappears once the engine reports idle.
+  async function stopTyping() {
+    try {
+      await ipc.kill();
+    } catch (e) {
+      console.error("kill failed", e);
+    }
+    await refresh();
   }
 
   async function checkForUpdates() {
@@ -168,17 +188,6 @@
     }
   }
 
-  // Compute the hover key from a pointer position by hit-testing the DOM.
-  // We don't rely on per-row mouseenter/leave because WKWebView inside a
-  // non-activating NSPanel does not reliably dispatch those events, leaving
-  // the CSS :hover state frozen wherever the last received mouse event was.
-  function updateHoverFromEvent(e: MouseEvent | PointerEvent) {
-    const el = document.elementFromPoint(e.clientX, e.clientY);
-    const row = (el as HTMLElement | null)?.closest<HTMLElement>("[data-hkey]");
-    hoverKey = row?.dataset.hkey ?? null;
-  }
-  function clearHover() { hoverKey = null; }
-
   let lastClientX = 0;
   let lastClientY = 0;
   let pollHandle: number | undefined;
@@ -195,6 +204,9 @@
     hoverKey = pickKeyAt(e.clientX, e.clientY);
   }
   function onLeaveDocument() { hoverKey = null; }
+  function onAnyMouseOut(e: MouseEvent) {
+    if (!e.relatedTarget) onLeaveDocument();
+  }
 
   // Some WKWebView + NSPanel combos drop mouse-moved events. As a last
   // resort, poll on rAF using the most recent known cursor position.
@@ -282,8 +294,11 @@
     }
   }
 
-  function dismissCtxOnOutsideClick() {
-    if (ctxMenu) ctxMenu = null;
+  function dismissCtxOnOutsidePointer(e: PointerEvent) {
+    if (!ctxMenu) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest(".ctx")) return;
+    ctxMenu = null;
   }
 
   onMount(async () => {
@@ -301,9 +316,8 @@
     document.addEventListener("pointermove", onAnyMouseMove, true);
     document.addEventListener("mouseover", onAnyMouseMove, true);
     document.addEventListener("mouseleave", onLeaveDocument, true);
-    document.addEventListener("mouseout", (e) => {
-      if (!e.relatedTarget) onLeaveDocument();
-    }, true);
+    document.addEventListener("mouseout", onAnyMouseOut, true);
+    document.addEventListener("pointerdown", dismissCtxOnOutsidePointer, true);
     document.addEventListener("contextmenu", blockBrowserContextMenu);
     startPoll();
     unlisten = await listen("tray-popup-show", async () => {
@@ -342,6 +356,8 @@
     document.removeEventListener("pointermove", onAnyMouseMove, true);
     document.removeEventListener("mouseover", onAnyMouseMove, true);
     document.removeEventListener("mouseleave", onLeaveDocument, true);
+    document.removeEventListener("mouseout", onAnyMouseOut, true);
+    document.removeEventListener("pointerdown", dismissCtxOnOutsidePointer, true);
     document.removeEventListener("contextmenu", blockBrowserContextMenu);
   });
 
@@ -349,6 +365,7 @@
     void prompts;
     void armed;
     void ctxMenu;
+    void playing;
     fitWindow();
   });
 
@@ -370,11 +387,24 @@
   class="root"
   class:opaque={!IS_MAC}
   bind:this={rootEl}
-  onmousemove={updateHoverFromEvent}
-  onmouseover={updateHoverFromEvent}
-  onmouseleave={clearHover}
-  onclick={dismissCtxOnOutsideClick}
 >
+  {#if playing}
+    <!-- Emergency stop — a playback is typing into the foreground app right
+         now. Most prominent row in the popup; aborts via the same kill
+         pipeline as the global kill-switch. -->
+    <button
+      class="row stop"
+      class:hover={hoverKey === "stop"}
+      data-hkey="stop"
+      onclick={stopTyping}
+      title="Abort the in-flight typing playback"
+    >
+      <span class="stop-dot"></span>
+      <span class="label">Stop typing</span>
+    </button>
+    <div class="sep"></div>
+  {/if}
+
   <!-- Header — title + native toggle switch. The toggle alone carries the
        state; no verb in the title (#1 option C). Aria-label preserves the
        semantic meaning for screen readers. -->
@@ -660,6 +690,25 @@
     font-weight: 600;
   }
 
+  /* Emergency "Stop typing" row — red, bold, sits above everything else
+     while a playback is in flight. */
+  .row.stop .label {
+    color: rgba(255, 69, 58, 1);
+    font-weight: 600;
+  }
+  .stop-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: rgba(255, 69, 58, 1);
+    margin-right: 8px;
+    flex-shrink: 0;
+    box-shadow: 0 0 6px rgba(255, 69, 58, 0.6);
+  }
+  .row.stop.hover {
+    background: rgba(255, 69, 58, 0.18);
+  }
+
   /* Warning state for the "Grant Accessibility" banner. macOS-y orange. */
   .row.warn .label {
     color: rgba(255, 159, 10, 1);
@@ -786,8 +835,27 @@
     :global(html), :global(body), :global(#app) {
       color: rgba(0, 0, 0, 0.88);
     }
+    /* Windows opaque fallback must flip with the text: the base rule paints
+       a near-black surface, but this media block flips text to near-black —
+       give the opaque root a light surface (plus a hairline border, since a
+       near-white panel otherwise has no edge against light desktops).
+       macOS stays translucent (.opaque is only applied when !IS_MAC). */
+    .root.opaque {
+      background: rgba(250, 250, 250, 0.98);
+      border: 1px solid rgba(0, 0, 0, 0.12);
+    }
     .row.hover:not(.disabled) {
       background: rgba(0, 0, 0, 0.10);
+    }
+    .row.stop .label {
+      color: rgba(255, 59, 48, 1);
+    }
+    .stop-dot {
+      background: rgba(255, 59, 48, 1);
+      box-shadow: 0 0 6px rgba(255, 59, 48, 0.5);
+    }
+    .row.stop.hover {
+      background: rgba(255, 59, 48, 0.12);
     }
     .trigger, .shortcut {
       color: rgba(0, 0, 0, 0.45);

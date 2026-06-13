@@ -2,13 +2,30 @@
   // §10.2 — live cadence preview using the same statistical model as the
   // backend typer (log-normal mixture + hierarchical pauses).
 
-  let { body, profile = "sales-engineer" }: { body: string; profile?: string } =
-    $props();
+  import { onDestroy } from "svelte";
+  import type { TypingOverrides } from "$lib/ipc";
+
+  let {
+    body,
+    profile = "sales-engineer",
+    overrides = null,
+  }: {
+    body: string;
+    profile?: string;
+    /** Per-prompt typing overrides — folded into `custom` profile params. */
+    overrides?: Partial<TypingOverrides> | null;
+  } = $props();
 
   let preview = $state("");
   let playing = $state(false);
   let phase = $state<"idle" | "pre-typing" | "typing" | "done">("idle");
   let cancelToken = $state(0);
+
+  // Stop the playback loop when the component unmounts — otherwise the
+  // async for-loop keeps mutating state on a dead component.
+  onDestroy(() => {
+    cancelToken++;
+  });
 
   function lognormal(mu: number, sigma: number): number {
     const u1 = Math.random() || 1e-9;
@@ -16,11 +33,21 @@
     const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
     return Math.exp(mu + sigma * z);
   }
-  // Mirror profiles.rs iki_scale values so the JS preview matches the Rust engine.
-  function profileScale(p: string): number {
-    if (p === "fast-presenter") return 0.32;
-    if (p === "thoughtful-ceo") return 0.78;
-    return 0.55;
+  // Mirror profiles.rs so the JS preview matches the Rust engine.
+  function profileParams(p: string): { ikiScale: number; pauseScale: number; varianceScale: number } {
+    if (p === "fast-presenter") return { ikiScale: 0.22, pauseScale: 0.4, varianceScale: 0.4 };
+    if (p === "thoughtful-ceo") return { ikiScale: 0.85, pauseScale: 1.3, varianceScale: 1.5 };
+    const base = { ikiScale: 0.5, pauseScale: 0.9, varianceScale: 1.0 };
+    if (p === "custom" && overrides) {
+      // sampleIki()'s main mode has median ≈ e^4.95 ≈ 140 ms, so scaling by
+      // (requested median / 140) makes the preview's median IKI track the
+      // override the way the Rust engine does.
+      const iki = overrides["iki-median-ms"];
+      if (iki != null && iki > 0) base.ikiScale = iki / 140;
+      const pv = overrides["pause-variance-scale"];
+      if (pv != null && pv > 0) base.varianceScale = pv;
+    }
+    return base;
   }
   function sampleIki(): number {
     const m =
@@ -42,7 +69,7 @@
     playing = true;
     phase = "pre-typing";
     preview = "";
-    const scale = profileScale(profile);
+    const params = profileParams(profile);
 
     // Snappier pre-typing for the preview vs the real engine's 1.5s.
     await sleep(400 + Math.random() * 200);
@@ -52,11 +79,11 @@
     let prev = "";
     for (const c of body) {
       if (myToken !== cancelToken) return;
-      let iki = sampleIki() * scale;
+      let iki = sampleIki() * params.ikiScale;
       // Match distributions.rs: word μ=5.2, sentence μ=6.4, paragraph mean 1500.
-      if (prev === " " && c !== " ") iki += lognormal(5.2, 0.4);
-      if (prev.match(/[.!?]/) && c === " ") iki += lognormal(6.4, 0.5);
-      if (prev === "\n" && c === "\n") iki += 1500;
+      if (prev === " " && c !== " ") iki += params.pauseScale * lognormal(5.2, 0.4 * params.varianceScale);
+      if (prev.match(/[.!?]/) && c === " ") iki += params.pauseScale * lognormal(6.4, 0.5 * params.varianceScale);
+      if (prev === "\n" && c === "\n") iki += params.pauseScale * 1500;
       await sleep(iki);
       if (myToken !== cancelToken) return;
       preview += c;

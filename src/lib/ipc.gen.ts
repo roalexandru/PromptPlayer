@@ -206,6 +206,19 @@ async exportPrompt(promptId: string, destPath: string) : Promise<Result<null, Ip
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Open an `http://` or `https://` URL in the user's default browser.
+ * Rejects any other scheme — keeps the IPC from doubling as a generic
+ * shell-execute primitive.
+ */
+async openExternal(url: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_external", { url }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 

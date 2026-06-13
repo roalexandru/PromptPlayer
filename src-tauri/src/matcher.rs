@@ -125,6 +125,10 @@ impl MatchIndex {
         self.by_canonical.values().map(|v| v.len()).sum()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.by_canonical.values().all(Vec::is_empty)
+    }
+
     fn lookup_all(&self, canonical: &str, commit_char: char) -> Vec<&TriggerEntry> {
         self.by_canonical
             .get(canonical)
@@ -152,6 +156,12 @@ pub struct Match {
     /// Number of chars in the buffer that are part of the trigger
     /// (excluding the commit char itself; that's already separately consumed).
     pub trigger_chars: usize,
+    /// Number of chars to pop from the back of the ring buffer to clear the
+    /// trigger from our shadow of the screen. Spans from the trigger's first
+    /// char to the buffer end, so it also includes any trailing whitespace
+    /// the user typed between the trigger and the commit char (`build >`).
+    /// Always `>= trigger_chars`.
+    pub pop_chars: usize,
     /// Word count consumed.
     pub word_count: usize,
     /// The exact original-case form the user typed for the trigger.
@@ -274,6 +284,11 @@ pub fn match_buffer_all(
             let first_idx = words[k - 1].0;
             let last_idx = words[0].1;
             let trigger_chars = last_idx - first_idx;
+            // Pop count spans from the trigger start to the actual buffer end
+            // (not `last_idx`, which excludes trailing whitespace) so that a
+            // stray space typed before the commit char doesn't survive in the
+            // ring and poison subsequent matches.
+            let pop_chars = entries.len() - first_idx;
             let last_char_age = now.duration_since(entries[last_idx - 1].at);
             if last_char_age > Duration::from_secs(10) {
                 continue;
@@ -290,6 +305,7 @@ pub fn match_buffer_all(
                 .map(|entry| Match {
                     prompt_id: entry.prompt_id.clone(),
                     trigger_chars,
+                    pop_chars,
                     word_count: k,
                     typed_form: typed_form.clone(),
                 })
@@ -335,6 +351,10 @@ pub fn propagate_case(typed_form: &str, body: &str) -> String {
 pub struct MatcherState {
     pub index: RwLock<MatchIndex>,
     pub buffer: RwLock<RingBuffer>,
+    /// Set of every commit char registered across all triggers. The hook
+    /// consults this so per-prompt `commit-char:` overrides (§2.3) enter the
+    /// match path, not just the global commit char. Rebuilt with the index.
+    commit_chars: RwLock<std::collections::HashSet<char>>,
 }
 
 impl MatcherState {
@@ -342,17 +362,53 @@ impl MatcherState {
         Arc::new(Self::default())
     }
 
-    pub fn rebuild_index(&self, entries: Vec<TriggerEntry>) -> Result<(), DuplicateError> {
-        let mut idx = self.index.write();
-        idx.clear();
+    /// Rebuild the trigger index. Duplicate entries (matching prompt_id,
+    /// canonical form, and commit char) are skipped with a warning rather than
+    /// aborting the whole swap — a single colliding entry (e.g. a
+    /// `foo copy.pp.md` duplicate in the library) must not freeze the entire
+    /// index and silently break every other prompt's matching. Returns the
+    /// number of entries that were skipped.
+    pub fn rebuild_index(&self, entries: Vec<TriggerEntry>) -> usize {
+        let mut next = MatchIndex::new();
+        let mut commit_chars = std::collections::HashSet::new();
+        let mut skipped = 0usize;
         for e in entries {
-            idx.insert(e)?;
+            let cc = e.commit_char;
+            match next.insert(e) {
+                Ok(()) => {
+                    commit_chars.insert(cc);
+                }
+                Err(err) => {
+                    tracing::warn!("skipping duplicate trigger: {}", err);
+                    skipped += 1;
+                }
+            }
         }
-        Ok(())
+        *self.index.write() = next;
+        *self.commit_chars.write() = commit_chars;
+        skipped
+    }
+
+    /// True if `c` is a commit char registered by any trigger.
+    pub fn is_commit_char(&self, c: char) -> bool {
+        self.commit_chars.read().contains(&c)
     }
 
     pub fn observe_char(&self, ch: char, at: Instant) {
         self.buffer.write().push(ch, at);
+    }
+
+    /// Observe a word-boundary key (Enter / Tab) that produces no character but
+    /// still separates words. Without this, `<line>\nbuild>` glues the line and
+    /// the trigger into one word and the match silently fails — the single most
+    /// common live-demo flow (type a line, press Enter, type a trigger). We push
+    /// a synthetic space so the matcher's word segmentation sees the boundary.
+    pub fn observe_separator(&self, at: Instant) {
+        let mut buf = self.buffer.write();
+        // Avoid stacking redundant separators (e.g. Enter then Tab).
+        if buf.iter().last().map(|e| e.ch) != Some(' ') {
+            buf.push(' ', at);
+        }
     }
 
     /// User pressed Backspace — drop the last char from the buffer (mimics what
@@ -424,6 +480,81 @@ mod tests {
         let buf = build(now, "intro");
         let all = match_buffer_all(&idx, &buf, '>', now + Duration::from_millis(600));
         assert_eq!(all.len(), 2, "both candidates should match");
+    }
+
+    #[test]
+    fn duplicate_in_rebuild_is_skipped_not_aborted() {
+        // A colliding entry must be dropped while the rest of the rebuild
+        // still takes effect — one bad duplicate can't be allowed to freeze
+        // the whole index (which would silently break every other prompt).
+        let state = MatcherState::default();
+        state.rebuild_index(vec![t("p1", "build", 1)]);
+        let skipped = state.rebuild_index(vec![
+            t("p2", "other", 1),
+            t("p2", "other", 1), // duplicate of the line above
+            t("p3", "third", 1),
+        ]);
+        assert_eq!(skipped, 1, "exactly one duplicate skipped");
+
+        let now = Instant::now();
+        // Old entry is gone (index was swapped).
+        let buf_old = build(now, "build");
+        assert!({
+            let idx = state.index.read();
+            match_buffer(&idx, &buf_old, '>', now + Duration::from_millis(600)).is_none()
+        });
+        // Both unique new entries survive.
+        for (text, id) in [("other", "p2"), ("third", "p3")] {
+            let buf = build(now, text);
+            let m = {
+                let idx = state.index.read();
+                match_buffer(&idx, &buf, '>', now + Duration::from_millis(600))
+            }
+            .unwrap();
+            assert_eq!(m.prompt_id, id);
+        }
+    }
+
+    #[test]
+    fn commit_char_set_tracks_registered_chars() {
+        let state = MatcherState::default();
+        state.rebuild_index(vec![
+            TriggerEntry {
+                canonical: "build".into(),
+                prompt_id: "p1".into(),
+                word_count: 1,
+                commit_char: '>',
+            },
+            TriggerEntry {
+                canonical: "ship".into(),
+                prompt_id: "p2".into(),
+                word_count: 1,
+                commit_char: '»',
+            },
+        ]);
+        assert!(state.is_commit_char('>'));
+        assert!(state.is_commit_char('»'));
+        assert!(!state.is_commit_char(';'));
+    }
+
+    #[test]
+    fn separator_creates_word_boundary() {
+        // Regression: pressing Enter between context and a trigger must not
+        // glue them into one word.
+        let mut idx = MatchIndex::new();
+        idx.insert(t("p1", "build", 1)).unwrap();
+        let now = Instant::now();
+        let mut buf = RingBuffer::default();
+        for (i, c) in "hello".chars().enumerate() {
+            buf.push(c, now + Duration::from_millis(i as u64 * 50));
+        }
+        // Simulate Enter → synthetic separator.
+        buf.push(' ', now + Duration::from_millis(300));
+        for (i, c) in "build".chars().enumerate() {
+            buf.push(c, now + Duration::from_millis(400 + i as u64 * 50));
+        }
+        let m = match_buffer(&idx, &buf, '>', now + Duration::from_millis(700)).unwrap();
+        assert_eq!(m.prompt_id, "p1");
     }
 
     #[test]
@@ -505,7 +636,7 @@ mod tests {
     #[test]
     fn matcher_state_rebuild() {
         let s = MatcherState::shared();
-        s.rebuild_index(vec![t("p1", "build", 1)]).unwrap();
+        s.rebuild_index(vec![t("p1", "build", 1)]);
         let now = Instant::now();
         s.observe_char('B', now);
         s.observe_char('u', now + Duration::from_millis(100));

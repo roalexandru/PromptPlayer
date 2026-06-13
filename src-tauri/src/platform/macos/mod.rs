@@ -4,6 +4,8 @@
 //! `objc2` ecosystem; legacy `cocoa`/`objc` is still permitted for code we
 //! haven't migrated yet.
 
+#![allow(deprecated, unexpected_cfgs)]
+
 pub mod activation;
 pub mod monitor;
 pub mod nsworkspace;

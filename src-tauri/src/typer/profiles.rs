@@ -105,6 +105,7 @@ impl Profile {
 
     /// Apply per-prompt YAML overrides (§7.1 `typing-overrides:` block).
     pub fn with_overrides(mut self, overrides: &TypingOverrides) -> Self {
+        let overrides = overrides.normalized();
         if let Some(median_ms) = overrides.iki_median_ms {
             // Retarget IKI median: scale relative to baseline 140ms.
             self.iki_scale = median_ms / 140.0;
@@ -150,6 +151,27 @@ pub struct TypingOverrides {
     pub send_final_enter: Option<bool>,
 }
 
+impl TypingOverrides {
+    pub fn normalized(&self) -> Self {
+        Self {
+            iki_median_ms: positive_finite(self.iki_median_ms),
+            typo_rate: self
+                .typo_rate
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(0.0, 1.0)),
+            pause_variance_scale: positive_finite(self.pause_variance_scale),
+            burst_enabled: self.burst_enabled,
+            typos_enabled: self.typos_enabled,
+            pre_submit_pause_enabled: self.pre_submit_pause_enabled,
+            send_final_enter: self.send_final_enter,
+        }
+    }
+}
+
+fn positive_finite(v: Option<f64>) -> Option<f64> {
+    v.filter(|v| v.is_finite() && *v > 0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +192,21 @@ mod tests {
         });
         assert_eq!(p.kind, ProfileKind::Custom);
         assert!((p.iki_scale - 80.0 / 140.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn numeric_overrides_are_normalized_before_use() {
+        let p = Profile::SALES_ENGINEER.with_overrides(&TypingOverrides {
+            iki_median_ms: Some(f64::NAN),
+            typo_rate: Some(2.5),
+            pause_variance_scale: Some(0.0),
+            ..Default::default()
+        });
+        assert_eq!(p.iki_scale, Profile::SALES_ENGINEER.iki_scale);
+        assert_eq!(p.typo_rate, 1.0);
+        assert_eq!(
+            p.pause_variance_scale,
+            Profile::SALES_ENGINEER.pause_variance_scale
+        );
     }
 }

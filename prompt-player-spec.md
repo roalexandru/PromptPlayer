@@ -224,7 +224,7 @@ Floating window, clipboard-history-style. For non-stealth use, rehearsal, and de
 
 ### 5.1 Invocation
 
-- Default hotkey: `Cmd/Ctrl+Shift+V` (mirrors clipboard-history convention).
+- Default hotkey: `Cmd+Alt+\` on macOS / `Ctrl+Alt+\` on Windows.
 - Works regardless of armed state.
 - Captures foreground window handle on open.
 
@@ -378,7 +378,7 @@ $0
 profile-default: sales-engineer
 commit-char-default: ">"
 hotkey-arm: cmd+shift+p
-hotkey-picker: cmd+shift+v
+hotkey-picker: alt+cmd+\
 hotkey-kill: cmd+shift+escape
 
 prompts:
