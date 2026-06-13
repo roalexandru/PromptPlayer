@@ -42,7 +42,11 @@ pub enum ExprError {
     Timeout(Duration),
 }
 
-const EVAL_BUDGET: Duration = Duration::from_millis(100);
+// Wall-clock ceiling for *script evaluation* (started after the QuickJS
+// runtime is built — see `eval`). Real expressions finish in single-digit ms;
+// the headroom is purely to absorb CPU contention on slow CI runners and
+// still kill genuine runaway scripts.
+const EVAL_BUDGET: Duration = Duration::from_millis(250);
 const MEMORY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const STACK_LIMIT_BYTES: usize = 256 * 1024;
 
@@ -60,11 +64,9 @@ struct Builtins {
 
 /// Evaluate one `${{ expr }}` block. The braces should already be stripped.
 pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
-    let deadline = Instant::now() + EVAL_BUDGET;
     let runtime = Runtime::new().map_err(|e| ExprError::Runtime(e.to_string()))?;
     runtime.set_memory_limit(MEMORY_LIMIT_BYTES);
     runtime.set_max_stack_size(STACK_LIMIT_BYTES);
-    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
 
     let context = Context::full(&runtime).map_err(|e| ExprError::Runtime(e.to_string()))?;
 
@@ -136,6 +138,12 @@ pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
     "#
     );
 
+    // Start the eval clock only now — AFTER constructing the QuickJS runtime
+    // and context. Including engine cold-start in EVAL_BUDGET made the first
+    // eval spuriously time out on slow/contended CI runners (setup alone could
+    // exceed the budget), failing whichever expression test lost the CPU race.
+    let deadline = Instant::now() + EVAL_BUDGET;
+    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
     let started = Instant::now();
     context.with(|js| {
         js.eval::<(), _>(prelude)
