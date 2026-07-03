@@ -22,6 +22,7 @@ pub mod filters;
 pub mod hotkey;
 pub mod matcher;
 pub mod platform;
+pub mod power;
 pub mod prompts;
 pub mod rdp;
 pub mod scopes;

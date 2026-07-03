@@ -17,6 +17,9 @@
   // when permission flips on, so the banner disappears automatically — we
   // re-poll on every popover show to pick that up without a heavier event bus.
   let hookAlive = $state(true);
+  // Keep-awake: when on, the OS won't dim/screensaver/sleep. In-memory only
+  // (resets each launch, like `armed`). Re-polled on every popover show.
+  let keepAwake = $state(false);
   let unlisten: UnlistenFn | null = null;
   let unlistenUpdate: UnlistenFn | null = null;
   let rootEl = $state<HTMLDivElement | null>(null);
@@ -71,6 +74,11 @@
       // report than spam the user with a false-positive permission banner.
       hookAlive = true;
     }
+    try {
+      keepAwake = await ipc.getKeepAwake();
+    } catch {
+      keepAwake = false;
+    }
   }
 
   async function fixAccessibility() {
@@ -84,6 +92,19 @@
 
   async function toggleArmed() {
     armed = await ipc.toggleArmed();
+  }
+
+  // Keep-awake toggle. Optimistic flip so the checkmark responds instantly;
+  // reconcile with the backend's authoritative return (rolls back on error).
+  async function toggleKeepAwake() {
+    const optimistic = !keepAwake;
+    keepAwake = optimistic;
+    try {
+      keepAwake = await ipc.toggleKeepAwake();
+    } catch (e) {
+      console.error("toggle keep-awake failed", e);
+      keepAwake = !optimistic;
+    }
   }
 
   // Left-click on a pinned prompt FIRES it (Apple Shortcuts behavior). The
@@ -493,6 +514,21 @@
     <span class="label">Command Palette…</span>
     <span class="shortcut">{primaryShortcut}</span>
   </button>
+  <!-- Keep Awake — checkmark reflects state (macOS menu idiom), matching the
+       Windows native menu's MF_CHECKED. Prevents display sleep / screensaver /
+       idle system sleep while on. -->
+  <button
+    class="row plain"
+    class:hover={hoverKey === "keepawake"}
+    data-hkey="keepawake"
+    role="menuitemcheckbox"
+    aria-checked={keepAwake}
+    onclick={toggleKeepAwake}
+    title="Prevent the screen from sleeping or the screensaver from starting"
+  >
+    <span class="label">Keep Awake</span>
+    {#if keepAwake}<span class="check">✓</span>{/if}
+  </button>
 
   <div class="sep"></div>
 
@@ -755,6 +791,16 @@
   }
   .row.plain.hover .shortcut {
     color: rgba(255, 255, 255, 0.7);
+  }
+
+  /* Checkmark for the Keep Awake toggle — right-aligned, brighter than the
+     shortcut hint so the "on" state reads at a glance. */
+  .check {
+    font-size: 12px;
+    color: rgba(48, 209, 88, 1);
+    flex-shrink: 0;
+    margin-left: 8px;
+    font-weight: 700;
   }
 
   .sep {

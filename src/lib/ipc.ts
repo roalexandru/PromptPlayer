@@ -32,6 +32,9 @@ export const ipc = {
   isPlaying: () => commands.isPlaying(),
   isHookAlive: () => commands.isHookAlive(),
   openAccessibilitySettings: () => commands.openAccessibilitySettings(),
+  // keep-awake (prevent display/screensaver/idle-sleep)
+  getKeepAwake: () => commands.getKeepAwake(),
+  toggleKeepAwake: () => commands.toggleKeepAwake(),
   // prompts
   listPrompts: () => commands.listPrompts(),
   libraryRoot: () => unwrap(commands.libraryRoot()),

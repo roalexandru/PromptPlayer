@@ -8,6 +8,7 @@
 
 use crate::matcher::MatcherState;
 use crate::picker::{FocusStore, SearchIndex};
+use crate::power::PowerManager;
 use crate::rdp::RdpRegistry;
 use crate::state::AppState;
 use crate::store::PromptStore;
@@ -29,6 +30,8 @@ pub struct AppContext {
     pub search: Arc<Mutex<SearchIndex>>,
     pub rdp: Arc<RdpRegistry>,
     pub hotkeys: PromptHotkeyMap,
+    /// "Keep Awake" controller — inhibits display/screensaver/idle-sleep.
+    pub power: Arc<PowerManager>,
 }
 
 impl AppContext {
@@ -42,6 +45,7 @@ impl AppContext {
             search: Arc::new(Mutex::new(SearchIndex::new())),
             rdp: Arc::new(RdpRegistry::new()),
             hotkeys: Arc::new(RwLock::new(HashMap::new())),
+            power: PowerManager::shared(),
         }
     }
 }
