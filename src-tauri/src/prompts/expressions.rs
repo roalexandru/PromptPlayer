@@ -1,4 +1,4 @@
-//! §6.3 — TypeScript expressions via `boa_engine`.
+//! §6.3 — TypeScript expressions via QuickJS.
 //!
 //! Syntax: `${{ expr }}` — double-brace to disambiguate from VS Code single-brace
 //! placeholders.
@@ -6,18 +6,18 @@
 //! Sandbox guarantees per §6.3:
 //!  - No filesystem (helpers `git()` / `shell()` exist but are off by default).
 //!  - No network (host objects not exposed).
-//!  - 100 ms execution timeout.
-//!  - 10 MB memory cap (best-effort — boa doesn't yet expose this, tracked as a TODO).
+//!  - 100 ms execution timeout via QuickJS interrupt handler.
+//!  - 10 MB runtime memory cap and 256 KB stack cap.
 //!  - Frozen built-ins: `now`, `today`, `clipboard`, `selection`, `app`, `env`,
 //!    `random`, `random_choice([...])`, `format_date(d, fmt)`, `ago(d)`.
 //!
 //! Lazy evaluation is honored at the call site (Phase 8 stub here): expressions
 //! are evaluated only when their slot is reached during typing.
 
-use boa_engine::{Context, JsValue, Source};
 use chrono::Local;
+use rquickjs::{Context, Ctx, Error as QuickJsError, Runtime};
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Per-call evaluation context.
 #[derive(Debug, Clone, Default)]
@@ -42,66 +42,73 @@ pub enum ExprError {
     Timeout(Duration),
 }
 
+// Wall-clock ceiling for *script evaluation* (started after the QuickJS
+// runtime is built — see `eval`). Real expressions finish in single-digit ms;
+// the headroom is purely to absorb CPU contention on slow CI runners and
+// still kill genuine runaway scripts.
+const EVAL_BUDGET: Duration = Duration::from_millis(250);
+const MEMORY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+const STACK_LIMIT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Builtins {
+    now_iso: String,
+    today: String,
+    clipboard: String,
+    selection: String,
+    app_name: String,
+    app_bundle: String,
+    window_title: String,
+}
+
 /// Evaluate one `${{ expr }}` block. The braces should already be stripped.
 pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
-    let mut context = Context::default();
+    let runtime = Runtime::new().map_err(|e| ExprError::Runtime(e.to_string()))?;
+    runtime.set_memory_limit(MEMORY_LIMIT_BYTES);
+    runtime.set_max_stack_size(STACK_LIMIT_BYTES);
 
-    // Inject built-ins as JS globals via property registration.
+    let context = Context::full(&runtime).map_err(|e| ExprError::Runtime(e.to_string()))?;
+
     let now = Local::now();
-    inject_global(&mut context, "__now_iso__", &now.to_rfc3339());
-    inject_global(
-        &mut context,
-        "__today__",
-        &now.format("%Y-%m-%d").to_string(),
-    );
-    inject_global(
-        &mut context,
-        "__clipboard__",
-        ctx.clipboard.as_deref().unwrap_or(""),
-    );
-    inject_global(
-        &mut context,
-        "__selection__",
-        ctx.selection.as_deref().unwrap_or(""),
-    );
-    inject_global(
-        &mut context,
-        "__app_name__",
-        ctx.app_name.as_deref().unwrap_or(""),
-    );
-    inject_global(
-        &mut context,
-        "__app_bundle__",
-        ctx.app_bundle.as_deref().unwrap_or(""),
-    );
-    inject_global(
-        &mut context,
-        "__window_title__",
-        ctx.window_title.as_deref().unwrap_or(""),
-    );
+    let builtins = Builtins {
+        now_iso: now.to_rfc3339(),
+        today: now.format("%Y-%m-%d").to_string(),
+        clipboard: ctx.clipboard.clone().unwrap_or_default(),
+        selection: ctx.selection.clone().unwrap_or_default(),
+        app_name: ctx.app_name.clone().unwrap_or_default(),
+        app_bundle: ctx.app_bundle.clone().unwrap_or_default(),
+        window_title: ctx.window_title.clone().unwrap_or_default(),
+    };
+    let builtins_json =
+        serde_json::to_string(&builtins).map_err(|e| ExprError::Runtime(e.to_string()))?;
+    let source_json =
+        serde_json::to_string(source).map_err(|e| ExprError::Runtime(e.to_string()))?;
 
     // Compose a small prelude that exposes the documented surface.
     // We deliberately freeze names to avoid scripts shadowing them.
-    let prelude = r#"
-        const now = {
-            toISOString: () => __now_iso__,
-            valueOf: () => Date.parse(__now_iso__),
-        };
-        const today = __today__;
-        const clipboard = __clipboard__;
-        const selection = __selection__;
-        const app = {
-            name: __app_name__,
-            bundle: __app_bundle__,
-            windowTitle: __window_title__,
-        };
+    let prelude = format!(
+        r#"
+        const __pp = {builtins_json};
+        const now = {{
+            toISOString: () => __pp.nowIso,
+            valueOf: () => Date.parse(__pp.nowIso),
+        }};
+        const today = __pp.today;
+        const clipboard = __pp.clipboard;
+        const selection = __pp.selection;
+        const app = {{
+            name: __pp.appName,
+            bundle: __pp.appBundle,
+            windowTitle: __pp.windowTitle,
+        }};
         const env = (k) => "";
         const random = () => Math.random();
-        function random_choice(arr) {
+        function random_choice(arr) {{
             if (!Array.isArray(arr) || arr.length === 0) return "";
             return arr[Math.floor(Math.random() * arr.length)];
-        }
-        function format_date(d, fmt) {
+        }}
+        function format_date(d, fmt) {{
             // Minimal: only respects %Y, %m, %d, %H, %M, %S.
             const dt = (d && d.toISOString) ? new Date(d.valueOf()) : new Date(d);
             const pad = (n) => String(n).padStart(2, "0");
@@ -112,50 +119,93 @@ pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
                 .replace("%H", pad(dt.getHours()))
                 .replace("%M", pad(dt.getMinutes()))
                 .replace("%S", pad(dt.getSeconds()));
-        }
-        function ago(d) {
+        }}
+        function ago(d) {{
             const dt = (d && d.toISOString) ? new Date(d.valueOf()) : new Date(d);
             const sec = Math.floor((Date.now() - dt.getTime()) / 1000);
             if (sec < 60) return sec + "s ago";
             if (sec < 3600) return Math.floor(sec/60) + "m ago";
             if (sec < 86400) return Math.floor(sec/3600) + "h ago";
             return Math.floor(sec/86400) + "d ago";
-        }
+        }}
         Object.freeze(app);
-    "#;
-    context
-        .eval(Source::from_bytes(prelude))
-        .map_err(|e| ExprError::Runtime(format!("{}", e)))?;
+    "#
+    );
+    let eval_script = format!(
+        r#"
+        const __pp_result = (0, eval)({source_json});
+        (__pp_result === undefined || __pp_result === null) ? "" : String(__pp_result);
+    "#
+    );
 
-    // Evaluate the user expression with a 100 ms host-side budget.
-    // boa_engine 0.19 doesn't expose a portable interrupt; we run on this thread
-    // and post-check elapsed time. For untrusted code this is a soft guarantee.
-    let start = std::time::Instant::now();
-    let result = context
-        .eval(Source::from_bytes(source))
-        .map_err(|e| ExprError::Syntax(format!("{}", e)))?;
-    if start.elapsed() > Duration::from_millis(100) {
-        return Err(ExprError::Timeout(Duration::from_millis(100)));
-    }
-
-    Ok(stringify(&result, &mut context))
+    // Start the eval clock only now — AFTER constructing the QuickJS runtime
+    // and context. Including engine cold-start in EVAL_BUDGET made the first
+    // eval spuriously time out on slow/contended CI runners (setup alone could
+    // exceed the budget), failing whichever expression test lost the CPU race.
+    let deadline = Instant::now() + EVAL_BUDGET;
+    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    let started = Instant::now();
+    context.with(|js| {
+        js.eval::<(), _>(prelude)
+            .map_err(|e| map_quickjs_error(&js, e, started, deadline))?;
+        js.eval::<String, _>(eval_script)
+            .map_err(|e| map_quickjs_error(&js, e, started, deadline))
+    })
 }
 
-fn stringify(v: &JsValue, ctx: &mut Context) -> String {
-    if v.is_undefined() || v.is_null() {
-        return String::new();
+fn map_quickjs_error(
+    js: &Ctx<'_>,
+    err: QuickJsError,
+    started: Instant,
+    deadline: Instant,
+) -> ExprError {
+    if started.elapsed() >= EVAL_BUDGET || Instant::now() >= deadline {
+        return ExprError::Timeout(EVAL_BUDGET);
     }
-    match v.to_string(ctx) {
-        Ok(s) => s.to_std_string().unwrap_or_default(),
-        Err(_) => String::new(),
+    let raw = match err {
+        QuickJsError::Exception => exception_message(js),
+        other => other.to_string(),
+    };
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("out of memory") || lower.contains("memory allocation") {
+        ExprError::Runtime(raw)
+    } else {
+        ExprError::Syntax(raw)
     }
 }
 
-fn inject_global(ctx: &mut Context, name: &str, value: &str) {
-    use boa_engine::property::Attribute;
-    use boa_engine::JsString;
-    let js = JsString::from(value);
-    let _ = ctx.register_global_property(JsString::from(name), js, Attribute::READONLY);
+fn exception_message(js: &Ctx<'_>) -> String {
+    let caught = js.catch();
+    if caught.is_undefined() || caught.is_null() {
+        return "JavaScript exception".into();
+    }
+    if let Some(s) = caught.as_string() {
+        return s
+            .to_string()
+            .unwrap_or_else(|_| "JavaScript exception".into());
+    }
+    if let Some(i) = caught.as_int() {
+        return i.to_string();
+    }
+    if let Some(f) = caught.as_float() {
+        return f.to_string();
+    }
+    if let Some(b) = caught.as_bool() {
+        return b.to_string();
+    }
+    if let Some(obj) = caught.as_object() {
+        if let Ok(message) = obj.get::<_, String>("message") {
+            if !message.is_empty() {
+                return message;
+            }
+        }
+        if let Ok(name) = obj.get::<_, String>("name") {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    "JavaScript exception".into()
 }
 
 /// Parse `body` and replace every `${{ … }}` block with the evaluated string.
@@ -227,8 +277,10 @@ mod tests {
 
     #[test]
     fn clipboard_var() {
-        let mut ctx = ExprContext::default();
-        ctx.clipboard = Some("hello".into());
+        let ctx = ExprContext {
+            clipboard: Some("hello".into()),
+            ..Default::default()
+        };
         let s = eval("clipboard + ' world'", &ctx).unwrap();
         assert_eq!(s, "hello world");
     }
@@ -252,5 +304,17 @@ mod tests {
         let body = "ok: ${{ 1 + }}";
         let out = expand_expressions(body, &ExprContext::default());
         assert!(out.starts_with("ok: [expr error:"));
+    }
+
+    #[test]
+    fn runaway_loop_is_interrupted() {
+        let err = eval("while (true) {}", &ExprContext::default()).unwrap_err();
+        assert!(matches!(err, ExprError::Timeout(_)), "{err}");
+    }
+
+    #[test]
+    fn memory_hog_is_rejected() {
+        let err = eval("new ArrayBuffer(20 * 1024 * 1024)", &ExprContext::default()).unwrap_err();
+        assert!(matches!(err, ExprError::Runtime(_)), "{err}");
     }
 }

@@ -78,7 +78,9 @@ fn generate_handler_list_matches_command_names() {
 #[test]
 fn manage_state_helper_matches_inline_block_in_run() {
     fn extract_manage_chain(src: &str, marker: &str) -> Vec<String> {
-        let chunk_start = src.find(marker).expect(&format!("missing marker {marker}"));
+        let chunk_start = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing marker {marker}"));
         let chunk_end = (chunk_start + 1500).min(src.len());
         let chunk = &src[chunk_start..chunk_end];
         let mut managed = Vec::new();
@@ -170,10 +172,9 @@ fn collect_commands_list_matches_command_names() {
 // `lint-ipc.sh` script ensures the frontend can never call them with stale
 // command-name strings.
 
-use std::sync::Arc;
 use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 /// Build a `tauri::test::App<MockRuntime>` with all production-equivalent
 /// state managed and the no-AppHandle commands registered.
@@ -219,14 +220,16 @@ fn mock_app_with_state(prompts_dir: &std::path::Path) -> tauri::App<tauri::test:
     manage_state(mock_builder(), ctx)
         .invoke_handler(tauri::generate_handler![
             // No-AppHandle subset of the production registry. Every
-            // managed-state type is touched by at least one command here.
+            // managed-state type is touched by at least one command here:
+            // `get_armed` → Arc<AppState>, `list_prompts` → PromptStore,
+            // `picker_search` → AppContext. The CRUD commands
+            // (save/create/delete/set_enabled/set_pinned) now also take an
+            // AppHandle (to reindex the matcher after a mutation), so they
+            // join the AppHandle group and can't be registered against
+            // MockRuntime — same as the armed/picker AppHandle commands.
             prompt_player::commands::armed::get_armed,
             prompt_player::commands::prompts::list_prompts,
             prompt_player::commands::prompts::library_root,
-            prompt_player::commands::prompts::save_prompt,
-            prompt_player::commands::prompts::create_prompt,
-            prompt_player::commands::prompts::delete_prompt,
-            prompt_player::commands::prompts::set_prompt_enabled,
             prompt_player::commands::picker::picker_search,
         ])
         .build(mock_context(noop_assets()))
@@ -274,41 +277,8 @@ fn smoke_test_no_apphandle_commands_resolve_with_managed_state() {
         ("list_prompts", serde_json::json!({})),
         ("library_root", serde_json::json!({})),
         (
-            "set_prompt_enabled",
-            serde_json::json!({ "promptId": "smoke-test", "enabled": false }),
-        ),
-        (
-            "delete_prompt",
-            serde_json::json!({ "promptId": "smoke-test-nonexistent" }),
-        ),
-        (
-            "create_prompt",
-            serde_json::json!({ "name": "Smoke created" }),
-        ),
-        (
             "picker_search",
             serde_json::json!({ "q": "smoke", "limit": 5 }),
-        ),
-        (
-            "save_prompt",
-            serde_json::json!({
-                "prompt": {
-                    "id": "smoke-roundtrip",
-                    "name": "Smoke roundtrip",
-                    "description": "",
-                    "triggers": ["smoke"],
-                    "commit_char": ">",
-                    "priority": 0,
-                    "typing_profile": "sales-engineer",
-                    "typing_overrides": {},
-                    "scope": null,
-                    "filters": [],
-                    "hotkey": null,
-                    "tags": [],
-                    "enabled": true,
-                    "body": "smoke"
-                }
-            }),
         ),
     ];
 

@@ -14,8 +14,8 @@
 //!    `NSApp.activate(ignoringOtherApps:)` — that's what was switching
 //!    Spaces on every previous attempt. With `.accessory` activation policy
 //!    + the space-neutral library window (see `make_window_space_neutral`),
-//!    activation does not switch Spaces, so we activate the app for the
-//!    picker (it needs key/focus) but not for the popover.
+//!      activation does not switch Spaces, so we activate the app for the
+//!      picker (it needs key/focus) but not for the popover.
 
 use cocoa::base::id;
 use objc::runtime::Class;

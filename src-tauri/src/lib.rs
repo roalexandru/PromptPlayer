@@ -2,6 +2,11 @@
 //!
 //! Re-exports for tests and the `typing-engine-cli` binary.
 
+// Legacy `objc` macros emit `cargo-clippy` cfg probes that Rust's check-cfg
+// sees at our call sites. Keep validation output focused until those small
+// macOS shims finish moving to `objc2`.
+#![allow(unexpected_cfgs)]
+
 pub mod typer;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]

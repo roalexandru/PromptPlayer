@@ -11,6 +11,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -95,13 +96,11 @@ fn load_or_init_secret(path: &PathBuf) -> Result<String> {
             return Ok(s);
         }
     }
-    // Generate a fresh secret and persist.
-    let secret: String = (0..32)
-        .map(|_| {
-            let n: u8 = rand_u8();
-            format!("{:02x}", n)
-        })
-        .collect();
+    // Generate a fresh secret from OS entropy and persist. Failure is fatal:
+    // an all-zero or predictable auth secret would expose the local typing port.
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).context("OS randomness unavailable")?;
+    let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(path, &secret).context("write secret")?;
     #[cfg(windows)]
     {
@@ -123,38 +122,13 @@ fn whoami_user() -> String {
     std::env::var("USERNAME").unwrap_or_else(|_| "User".into())
 }
 
-fn rand_u8() -> u8 {
-    // Avoid pulling in `rand` here to keep the helper tiny; use a system source.
-    let mut buf = [0u8; 1];
-    let _ = read_random(&mut buf);
-    buf[0]
-}
-
-#[cfg(windows)]
-fn read_random(buf: &mut [u8]) -> Result<()> {
-    use std::io::Read;
-    let mut f = std::fs::File::open("\\\\.\\?\\BCRYPT_RNG")
-        .or_else(|_| std::fs::File::open("CONOUT$"))
-        .context("rng open")?;
-    f.read_exact(buf).context("rng read")?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn read_random(buf: &mut [u8]) -> Result<()> {
-    use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom")?;
-    f.read_exact(buf)?;
-    Ok(())
-}
-
 async fn handle(stream: TcpStream, expected_secret: &str) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut line = String::new();
     reader.read_line(&mut line).await.context("read message")?;
     let msg: ClientMessage = serde_json::from_str(&line).context("parse json")?;
-    if msg.secret != expected_secret {
+    if !secrets_match(&msg.secret, expected_secret) {
         let reply = ServerReply {
             ok: false,
             error: Some("auth".into()),
@@ -173,6 +147,10 @@ async fn handle(stream: TcpStream, expected_secret: &str) -> Result<()> {
     Ok(())
 }
 
+fn secrets_match(actual: &str, expected: &str) -> bool {
+    actual.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
 #[cfg(target_os = "windows")]
 async fn play_schedule(schedule: Vec<ScheduledKeyWire>) -> Result<()> {
     use enigo::{Direction, Enigo, Key as EKey, Keyboard, Settings};
@@ -186,7 +164,7 @@ async fn play_schedule(schedule: Vec<ScheduledKeyWire>) -> Result<()> {
         }
         match sk.key {
             KeyWire::Char(c) => {
-                let _ = enigo.text(&c.to_string());
+                type_char_unicode(c);
             }
             KeyWire::Backspace => {
                 let _ = enigo.key(EKey::Backspace, Direction::Click);
@@ -199,8 +177,59 @@ async fn play_schedule(schedule: Vec<ScheduledKeyWire>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn type_char_unicode(c: char) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        KEYEVENTF_UNICODE, VIRTUAL_KEY,
+    };
+
+    let mut buf = [0u16; 2];
+    for &unit in c.encode_utf16(&mut buf).iter() {
+        let down = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: unit,
+                    dwFlags: KEYEVENTF_UNICODE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let up = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: unit,
+                    dwFlags: KEYBD_EVENT_FLAGS(KEYEVENTF_UNICODE.0 | KEYEVENTF_KEYUP.0),
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        unsafe {
+            SendInput(&[down, up], std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 async fn play_schedule(_schedule: Vec<ScheduledKeyWire>) -> Result<()> {
     // Non-Windows builds (CI cross-builds) accept the message but no-op the typing.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_comparison_requires_exact_match() {
+        assert!(secrets_match("abc123", "abc123"));
+        assert!(!secrets_match("abc124", "abc123"));
+        assert!(!secrets_match("abc123", "abc12300"));
+    }
 }

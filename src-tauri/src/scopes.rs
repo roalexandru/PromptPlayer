@@ -38,6 +38,38 @@ pub fn capture_foreground_context() -> ForegroundContext {
     }
 }
 
+/// A cheap, stable identifier for the current foreground app, used to detect
+/// focus changes mid-playback (mac: frontmost app pid; win: foreground HWND).
+/// Returns `None` when it can't be determined — callers treat that as "don't
+/// abort" so a transient read failure never cuts off a legitimate playback.
+///
+/// Note: our own injected keystrokes don't change the foreground (we're an
+/// accessory app on macOS; `SendInput` doesn't activate on Windows), so the
+/// target's identity is stable throughout a normal playback — a change means
+/// real focus loss (a click, Alt/Cmd-Tab, a notification stealing focus).
+pub fn foreground_identity() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::macos::nsworkspace::frontmost_app()
+            .pid
+            .map(|p| p as u64)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            None
+        } else {
+            Some(hwnd.0 as u64)
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn capture_macos() -> ForegroundContext {
     let snap = crate::platform::macos::nsworkspace::frontmost_app();
@@ -51,6 +83,7 @@ fn capture_macos() -> ForegroundContext {
 
 #[cfg(target_os = "windows")]
 fn capture_windows() -> ForegroundContext {
+    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
         PROCESS_QUERY_LIMITED_INFORMATION,
@@ -83,6 +116,7 @@ fn capture_windows() -> ForegroundContext {
                 let pwstr = windows::core::PWSTR(buf.as_mut_ptr());
                 let ok =
                     QueryFullProcessImageNameW(h, PROCESS_NAME_FORMAT::default(), pwstr, &mut sz);
+                let _ = CloseHandle(h);
                 if ok.is_ok() && sz > 0 {
                     Some(String::from_utf16_lossy(&buf[..sz as usize]))
                 } else {
@@ -169,7 +203,32 @@ impl ScopeFilter {
                 Err(_) => return false,
             }
         }
+        if let Some(spec) = &self.time_of_day {
+            let now = chrono::Local::now();
+            let minutes = now.hour() * 60 + now.minute();
+            if !matches_time_of_day(spec, minutes) {
+                return false;
+            }
+        }
         true
+    }
+
+    #[cfg(test)]
+    fn matches_at_minute(&self, ctx: &ForegroundContext, minutes: u32) -> bool {
+        if !self.matches_without_time(ctx) {
+            return false;
+        }
+        self.time_of_day
+            .as_deref()
+            .map(|spec| matches_time_of_day(spec, minutes))
+            .unwrap_or(true)
+    }
+
+    #[cfg(test)]
+    fn matches_without_time(&self, ctx: &ForegroundContext) -> bool {
+        let mut clone = self.clone();
+        clone.time_of_day = None;
+        clone.matches(ctx)
     }
 
     /// Specificity — number of constraints. Higher = more specific.
@@ -184,10 +243,44 @@ impl ScopeFilter {
         if self.url_regex.is_some() {
             s += 1;
         }
-        if self.time_of_day.is_some() {
+        if self
+            .time_of_day
+            .as_deref()
+            .and_then(parse_time_range)
+            .is_some()
+        {
             s += 1;
         }
         s
+    }
+}
+
+use chrono::Timelike;
+
+fn parse_time_range(spec: &str) -> Option<(u32, u32)> {
+    let (start, end) = spec.split_once('-')?;
+    Some((parse_hhmm(start.trim())?, parse_hhmm(end.trim())?))
+}
+
+fn parse_hhmm(s: &str) -> Option<u32> {
+    let (hh, mm) = s.split_once(':')?;
+    let hour: u32 = hh.parse().ok()?;
+    let minute: u32 = mm.parse().ok()?;
+    if hour < 24 && minute < 60 {
+        Some(hour * 60 + minute)
+    } else {
+        None
+    }
+}
+
+fn matches_time_of_day(spec: &str, minute: u32) -> bool {
+    let Some((start, end)) = parse_time_range(spec) else {
+        return false;
+    };
+    if start <= end {
+        (start..=end).contains(&minute)
+    } else {
+        minute >= start || minute <= end
     }
 }
 
@@ -236,5 +329,34 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s.specificity(), 2);
+    }
+
+    #[test]
+    fn time_of_day_matches_regular_and_midnight_ranges() {
+        let ctx = ForegroundContext::default();
+        let day = ScopeFilter {
+            time_of_day: Some("09:00-17:30".into()),
+            ..Default::default()
+        };
+        assert!(day.matches_at_minute(&ctx, 10 * 60));
+        assert!(!day.matches_at_minute(&ctx, 18 * 60));
+
+        let overnight = ScopeFilter {
+            time_of_day: Some("22:00-02:00".into()),
+            ..Default::default()
+        };
+        assert!(overnight.matches_at_minute(&ctx, 23 * 60));
+        assert!(overnight.matches_at_minute(&ctx, 60));
+        assert!(!overnight.matches_at_minute(&ctx, 12 * 60));
+    }
+
+    #[test]
+    fn invalid_time_of_day_does_not_match_or_count_specificity() {
+        let s = ScopeFilter {
+            time_of_day: Some("25:99-nope".into()),
+            ..Default::default()
+        };
+        assert!(!s.matches_at_minute(&ForegroundContext::default(), 10 * 60));
+        assert_eq!(s.specificity(), 0);
     }
 }

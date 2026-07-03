@@ -146,6 +146,9 @@ pub enum CancelReason {
     Esc,
     Error,
     Kill,
+    /// Foreground app changed mid-playback (click / Alt-Tab / notification).
+    /// We abort so the remainder isn't typed into the wrong window.
+    FocusChanged,
 }
 
 #[derive(Debug, Clone, Serialize)]

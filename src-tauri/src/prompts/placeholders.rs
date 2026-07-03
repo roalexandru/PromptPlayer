@@ -519,8 +519,10 @@ mod tests {
 
     #[test]
     fn pascal_case_transform_on_selection() {
-        let mut ctx = PlaceholderContext::default();
-        ctx.selection = Some("user-profile".into());
+        let ctx = PlaceholderContext {
+            selection: Some("user-profile".into()),
+            ..Default::default()
+        };
         let e = expand("${SELECTION/(.*)/${1:/pascalcase}/g}", &ctx);
         assert_eq!(e.text, "UserProfile");
     }
@@ -549,8 +551,10 @@ mod tests {
     #[test]
     fn nested_braces_are_handled() {
         // ${1/regex/${1:/upcase}/g} contains a nested ${1:/upcase}
-        let mut ctx = PlaceholderContext::default();
-        ctx.selection = Some("hello".into());
+        let ctx = PlaceholderContext {
+            selection: Some("hello".into()),
+            ..Default::default()
+        };
         let e = expand("${SELECTION/(.*)/${1:/upcase}/g}", &ctx);
         assert_eq!(e.text, "HELLO");
     }

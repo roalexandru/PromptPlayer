@@ -79,7 +79,7 @@ impl RdpRegistry {
             .as_deref()
             .map(|s| {
                 // Cross-platform basename: take after the last `/` or `\`.
-                s.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(s)
+                s.rsplit(['/', '\\']).next().unwrap_or(s)
             })
             .unwrap_or("");
         for needle in ids.iter() {

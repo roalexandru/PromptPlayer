@@ -163,6 +163,8 @@ pub fn expand_prompt_text(text: String) -> String {
 pub fn import_prompt(
     source_path: String,
     store: tauri::State<'_, PromptStore>,
+    ctx: tauri::State<'_, crate::app::context::AppContext>,
+    app: tauri::AppHandle,
 ) -> IpcResult<Prompt> {
     let src = std::path::PathBuf::from(&source_path);
     let raw = match std::fs::read_to_string(&src) {
@@ -204,7 +206,11 @@ pub fn import_prompt(
         source_path: Some(dest.clone()),
         ..parsed
     };
-    into_ipc(store.save(&prompt).map(|_| prompt))
+    let result = store.save(&prompt);
+    if result.is_ok() {
+        crate::app::setup::reindex_after_mutation(&app, &ctx);
+    }
+    into_ipc(result.map(|_| prompt))
 }
 
 /// Export a prompt to a user-chosen path. Re-serializes the in-memory

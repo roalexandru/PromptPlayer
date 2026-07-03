@@ -3,9 +3,9 @@
 //! Three commands surface to the frontend:
 //!  - `updater_current_version`: synchronous — current binary version.
 //!  - `updater_check`: hits the GitHub Releases endpoint, returns
-//!     `UpdateInfo { available, version?, notes? }`.
+//!    `UpdateInfo { available, version?, notes? }`.
 //!  - `updater_install`: downloads the update, installs it, and restarts
-//!     the app. Blocks until the restart begins.
+//!    the app. Blocks until the restart begins.
 //!
 //! Telemetry: every successful check fires `update_check`; a successful
 //! install fires `update_applied` before the process exits. No prompt

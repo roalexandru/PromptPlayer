@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ipc, type Prompt, type ProfileKind } from "$lib/ipc";
+  import { ipc, fmtErr, type Prompt, type ProfileKind } from "$lib/ipc";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
+  import { open as openFileDialog, save as saveFileDialog, confirm } from "@tauri-apps/plugin-dialog";
   import { IS_MAC } from "$lib/platform";
   import CadencePreview from "$lib/components/CadencePreview.svelte";
   import HotkeyRecorder from "$lib/components/HotkeyRecorder.svelte";
@@ -19,6 +19,46 @@
   let draft = $state<Prompt | null>(null);
   let dirty = $state(false);
   let saveStatus = $state<"" | "saving" | "saved" | "error">("");
+  // Validity surfaced by the HotkeyRecorder (conflict / unparseable combo).
+  // Non-null blocks Save so a broken hotkey never reaches the backend.
+  let hotkeyError = $state<string | null>(null);
+
+  // Transient success banner (export feedback etc) — mirrors the error
+  // banner but auto-dismisses.
+  let notice = $state<string | null>(null);
+  let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+  function flashNotice(msg: string) {
+    notice = msg;
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => (notice = null), 4000);
+  }
+
+  // Sidebar filter — client-side substring match over name, triggers, tags.
+  let filter = $state("");
+  let visiblePrompts = $derived.by(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return prompts;
+    return prompts.filter(
+      (p) =>
+        p.name.toLowerCase().includes(q) ||
+        p.triggers.some((t) => t.toLowerCase().includes(q)) ||
+        (p.tags ?? []).some((t) => t.toLowerCase().includes(q)),
+    );
+  });
+
+  // Library folder path — surfaced in the sidebar footer with click-to-copy.
+  let libRoot = $state<string>("");
+  let copiedRoot = $state(false);
+  let copiedRootTimer: ReturnType<typeof setTimeout> | null = null;
+  async function copyLibRoot() {
+    if (!libRoot) return;
+    try {
+      await navigator.clipboard.writeText(libRoot);
+      copiedRoot = true;
+      if (copiedRootTimer) clearTimeout(copiedRootTimer);
+      copiedRootTimer = setTimeout(() => (copiedRoot = false), 1500);
+    } catch {}
+  }
 
   let charCount = $derived(draft?.body.length ?? 0);
   let wordCount = $derived(
@@ -32,10 +72,18 @@
     if (k === "thoughtful-ceo") return 60;
     return 80;
   }
+  // For `custom` profiles the WPM follows the iki-median-ms override:
+  // ~5 chars/word → WPM ≈ 60000 / (iki × 5). Baseline 140 ms ≈ 85 wpm.
+  function draftWpm(d: Prompt): number {
+    const k = d.typing_profile ?? "sales-engineer";
+    if (k === "custom") {
+      const iki = d.typing_overrides?.["iki-median-ms"] ?? 140;
+      return Math.max(1, 12000 / iki);
+    }
+    return profileWpm(k);
+  }
   let estSeconds = $derived(
-    draft
-      ? Math.round((wordCount / profileWpm(draft.typing_profile ?? "sales-engineer")) * 60 + 1.0)
-      : 0,
+    draft ? Math.round((wordCount / draftWpm(draft)) * 60 + 1.0) : 0,
   );
 
   // Frontmatter fields are optional in the on-disk form; the parser fills in
@@ -48,6 +96,16 @@
   function ensureTov(p: Prompt) {
     if (!p.typing_overrides) p.typing_overrides = { ...EMPTY_OVERRIDES };
     return p.typing_overrides;
+  }
+  function positiveOrNull(value: string): number | null {
+    if (value === "") return null;
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  function rateOrNull(value: string): number | null {
+    if (value === "") return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : null;
   }
 
   async function refresh() {
@@ -64,7 +122,7 @@
         if (updated) draft = clone(updated);
       }
     } catch (e) {
-      error = String(e);
+      error = fmtErr(e);
     }
   }
 
@@ -77,8 +135,8 @@
   }
   async function toggleArmed() { armed = await ipc.toggleArmed(); }
 
-  function selectPrompt(p: Prompt) {
-    if (dirty && !confirm("Discard unsaved changes?")) return;
+  async function selectPrompt(p: Prompt) {
+    if (dirty && !(await confirm("Discard unsaved changes?"))) return;
     selectedId = p.id;
     draft = clone(p);
     dirty = false;
@@ -91,7 +149,7 @@
   }
 
   async function save() {
-    if (!draft) return;
+    if (!draft || hotkeyError) return;
     saveStatus = "saving";
     try {
       await ipc.savePrompt(draft);
@@ -99,13 +157,13 @@
       dirty = false;
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = fmtErr(e);
       saveStatus = "error";
     }
   }
 
   async function createNew() {
-    if (dirty && !confirm("Discard unsaved changes?")) return;
+    if (dirty && !(await confirm("Discard unsaved changes?"))) return;
     try {
       const p = await ipc.createPrompt();
       await refresh();
@@ -113,7 +171,7 @@
       draft = clone(p);
       dirty = false;
     } catch (e) {
-      error = String(e);
+      error = fmtErr(e);
     }
   }
 
@@ -127,7 +185,7 @@
     try {
       await ipc.setPromptEnabled(p.id, next);
     } catch (err) {
-      error = String(err);
+      error = fmtErr(err);
       // Roll back.
       prompts = prompts.map((x) => (x.id === p.id ? { ...x, enabled: !next } : x));
       if (draft && draft.id === p.id) draft = { ...draft, enabled: !next };
@@ -148,7 +206,7 @@
     try {
       await ipc.setPromptPinned(p.id, next);
     } catch (err) {
-      error = String(err);
+      error = fmtErr(err);
       prompts = prompts.map((x) => (x.id === p.id ? { ...x, pinned: !next } : x));
       if (draft && draft.id === p.id) draft = { ...draft, pinned: !next };
     }
@@ -161,7 +219,7 @@
 
   async function deleteCurrent() {
     if (!draft) return;
-    if (!confirm(`Delete "${draft.name}"? This removes the .pp.md file.`)) return;
+    if (!(await confirm(`Delete "${draft.name}"? This removes the .pp.md file.`))) return;
     try {
       await ipc.deletePrompt(draft.id);
       selectedId = null;
@@ -169,7 +227,7 @@
       dirty = false;
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = fmtErr(e);
     }
   }
 
@@ -191,6 +249,7 @@
   // where `data-tauri-drag-region` and `-webkit-app-region: drag` are flaky.
   async function startDrag(e: MouseEvent) {
     const target = e.target as HTMLElement;
+    if (!target.closest(".ribbon")) return;
     if (target.closest("button, input, select, textarea, .topbar-actions, .arm-btn"))
       return;
     e.preventDefault();
@@ -201,11 +260,42 @@
     }
   }
 
-  // Cmd/Ctrl+S save.
+  // Cmd/Ctrl+S save, Cmd/Ctrl+N new (matches the NEW_HINT tooltip).
   function onKey(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key === "s") {
       e.preventDefault();
       if (dirty) save();
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key === "n") {
+      e.preventDefault();
+      createNew();
+    }
+  }
+
+  // Sidebar keyboard navigation — ArrowUp/Down walk the (filtered) list,
+  // Enter re-selects. Attached to the filter input and the list rows.
+  function moveSelection(delta: number) {
+    if (visiblePrompts.length === 0) return;
+    const idx = visiblePrompts.findIndex((p) => p.id === selectedId);
+    const next =
+      idx === -1
+        ? delta > 0 ? 0 : visiblePrompts.length - 1
+        : Math.max(0, Math.min(visiblePrompts.length - 1, idx + delta));
+    selectPrompt(visiblePrompts[next]);
+  }
+  function onSidebarKey(e: KeyboardEvent) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      moveSelection(1);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      moveSelection(-1);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const hit =
+        visiblePrompts.find((p) => p.id === selectedId) ?? visiblePrompts[0];
+      if (hit) selectPrompt(hit);
     }
   }
 
@@ -269,7 +359,7 @@
         captureMsg = `Added: ${fg.name ?? id}`;
       }
     } catch (e) {
-      captureMsg = `Capture failed: ${e}`;
+      captureMsg = `Capture failed: ${fmtErr(e)}`;
       try { await getCurrentWindow().show(); } catch {}
     } finally {
       capturing = false;
@@ -291,7 +381,7 @@
     try {
       testResult = await ipc.expandPromptText(draft.body);
     } catch (e) {
-      testResult = `[error: ${e}]`;
+      testResult = `[error: ${fmtErr(e)}]`;
     } finally {
       testRunning = false;
     }
@@ -312,7 +402,7 @@
       draft = clone(p);
       dirty = false;
     } catch (e) {
-      error = String(e);
+      error = fmtErr(e);
     }
   }
   async function exportFile() {
@@ -325,14 +415,16 @@
     if (!dest) return;
     try {
       await ipc.exportPrompt(draft.id, dest);
+      flashNotice(`Exported to ${dest}`);
     } catch (e) {
-      error = String(e);
+      error = fmtErr(e);
     }
   }
 
   onMount(() => {
     refresh();
     refreshArmed();
+    ipc.libraryRoot().then((r) => (libRoot = r)).catch(() => {});
     const t = setInterval(() => {
       refreshArmed();
       if (!dirty) refresh();
@@ -341,12 +433,12 @@
   });
 </script>
 
-<svelte:window on:keydown={onKey} />
+<svelte:window on:keydown={onKey} on:mousedown={startDrag} />
 
 <div class="app">
   <!-- Single compact ribbon. The whole strip is draggable; buttons
        opt out via the .topbar-actions early-return in startDrag. -->
-  <header class="ribbon" onmousedown={startDrag}>
+  <header class="ribbon">
     <div class="brand">
       <span class="chevron">›</span>
       <span class="brand-name">Prompt Player</span>
@@ -374,15 +466,31 @@
       <button onclick={() => (error = null)}>×</button>
     </div>
   {/if}
+  {#if notice}
+    <div class="banner ok">
+      {notice}
+      <button onclick={() => (notice = null)}>×</button>
+    </div>
+  {/if}
 
   <div class="layout">
     <aside class="sidebar glass">
       <div class="sidebar-head">
         <span class="label">Prompts</span>
-        <span class="count">{prompts.length}</span>
+        <span class="count">{filter ? `${visiblePrompts.length}/${prompts.length}` : prompts.length}</span>
+      </div>
+      <div class="sidebar-filter">
+        <input
+          class="filter-input"
+          type="text"
+          placeholder="Filter prompts…"
+          bind:value={filter}
+          onkeydown={onSidebarKey}
+          spellcheck="false"
+        />
       </div>
       <ul class="prompt-list">
-        {#each prompts as p (p.id)}
+        {#each visiblePrompts as p (p.id)}
           <li class="row" class:disabled-row={!p.enabled}>
             <button
               class="prompt-item"
@@ -390,6 +498,7 @@
               class:dim={!p.enabled}
               title={p.name}
               onclick={() => selectPrompt(p)}
+              onkeydown={onSidebarKey}
             >
               <div class="prompt-name">{p.name}</div>
               <div class="prompt-trigs">
@@ -437,11 +546,22 @@
               <li>Click <kbd>+ New</kbd> to create a prompt.</li>
               <li>Pin it (📌) to surface it in the menu bar.</li>
               <li>Type its trigger anywhere — e.g. <kbd>hello&gt;</kbd> — to fire it.</li>
-              <li>Press <kbd>{IS_MAC ? "⌘⇧V" : "Ctrl+⇧V"}</kbd> to open the picker.</li>
+              <li>Press <kbd>{IS_MAC ? "⌘⌥\\" : "Ctrl+Alt+\\"}</kbd> to open the picker.</li>
             </ol>
           </li>
+        {:else if visiblePrompts.length === 0}
+          <li class="empty">No matches for “{filter}”</li>
         {/if}
       </ul>
+      {#if libRoot}
+        <button
+          class="lib-root"
+          onclick={copyLibRoot}
+          title={`${libRoot} — click to copy`}
+        >
+          <span class="lib-root-path">{copiedRoot ? "Copied ✓" : libRoot}</span>
+        </button>
+      {/if}
     </aside>
 
     <main class="content">
@@ -495,7 +615,12 @@
                 {/if}
               </button>
               <button class="ghost danger" onclick={deleteCurrent}>Delete</button>
-              <button class="primary" onclick={save} disabled={!dirty}>
+              <button
+                class="primary"
+                onclick={save}
+                disabled={!dirty || !!hotkeyError}
+                title={hotkeyError ? `Fix the hotkey first — ${hotkeyError}` : undefined}
+              >
                 Save
               </button>
             </div>
@@ -593,7 +718,7 @@
               </div>
 
               <div class="field">
-                <label>Hotkey</label>
+                <div class="field-label">Hotkey</div>
                 <HotkeyRecorder
                   bind:value={
                     () => draft?.hotkey ?? null,
@@ -605,7 +730,11 @@
                   }
                   prompts={prompts}
                   selfId={draft.id}
+                  onvalidity={(err) => (hotkeyError = err)}
                 />
+                {#if hotkeyError && dirty}
+                  <small class="hint">Save is disabled until the hotkey is fixed or cleared.</small>
+                {/if}
               </div>
             </div>
 
@@ -613,12 +742,12 @@
               <summary>Scope (per-app routing)</summary>
               <div class="form-grid">
                 <div class="field" style="grid-column: 1 / -1">
-                  <label>Apps (bundle ID / executable)</label>
+                  <div class="field-label">Apps (bundle ID / executable)</div>
                   <div class="chips">
                     {#each (draft.scope?.app ?? []) as bid (bid)}
-                      <span class="chip">
+                      <span class="app-chip">
                         {bid}
-                        <button class="chip-x" onclick={() => removeScopeApp(bid)} title="Remove">×</button>
+                        <button class="app-chip-x" onclick={() => removeScopeApp(bid)} title="Remove">×</button>
                       </span>
                     {/each}
                     {#if (draft.scope?.app ?? []).length === 0}
@@ -672,13 +801,14 @@
                   <input
                     id="iki"
                     type="number"
+                    min="1"
                     placeholder="140"
                     value={tov(draft)["iki-median-ms"] ?? ""}
                     oninput={(e) => {
                       if (!draft) return;
                       const v = (e.target as HTMLInputElement).value;
                       ensureTov(draft)["iki-median-ms"] =
-                        v === "" ? null : Number(v);
+                        positiveOrNull(v);
                       markDirty();
                     }}
                   />
@@ -689,6 +819,8 @@
                   <input
                     id="typo"
                     type="number"
+                    min="0"
+                    max="1"
                     step="0.001"
                     placeholder="0.011"
                     value={tov(draft)["typo-rate"] ?? ""}
@@ -696,7 +828,7 @@
                       if (!draft) return;
                       const v = (e.target as HTMLInputElement).value;
                       ensureTov(draft)["typo-rate"] =
-                        v === "" ? null : Number(v);
+                        rateOrNull(v);
                       markDirty();
                     }}
                   />
@@ -707,6 +839,7 @@
                   <input
                     id="pvar"
                     type="number"
+                    min="0.01"
                     step="0.1"
                     placeholder="1.0"
                     value={tov(draft)["pause-variance-scale"] ?? ""}
@@ -714,7 +847,7 @@
                       if (!draft) return;
                       const v = (e.target as HTMLInputElement).value;
                       ensureTov(draft)["pause-variance-scale"] =
-                        v === "" ? null : Number(v);
+                        positiveOrNull(v);
                       markDirty();
                     }}
                   />
@@ -779,7 +912,7 @@
 
             <div class="body-section">
               <div class="body-header">
-                <label class="body-label">Body</label>
+                <label class="body-label" for="prompt-body">Body</label>
                 <div class="body-actions">
                   <button class="ghost small" onclick={runTestExpansion} disabled={testRunning} title="Evaluate placeholders + ${'${{...}}'} expressions against now">
                     {testRunning ? "Testing…" : "Test expansion"}
@@ -790,6 +923,7 @@
                 </div>
               </div>
               <textarea
+                id="prompt-body"
                 bind:value={draft.body}
                 oninput={markDirty}
                 spellcheck="false"
@@ -814,7 +948,11 @@
           </section>
         {:else}
           <section class="pane glass">
-            <CadencePreview body={draft.body} profile={draft.typing_profile} />
+            <CadencePreview
+              body={draft.body}
+              profile={draft.typing_profile}
+              overrides={draft.typing_overrides ?? null}
+            />
           </section>
         {/if}
       {:else}
@@ -1037,6 +1175,24 @@
     padding: 1px 7px;
     border-radius: 10px;
   }
+  /* Sidebar filter — compact text field above the list. */
+  .sidebar-filter { padding: 2px 10px 6px; }
+  .filter-input {
+    width: 100%;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-family: inherit;
+    color: var(--text);
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+  }
+  .filter-input::placeholder { color: var(--text-muted); }
+  .filter-input:focus {
+    border-color: var(--selection-border);
+    outline: none;
+  }
+
   .prompt-list {
     list-style: none; margin: 0; padding: 2px 6px 8px;
     overflow-y: auto; flex: 1;
@@ -1045,6 +1201,33 @@
     padding: 16px; color: var(--text-muted);
     font-size: 12px; line-height: 1.5; text-align: center;
   }
+
+  /* Library folder path — sidebar footer, click-to-copy. */
+  .lib-root {
+    display: block;
+    width: 100%;
+    padding: 6px 14px;
+    background: transparent;
+    border: none;
+    border-top: 1px solid var(--separator);
+    border-radius: 0;
+    text-align: left;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .lib-root:hover { background: var(--hover); border-color: var(--separator); }
+  .lib-root-path {
+    display: block;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 10px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    direction: rtl; /* Truncate from the left so the folder name stays visible. */
+    text-align: left;
+  }
+  .lib-root:hover .lib-root-path { color: var(--text-secondary); }
   kbd {
     background: var(--hover);
     padding: 1px 5px;
@@ -1376,7 +1559,8 @@
   }
   .field { display: flex; flex-direction: column; gap: 4px; }
   .field.narrow { max-width: 200px; }
-  .field label {
+  .field label,
+  .field-label {
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -1514,7 +1698,8 @@
     border-radius: 4px;
   }
 
-  /* Scope app chips. */
+  /* Scope app chips. Named .app-chip (not .chip) so they don't collide with
+     the compact trigger chips in the sidebar list. */
   .chips {
     display: flex;
     flex-wrap: wrap;
@@ -1522,7 +1707,7 @@
     margin-bottom: 8px;
     min-height: 24px;
   }
-  .chip {
+  .app-chip {
     display: inline-flex;
     align-items: center;
     gap: 4px;
@@ -1533,7 +1718,7 @@
     font-size: 11.5px;
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
   }
-  .chip-x {
+  .app-chip-x {
     background: transparent;
     border: 0;
     color: var(--text-muted);
@@ -1542,7 +1727,7 @@
     font-size: 14px;
     line-height: 1;
   }
-  .chip-x:hover { color: var(--text-primary); }
+  .app-chip-x:hover { color: var(--text); }
   .chip-empty {
     color: var(--text-muted);
     font-size: 11.5px;
@@ -1584,6 +1769,23 @@
     align-items: center;
   }
   .banner.err button {
+    background: none; border: none; color: inherit;
+    font-size: 18px; cursor: pointer;
+  }
+  /* Success variant — same shape, green palette. */
+  .banner.ok {
+    background: rgba(52, 199, 89, 0.12);
+    color: var(--success);
+    padding: 10px 16px;
+    border-radius: 8px;
+    margin: 0 12px 12px;
+    font-size: 13px;
+    border: 1px solid rgba(52, 199, 89, 0.3);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .banner.ok button {
     background: none; border: none; color: inherit;
     font-size: 18px; cursor: pointer;
   }

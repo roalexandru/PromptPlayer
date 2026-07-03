@@ -11,6 +11,8 @@ use tauri::WebviewWindow;
 
 #[cfg(target_os = "macos")]
 mod plat {
+    #![allow(deprecated)]
+
     use cocoa::base::id;
     use objc::{msg_send, sel, sel_impl};
     use tauri::WebviewWindow;

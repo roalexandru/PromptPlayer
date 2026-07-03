@@ -28,7 +28,7 @@ use crate::prompts::Prompt;
 use crate::rdp::RdpMode;
 use crate::scopes;
 use crate::telemetry::{self, CancelReason, CharBucket, PromptMode, TargetAppKind, TelemetryEvent};
-use crate::typer::{play, schedule, Injector, Key, ScheduleOptions};
+use crate::typer::{play_guarded, schedule, Injector, Key, ScheduleOptions};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::sync::atomic::Ordering;
@@ -72,75 +72,113 @@ impl FireService {
     /// Fire a prompt triggered by the keyboard hook (commit-char + typed form).
     /// `candidate_ids` may contain multiple prompts sharing this trigger;
     /// `pick_best` resolves by scope+priority+specificity.
+    ///
+    /// Called directly from the OS keyboard-hook callback, which on Windows
+    /// runs under the `LowLevelHooksTimeout` budget (~300ms): exceeding it
+    /// makes Windows silently unhook us. So we do NO work here beyond spawning
+    /// a dispatch thread — foreground capture, the prompt-store read, and
+    /// scope resolution all happen off the hook thread.
     pub fn fire_from_trigger(&self, candidate_ids: Vec<String>, typed_form: String) {
-        let foreground = scopes::capture_foreground_context();
-        let candidates: Vec<Prompt> = {
-            let all = self.ctx.prompts.read();
-            candidate_ids
-                .iter()
-                .filter_map(|id| all.iter().find(|p| &p.id == id).cloned())
-                .filter(|p| p.enabled)
-                .collect()
-        };
-        if candidates.is_empty() {
-            tracing::debug!("trigger matched, but no enabled candidate; nothing fires");
-            return;
-        }
-        let Some(picked_id) = scopes::pick_best(&candidates, &foreground) else {
-            tracing::debug!("no scope match for trigger; nothing fires");
-            telemetry::send(
-                &self.app,
-                TelemetryEvent::PromptCancelled {
-                    reason: CancelReason::Error,
-                    completed_chars_pct: 0,
-                },
-            );
-            return;
-        };
-        let Some(prompt) = candidates.into_iter().find(|p| p.id == picked_id) else {
-            tracing::warn!("picked prompt {} not found", picked_id);
-            return;
-        };
-        self.spawn_fire(
-            prompt,
-            Some(typed_form),
-            PromptMode::Stealth,
-            foreground,
-            None,
-        );
+        let svc = self.clone();
+        thread::Builder::new()
+            .name("prompt-player-fire-stealth".into())
+            .spawn(move || {
+                let foreground = scopes::capture_foreground_context();
+                let candidates: Vec<Prompt> = {
+                    let all = svc.ctx.prompts.read();
+                    candidate_ids
+                        .iter()
+                        .filter_map(|id| all.iter().find(|p| &p.id == id).cloned())
+                        .filter(|p| p.enabled)
+                        .collect()
+                };
+                if candidates.is_empty() {
+                    tracing::debug!("trigger matched, but no enabled candidate; nothing fires");
+                    return;
+                }
+                let Some(picked_id) = scopes::pick_best(&candidates, &foreground) else {
+                    // The trigger matched (so the hook already suppressed the
+                    // commit char and popped the trigger from the ring), but no
+                    // candidate's scope matches the current app. Put the eaten
+                    // commit char back so the user isn't left with a silently
+                    // missing `>`, and re-observe trigger+commit so the ring
+                    // mirrors the screen again. All candidates share the same
+                    // commit char (the matcher filters on it).
+                    let commit = candidates[0].commit_char;
+                    tracing::debug!("no scope match for trigger; re-injecting '{}'", commit);
+                    if let Ok(mut inj) = EnigoInjector::new() {
+                        inj.type_char(commit);
+                    }
+                    let now = std::time::Instant::now();
+                    for ch in typed_form.chars() {
+                        svc.ctx.matcher.observe_char(ch, now);
+                    }
+                    svc.ctx.matcher.observe_char(commit, now);
+                    return;
+                };
+                let Some(prompt) = candidates.into_iter().find(|p| p.id == picked_id) else {
+                    tracing::warn!("picked prompt {} not found", picked_id);
+                    return;
+                };
+                svc.run_resolved(
+                    prompt,
+                    Some(typed_form),
+                    PromptMode::Stealth,
+                    foreground,
+                    None,
+                );
+            })
+            .expect("spawn fire dispatch thread");
     }
 
     /// Fire a prompt selected from the picker. Mode controls modifier-on-Enter
     /// behavior (human cadence, fast, paste, run). Picker runs scope/expr/
     /// filters too — it's the same pipeline.
     pub fn fire_from_picker(&self, prompt_id: &str, mode: PickMode) {
-        let Some(prompt) = self.ctx.prompts.find(prompt_id) else {
-            tracing::warn!("picker selected unknown prompt {}", prompt_id);
-            return;
-        };
-        if !prompt.enabled {
-            tracing::info!("picker selected disabled prompt {}; ignoring", prompt_id);
-            return;
-        }
-        // Picker runs after focus restore — capture foreground anew so
-        // scope/expr context reflects the target app, not Prompt Player itself.
-        let foreground = scopes::capture_foreground_context();
-        self.spawn_fire(prompt, None, PromptMode::Picker, foreground, Some(mode));
+        let svc = self.clone();
+        let prompt_id = prompt_id.to_string();
+        thread::Builder::new()
+            .name("prompt-player-fire-picker".into())
+            .spawn(move || {
+                let Some(prompt) = svc.ctx.prompts.find(&prompt_id) else {
+                    tracing::warn!("picker selected unknown prompt {}", prompt_id);
+                    return;
+                };
+                if !prompt.enabled {
+                    tracing::info!("picker selected disabled prompt {}; ignoring", prompt_id);
+                    return;
+                }
+                // Picker runs after focus restore — capture foreground anew so
+                // scope/expr context reflects the target app, not Prompt Player.
+                let foreground = scopes::capture_foreground_context();
+                svc.run_resolved(prompt, None, PromptMode::Picker, foreground, Some(mode));
+            })
+            .expect("spawn picker fire thread");
     }
 
     /// Fire from a per-prompt global hotkey. No commit-char, no typed form.
     pub fn fire_from_hotkey(&self, prompt_id: &str) {
-        let Some(prompt) = self.ctx.prompts.find(prompt_id) else {
-            return;
-        };
-        if !prompt.enabled {
-            return;
-        }
-        let foreground = scopes::capture_foreground_context();
-        self.spawn_fire(prompt, None, PromptMode::Stealth, foreground, None);
+        let svc = self.clone();
+        let prompt_id = prompt_id.to_string();
+        thread::Builder::new()
+            .name("prompt-player-fire-hotkey".into())
+            .spawn(move || {
+                let Some(prompt) = svc.ctx.prompts.find(&prompt_id) else {
+                    return;
+                };
+                if !prompt.enabled {
+                    return;
+                }
+                let foreground = scopes::capture_foreground_context();
+                svc.run_resolved(prompt, None, PromptMode::Stealth, foreground, None);
+            })
+            .expect("spawn hotkey fire thread");
     }
 
-    fn spawn_fire(
+    /// Run a fully-resolved fire on the current (dispatch) thread. Acquires the
+    /// playback lock; bails if another playback is already typing so keystrokes
+    /// can't interleave into the same window.
+    fn run_resolved(
         &self,
         prompt: Prompt,
         typed_form: Option<String>,
@@ -148,39 +186,34 @@ impl FireService {
         foreground: scopes::ForegroundContext,
         pick_mode: Option<PickMode>,
     ) {
-        let cancel = self.ctx.state.begin_playback();
-        let app_state = self.ctx.state.clone();
-        let undo = self.ctx.undo.clone();
-        let rdp_registry = self.ctx.rdp.clone();
-        let app = self.app.clone();
-        let thread_name = match telem_mode {
-            PromptMode::Stealth => "prompt-player-fire-stealth",
-            PromptMode::Picker => "prompt-player-fire-picker",
+        let Some(cancel) = self.ctx.state.begin_playback() else {
+            tracing::info!("fire ignored — a playback is already in progress");
+            return;
         };
-        thread::Builder::new()
-            .name(thread_name.into())
-            .spawn(move || {
-                run_fire_pipeline(
-                    app,
-                    prompt,
-                    typed_form,
-                    telem_mode,
-                    foreground,
-                    pick_mode,
-                    cancel,
-                    app_state,
-                    undo,
-                    rdp_registry,
-                );
-            })
-            .expect("spawn fire thread");
+        run_fire_pipeline(
+            self.app.clone(),
+            prompt,
+            typed_form,
+            telem_mode,
+            foreground,
+            pick_mode,
+            cancel,
+            self.ctx.state.clone(),
+            self.ctx.undo.clone(),
+            self.ctx.rdp.clone(),
+        );
     }
 
     /// Backspace-undo flow — separate from fire because it doesn't run the
-    /// pipeline; it just types backspaces + retypes the original trigger.
+    /// pipeline. The trigger word itself was never erased during expansion
+    /// (the body is typed as a continuation after it), so undo only needs to
+    /// backspace the body chars; the user's original trigger stays on screen.
+    /// We then re-observe the trigger into the matcher buffer (which had it
+    /// popped at fire time) so `trigger>` can fire again immediately after.
     pub fn run_undo(&self) {
         let app_state = self.ctx.state.clone();
         let undo = self.ctx.undo.clone();
+        let matcher = self.ctx.matcher.clone();
         let app = self.app.clone();
         thread::Builder::new()
             .name("prompt-player-undo".into())
@@ -188,7 +221,10 @@ impl FireService {
                 let Some(entry) = undo.take_recent(std::time::Instant::now()) else {
                     return;
                 };
-                let cancel = app_state.begin_playback();
+                let Some(cancel) = app_state.begin_playback() else {
+                    // A playback is already running — don't stomp it.
+                    return;
+                };
                 let mut inj = match EnigoInjector::new() {
                     Ok(i) => i,
                     Err(e) => {
@@ -206,16 +242,15 @@ impl FireService {
                     inj.press_backspace();
                     thread::sleep(std::time::Duration::from_millis(15));
                 }
-                for c in entry.trigger_form.chars() {
-                    if cancel.load(Ordering::Relaxed) {
-                        inj.release_all_modifiers();
-                        app_state.end_playback();
-                        return;
-                    }
-                    inj.type_char(c);
-                    thread::sleep(std::time::Duration::from_millis(20));
-                }
                 app_state.end_playback();
+                // Restore the matcher's shadow of the screen: the trigger text
+                // is back on screen (we never erased it), but it was popped
+                // from the ring at fire time. Re-observe it so a fresh `>`
+                // can re-fire without the user retyping the trigger.
+                let now = std::time::Instant::now();
+                for c in entry.trigger_form.chars() {
+                    matcher.observe_char(c, now);
+                }
                 telemetry::send(&app, TelemetryEvent::PromptUndone);
             })
             .expect("spawn undo thread");
@@ -235,24 +270,40 @@ fn run_fire_pipeline(
     undo: Arc<crate::undo::UndoLog>,
     rdp_registry: Arc<crate::rdp::RdpRegistry>,
 ) {
+    let _playback_guard = PlaybackEndGuard::new(app_state.clone());
     // 1+2 — already done by caller (foreground capture, scope pick).
+    // Read the clipboard only when the body actually references it — avoids
+    // touching the user's clipboard on every fire (privacy + cost). Covers both
+    // the `$CLIPBOARD` placeholder and the `clipboard` expression builtin.
+    let clipboard = if prompt.body.contains("CLIPBOARD") || prompt.body.contains("clipboard") {
+        crate::inject::read_clipboard_text()
+    } else {
+        None
+    };
     // 3 — TS expressions.
-    let mut expr_ctx = ExprContext::default();
-    expr_ctx.app_bundle = foreground.bundle_id.clone();
-    expr_ctx.app_name = foreground
+    let app_name = foreground
         .executable
         .as_deref()
         .and_then(|s| std::path::Path::new(s).file_name().and_then(|f| f.to_str()))
         .map(|s| s.to_string());
-    expr_ctx.window_title = foreground.window_title.clone();
+    let expr_ctx = ExprContext {
+        app_bundle: foreground.bundle_id.clone(),
+        app_name,
+        window_title: foreground.window_title.clone(),
+        clipboard: clipboard.clone(),
+        ..Default::default()
+    };
     let body_after_expr = crate::prompts::expressions::expand_expressions(&prompt.body, &expr_ctx);
     let has_expressions = body_after_expr.len() != prompt.body.len();
 
     // 4 — placeholders.
-    let mut ph_ctx = PlaceholderContext::default();
-    ph_ctx.app_bundle = foreground.bundle_id.clone();
-    ph_ctx.app_name = expr_ctx.app_name.clone();
-    ph_ctx.window_title = foreground.window_title.clone();
+    let ph_ctx = PlaceholderContext {
+        app_bundle: foreground.bundle_id.clone(),
+        app_name: expr_ctx.app_name.clone(),
+        window_title: foreground.window_title.clone(),
+        clipboard,
+        ..Default::default()
+    };
     let expanded = expand(&body_after_expr, &ph_ctx);
 
     // 5 — filter chain.
@@ -363,6 +414,20 @@ fn run_fire_pipeline(
     );
 
     // 9 — play.
+    // Snapshot the target app's identity so we can bail if focus leaves it
+    // mid-playback (a click, Alt/Cmd-Tab, a notification) — otherwise the
+    // remainder of the prompt gets typed into whatever now has focus (a chat
+    // with a customer, a terminal, a password field). The §2.6 panic ring only
+    // catches *typed* keystrokes; a silent focus change produces none.
+    let target_identity = scopes::foreground_identity();
+    let focus_lost = move || match (target_identity, scopes::foreground_identity()) {
+        // Abort only when both are known and differ — a transient read failure
+        // must never cut off a legitimate playback.
+        (Some(t), Some(c)) => t != c,
+        _ => false,
+    };
+    let mut focus_changed = false;
+    let mut completed_chars = 0usize;
     let completed = if paste_mode {
         // Clipboard paste: save → set → Ctrl/Cmd+V → wait → restore.
         // Focus was confirmed by the caller (`picker_select` →
@@ -375,10 +440,35 @@ fn run_fire_pipeline(
             false
         } else {
             match paste_via_clipboard(&body) {
-                Ok(()) => true,
+                Ok(()) => {
+                    completed_chars = body_chars;
+                    true
+                }
                 Err(e) => {
-                    tracing::error!("clipboard paste failed: {:?}", e);
-                    false
+                    tracing::warn!(
+                        "clipboard paste failed, falling back to typed playback: {:?}",
+                        e
+                    );
+                    let mut rng = ChaCha8Rng::from_entropy();
+                    let fallback_schedule = schedule(&body, &profile, &opts, &mut rng);
+                    match EnigoInjector::new() {
+                        Ok(mut inj) => {
+                            let _timer = crate::typer::TimerResolutionGuard::acquire();
+                            let outcome = play_guarded(
+                                &fallback_schedule,
+                                &mut inj,
+                                cancel.clone(),
+                                Some(&focus_lost),
+                            );
+                            completed_chars = outcome.visible_chars;
+                            focus_changed = outcome.focus_changed;
+                            outcome.completed
+                        }
+                        Err(e) => {
+                            tracing::error!("fallback enigo init failed: {:?}", e);
+                            false
+                        }
+                    }
                 }
             }
         }
@@ -387,18 +477,30 @@ fn run_fire_pipeline(
             Ok(i) => i,
             Err(e) => {
                 tracing::error!("enigo init failed: {:?}", e);
-                app_state.end_playback();
                 return;
             }
         };
-        let result = play(&scheduled, &mut inj, cancel.clone());
+        // Hold 1ms timer resolution across the whole typed run so per-key
+        // sleeps don't quantize to the OS timer period (Windows-only effect).
+        let _timer = crate::typer::TimerResolutionGuard::acquire();
+        let outcome = play_guarded(&scheduled, &mut inj, cancel.clone(), Some(&focus_lost));
+        completed_chars = outcome.visible_chars;
+        focus_changed = outcome.focus_changed;
         drop(inj);
-        result
+        outcome.completed
     };
 
     if completed {
         if let Some(form) = typed_form.as_deref() {
-            undo.record(form.to_string(), body_chars);
+            if profile.send_final_enter {
+                // The profile pressed Enter to submit the message. Backspace-
+                // undo can't un-send it, and the backspaces would delete from
+                // whatever field now has focus (often empty) — so don't arm
+                // undo for a submitted prompt.
+                tracing::debug!("not recording undo: prompt was submitted via final Enter");
+            } else {
+                undo.record(form.to_string(), body_chars);
+            }
         }
     } else {
         // Paste is effectively atomic — `completed=false` means we never
@@ -407,21 +509,40 @@ fn run_fire_pipeline(
         // full paste happened when nothing did. The typed-path estimator
         // uses `remaining_chars(&scheduled)` (still coarse — see the
         // function comment).
-        let pct = if paste_mode || body_chars == 0 {
+        let pct = if body_chars == 0 {
             0
         } else {
-            (body_chars.saturating_sub(remaining_chars(&scheduled)) * 100 / body_chars).min(100)
-                as u8
+            (completed_chars * 100 / body_chars).min(100) as u8
+        };
+        let reason = if focus_changed {
+            CancelReason::FocusChanged
+        } else {
+            CancelReason::UserKeystrokes
         };
         telemetry::send(
             &app,
             TelemetryEvent::PromptCancelled {
-                reason: CancelReason::UserKeystrokes,
+                reason,
                 completed_chars_pct: pct,
             },
         );
     }
-    app_state.end_playback();
+}
+
+struct PlaybackEndGuard {
+    state: Arc<crate::state::AppState>,
+}
+
+impl PlaybackEndGuard {
+    fn new(state: Arc<crate::state::AppState>) -> Self {
+        Self { state }
+    }
+}
+
+impl Drop for PlaybackEndGuard {
+    fn drop(&mut self) {
+        self.state.end_playback();
+    }
 }
 
 fn classify_target_app(ctx: &scopes::ForegroundContext, rdp: RdpMode) -> TargetAppKind {
@@ -432,12 +553,7 @@ fn classify_target_app(ctx: &scopes::ForegroundContext, rdp: RdpMode) -> TargetA
     let exe = ctx
         .executable
         .as_deref()
-        .map(|s| {
-            s.rsplit(|c| c == '/' || c == '\\')
-                .next()
-                .unwrap_or(s)
-                .to_lowercase()
-        })
+        .map(|s| s.rsplit(['/', '\\']).next().unwrap_or(s).to_lowercase())
         .unwrap_or_default();
     let is_browser = bundle.contains("safari")
         || bundle.contains("chrome")
@@ -455,11 +571,4 @@ fn classify_target_app(ctx: &scopes::ForegroundContext, rdp: RdpMode) -> TargetA
         return TargetAppKind::Native;
     }
     TargetAppKind::Unknown
-}
-
-fn remaining_chars(_schedule: &[crate::typer::ScheduledKey]) -> usize {
-    // We don't track current playback index; approximate as 0 (everything
-    // remaining was cancelled). This is a coarse signal — the bucket is
-    // what's reported, not exact counts.
-    0
 }

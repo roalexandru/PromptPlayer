@@ -112,7 +112,7 @@ pub fn parse_str(raw: &str, path: &Path) -> Result<Prompt, ParseError> {
         commit_char: commit,
         priority: fm.priority.unwrap_or(0),
         typing_profile: fm.typing_profile.unwrap_or_default(),
-        typing_overrides: fm.typing_overrides.unwrap_or_default(),
+        typing_overrides: fm.typing_overrides.unwrap_or_default().normalized(),
         scope: fm.scope,
         filters: fm.filters,
         hotkey: fm.hotkey,
@@ -132,6 +132,7 @@ pub fn serialize(prompt: &Prompt) -> Result<String, serde_yaml::Error> {
     #[derive(serde::Serialize)]
     #[serde(rename_all = "kebab-case")]
     struct Out<'a> {
+        id: &'a str,
         name: &'a str,
         #[serde(skip_serializing_if = "str::is_empty")]
         description: &'a str,
@@ -141,7 +142,7 @@ pub fn serialize(prompt: &Prompt) -> Result<String, serde_yaml::Error> {
         priority: i32,
         typing_profile: ProfileKind,
         #[serde(skip_serializing_if = "is_default_overrides")]
-        typing_overrides: &'a crate::typer::TypingOverrides,
+        typing_overrides: crate::typer::TypingOverrides,
         #[serde(skip_serializing_if = "Option::is_none")]
         scope: &'a Option<crate::scopes::ScopeFilter>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -174,14 +175,16 @@ pub fn serialize(prompt: &Prompt) -> Result<String, serde_yaml::Error> {
             && v.send_final_enter.is_none()
     }
 
+    let normalized_overrides = prompt.typing_overrides.normalized();
     let out = Out {
+        id: &prompt.id,
         name: &prompt.name,
         description: &prompt.description,
         triggers: &prompt.triggers,
         commit_char: prompt.commit_char.to_string(),
         priority: prompt.priority,
         typing_profile: prompt.typing_profile,
-        typing_overrides: &prompt.typing_overrides,
+        typing_overrides: normalized_overrides,
         scope: &prompt.scope,
         filters: &prompt.filters,
         hotkey: &prompt.hotkey,
@@ -235,6 +238,23 @@ mod tests {
         let raw = "---\nname: x\ntriggers: [x]\n---\nbody\n";
         let p = parse_str(raw, std::path::Path::new("/tmp/myprompt.pp.md")).unwrap();
         assert_eq!(p.id, "myprompt");
+    }
+
+    #[test]
+    fn serialize_always_emits_explicit_id() {
+        let raw = "---\nid: stable-id\nname: x\ntriggers: [x]\n---\nbody\n";
+        let p = parse_str(raw, std::path::Path::new("/tmp/other.pp.md")).unwrap();
+        let out = serialize(&p).unwrap();
+        assert!(out.contains("id: stable-id\n"));
+    }
+
+    #[test]
+    fn invalid_numeric_overrides_are_not_persisted() {
+        let raw = "---\nname: x\ntriggers: [x]\ntyping-overrides:\n  iki-median-ms: -1\n  typo-rate: 2\n  pause-variance-scale: .nan\n---\nbody\n";
+        let p = parse_str(raw, std::path::Path::new("/tmp/x.pp.md")).unwrap();
+        assert!(p.typing_overrides.iki_median_ms.is_none());
+        assert_eq!(p.typing_overrides.typo_rate, Some(1.0));
+        assert!(p.typing_overrides.pause_variance_scale.is_none());
     }
 
     #[test]
