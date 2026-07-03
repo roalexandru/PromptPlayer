@@ -43,6 +43,9 @@ pub enum TelemetryEvent {
     ArmToggled {
         armed: bool,
     },
+    KeepAwakeToggled {
+        enabled: bool,
+    },
     ExpressionError {
         kind: ExpressionErrorKind,
     },
@@ -238,6 +241,7 @@ impl TelemetryEvent {
             Self::PickerDismissed => "picker_dismissed",
             Self::PickerSearchChars { .. } => "picker_search_chars",
             Self::ArmToggled { .. } => "arm_toggled",
+            Self::KeepAwakeToggled { .. } => "keep_awake_toggled",
             Self::ExpressionError { .. } => "expression_error",
             Self::UpdateCheck { .. } => "update_check",
             Self::UpdateApplied { .. } => "update_applied",

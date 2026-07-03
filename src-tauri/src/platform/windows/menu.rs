@@ -44,6 +44,7 @@ const ID_PROMPT_LIBRARY: u32 = 101;
 const ID_COMMAND_PALETTE: u32 = 102;
 const ID_ABOUT: u32 = 103;
 const ID_QUIT: u32 = 104;
+const ID_KEEP_AWAKE: u32 = 105;
 const ID_PINNED_BASE: u32 = 1000;
 
 /// Cached helper-window HWND. Win32 `HWND` isn't `Send`, but the raw
@@ -138,6 +139,7 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
         }
     };
     let armed = ctx.state.is_armed();
+    let keep_awake = ctx.power.is_enabled();
     let prompts = ctx.prompts.snapshot();
     let pinned: Vec<&crate::prompts::Prompt> = prompts.iter().filter(|p| p.pinned).collect();
 
@@ -193,6 +195,16 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
         ID_COMMAND_PALETTE as usize,
         PCWSTR(cp.as_ptr()),
     );
+
+    // Keep Awake — checkbox item (MF_CHECKED when on). Prevents display sleep,
+    // the screensaver, and idle system sleep while enabled.
+    let ka = wstr("Keep Awake");
+    let ka_flags = if keep_awake {
+        MF_STRING | MF_CHECKED
+    } else {
+        MF_STRING
+    };
+    let _ = AppendMenuW(menu, ka_flags, ID_KEEP_AWAKE as usize, PCWSTR(ka.as_ptr()));
 
     // 4. About + Quit.
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -262,6 +274,11 @@ fn dispatch(app: &AppHandle, cmd_id: u32, pinned_ids: &[String]) {
         }
         ID_ABOUT => show_window(app, "about"),
         ID_QUIT => app.exit(0),
+        ID_KEEP_AWAKE => {
+            if let Some(ctx) = app.try_state::<AppContext>() {
+                let _ = ctx.power.toggle();
+            }
+        }
         id if id >= ID_PINNED_BASE => {
             let idx = (id - ID_PINNED_BASE) as usize;
             if let Some(prompt_id) = pinned_ids.get(idx) {

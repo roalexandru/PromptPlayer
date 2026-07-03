@@ -4,6 +4,7 @@
 pub mod armed;
 pub mod library;
 pub mod picker;
+pub mod power;
 pub mod prompts;
 pub mod shell;
 pub mod tray;
@@ -25,6 +26,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "is_playing",
     "is_hook_alive",
     "open_accessibility_settings",
+    "get_keep_awake",
+    "toggle_keep_awake",
     "list_prompts",
     "library_root",
     "save_prompt",

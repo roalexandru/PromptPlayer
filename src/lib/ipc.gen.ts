@@ -36,6 +36,21 @@ async isHookAlive() : Promise<boolean> {
 async openAccessibilitySettings() : Promise<void> {
     await TAURI_INVOKE("open_accessibility_settings");
 },
+/**
+ * Current keep-awake state. Read by the macOS tray popover on every show.
+ */
+async getKeepAwake() : Promise<boolean> {
+    return await TAURI_INVOKE("get_keep_awake");
+},
+/**
+ * Flip keep-awake, apply the OS-level assertion, and return the new state.
+ * Refreshes the tray popover (macOS) so the checkmark stays in sync; the
+ * Windows native menu is rebuilt from a fresh snapshot on every open, so it
+ * needs no explicit refresh.
+ */
+async toggleKeepAwake() : Promise<boolean> {
+    return await TAURI_INVOKE("toggle_keep_awake");
+},
 async listPrompts() : Promise<Prompt[]> {
     return await TAURI_INVOKE("list_prompts");
 },
