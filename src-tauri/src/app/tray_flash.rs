@@ -13,7 +13,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::image::Image;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 /// How long the icon stays red. Long enough to register in peripheral vision,
 /// short enough not to look like a stuck error state.

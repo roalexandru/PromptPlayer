@@ -69,8 +69,6 @@ reqwest = { version = "0.13", default-features = false, features = [
     "system-proxy",
 ] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-# Pack-manifest `min-app-version` gate.
-semver = "1"
 tar = "0.4"
 
 # telemetry

@@ -3889,7 +3889,6 @@ dependencies = [
  "regex",
  "reqwest 0.13.3",
  "rquickjs",
- "semver",
  "serde",
  "serde_json",
  "serde_yaml",

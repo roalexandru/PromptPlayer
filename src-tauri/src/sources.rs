@@ -100,6 +100,30 @@ fn read_pack_manifest(archive: &[u8]) -> Option<PackManifest> {
     None
 }
 
+/// Parse `major.minor.patch` into a comparable triple, ignoring any
+/// pre-release or build suffix.
+///
+/// Hand-rolled rather than pulling in a semver crate: this compares three
+/// integers, and the app's own version is a plain `x.y.z` kept in lockstep
+/// across three manifests. Returns `None` for anything that isn't three
+/// numbers, which the caller treats as "no constraint".
+fn parse_version(raw: &str) -> Option<(u64, u64, u64)> {
+    // Drop a pre-release (`-rc.1`) or build (`+meta`) suffix before splitting.
+    let core = raw
+        .trim()
+        .trim_start_matches('v')
+        .split(['-', '+'])
+        .next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
 /// Check a pack's `min-app-version` against this build.
 ///
 /// An unparseable requirement is ignored rather than treated as a block: a
@@ -109,16 +133,18 @@ fn check_min_version(pack: &PackManifest) -> Result<(), String> {
     let Some(raw) = pack.min_app_version.as_deref() else {
         return Ok(());
     };
-    let Ok(required) = semver::Version::parse(raw.trim()) else {
+    let Some(required) = parse_version(raw) else {
         tracing::warn!("ignoring unparseable min-app-version {:?}", raw);
         return Ok(());
     };
-    let Ok(current) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
+    let Some(current) = parse_version(env!("CARGO_PKG_VERSION")) else {
         return Ok(());
     };
     if current < required {
+        let (a, b, c) = required;
         return Err(format!(
-            "this pack needs Prompt Player {required} or newer (this is {current})"
+            "this pack needs Prompt Player {a}.{b}.{c} or newer (this is {})",
+            env!("CARGO_PKG_VERSION")
         ));
     }
     Ok(())
@@ -948,9 +974,47 @@ mod tests {
     }
 
     #[test]
+    fn version_parsing_handles_the_shapes_that_occur() {
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version(" 0.1.8 "), Some((0, 1, 8)));
+        assert_eq!(parse_version("v2.0.0"), Some((2, 0, 0)));
+        // The repo tags release candidates, so a pack might name one.
+        assert_eq!(parse_version("1.2.3-rc.1"), Some((1, 2, 3)));
+        assert_eq!(parse_version("1.2.3+build7"), Some((1, 2, 3)));
+        // Short forms are treated as zero-filled.
+        assert_eq!(parse_version("2"), Some((2, 0, 0)));
+        assert_eq!(parse_version("2.1"), Some((2, 1, 0)));
+    }
+
+    #[test]
+    fn version_parsing_rejects_nonsense() {
+        for bad in ["", "next", "1.x", "1.2.3.4", "a.b.c", "-1.0.0"] {
+            assert!(parse_version(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn versions_compare_by_component_not_lexically() {
+        // The bug a string compare would have: "0.10.0" < "0.9.0".
+        assert!(parse_version("0.10.0") > parse_version("0.9.0"));
+        assert!(parse_version("1.0.0") > parse_version("0.99.99"));
+        assert!(parse_version("0.1.10") > parse_version("0.1.9"));
+    }
+
+    #[test]
+    fn this_builds_own_version_parses() {
+        // The gate silently becomes a no-op if it can't read our version.
+        assert!(
+            parse_version(env!("CARGO_PKG_VERSION")).is_some(),
+            "CARGO_PKG_VERSION {:?} must parse",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    #[test]
     fn an_unparseable_min_version_is_ignored_not_fatal() {
         // A typo in someone else's repo must not lock a user out of prompts.
-        for raw in ["not-a-version", "", "v1", "1.x"] {
+        for raw in ["not-a-version", "", "1.x", "1.2.3.4"] {
             let pack = PackManifest {
                 min_app_version: Some(raw.into()),
                 ..Default::default()
