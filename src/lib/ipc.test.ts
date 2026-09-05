@@ -77,6 +77,8 @@ describe("ipc façade", () => {
       "importAgentPrompts",
       "agentImportCandidates",
       "captureLastTyped",
+      "sourcePendingChanges",
+      "applySourceUpdates",
     ];
     for (const key of expected) {
       expect(typeof (ipc as Record<string, unknown>)[key]).toBe("function");

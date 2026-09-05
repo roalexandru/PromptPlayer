@@ -5,6 +5,7 @@ pub mod expressions;
 pub mod library;
 pub mod parser;
 pub mod placeholders;
+pub mod steps;
 
 use crate::config::NewlineMode;
 use crate::typer::{Profile, ProfileKind, TypingOverrides};

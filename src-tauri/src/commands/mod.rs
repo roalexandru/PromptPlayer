@@ -72,6 +72,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "import_agent_prompts",
     "agent_import_candidates",
     "capture_last_typed",
+    "source_pending_changes",
+    "apply_source_updates",
 ];
 
 #[cfg(test)]

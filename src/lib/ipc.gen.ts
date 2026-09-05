@@ -429,6 +429,27 @@ async captureLastTyped(name: string | null, maxChars: number | null) : Promise<R
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Prompts whose cached copy differs from what the app has loaded.
+ * 
+ * The startup refresh updates each source's cache but does not reload the
+ * library, so this is what lets the UI surface "3 prompts changed" and offer
+ * to apply, rather than a third party's edits appearing mid-demo unannounced.
+ */
+async sourcePendingChanges() : Promise<PendingChange[]> {
+    return await TAURI_INVOKE("source_pending_changes");
+},
+/**
+ * Adopt the cached source updates: reload the library and reindex.
+ */
+async applySourceUpdates() : Promise<Result<number, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("apply_source_updates") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -499,6 +520,13 @@ export type AppConfig = {
  */
 "text-field-guard": boolean; 
 /**
+ * Allow `${{ git("rev-parse --short HEAD") }}` in prompt bodies (§6.3).
+ * Off by default; read-only subcommands only; never applied to prompts
+ * from a remote source. `shell()` is not implemented — see
+ * `prompts::expressions`.
+ */
+"allow-git-expressions": boolean; 
+/**
  * Which screen the picker opens on.
  */
 "picker-display": PickerDisplay; 
@@ -563,6 +591,35 @@ export type NewlineMode =
  * A bare Enter. Only safe where Enter does not submit (plain editors).
  */
 "plain"
+/**
+ * A repository's own description of the prompt pack it publishes.
+ * 
+ * Entirely optional — a repo of loose `.pp.md` files works with no manifest
+ * at all. Its job is to let a pack name itself, point at its own
+ * subdirectory, and refuse to load into an app that is too old to understand
+ * it (a pack using a feature this build lacks would otherwise fail in a
+ * confusing, per-prompt way).
+ */
+export type PackManifest = { name: string | null; description: string | null; 
+/**
+ * Subdirectory holding the prompts. Used when the source entry doesn't
+ * name one of its own.
+ */
+subdir: string | null; 
+/**
+ * Minimum Prompt Player version this pack needs.
+ */
+"min-app-version": string | null }
+/**
+ * One prompt-level difference between a source's cache on disk and the
+ * prompts the app currently has loaded.
+ */
+export type PendingChange = { promptId: string; 
+/**
+ * Prompt name, from whichever side has it.
+ */
+name: string; kind: PendingKind }
+export type PendingKind = "added" | "removed" | "changed"
 /**
  * Which display the picker opens on.
  */
@@ -659,7 +716,16 @@ options: string[];
  * Default text for `${1:default}`. `None` for a bare `$1`.
  */
 default: string | null }
-export type SaveConfigOutcome = { path: string; restartRequiredForHotkeys: boolean }
+export type SaveConfigOutcome = { path: string; 
+/**
+ * True when the global chords were re-registered as part of this save.
+ */
+hotkeysRebound: boolean; 
+/**
+ * Chords the OS refused (already claimed by another app). Non-fatal:
+ * every other binding still took effect.
+ */
+hotkeyWarnings: string[] }
 /**
  * One scope filter from §4.2: app(s), window-title regex, url regex, time-of-day.
  */
@@ -733,6 +799,10 @@ export type SourceStatus = { id: string; repo: string; gitRef: string | null; su
  * Present once the source has been fetched at least once.
  */
 manifest: SourceManifest | null; 
+/**
+ * The repo's own `promptplayer-pack.yaml`, if it publishes one.
+ */
+pack: PackManifest | null; 
 /**
  * Web URL for the "open on GitHub" affordance.
  */

@@ -370,6 +370,8 @@ pub fn run() {
             commands::library::import_agent_prompts,
             commands::library::agent_import_candidates,
             commands::library::capture_last_typed,
+            commands::sources::source_pending_changes,
+            commands::sources::apply_source_updates,
         ])
         .setup(move |app| {
             // Tray icon — left-click toggles the WiFi-style stay-open popover.
@@ -387,13 +389,7 @@ pub fn run() {
             //   variants (light/dark) and pick the right one at startup based
             //   on the current `SystemUsesLightTheme` registry value, then
             //   spawn a watcher that swaps the icon on theme change.
-            #[cfg(not(target_os = "windows"))]
-            const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../icons/tray-icon.png");
-            #[cfg(target_os = "windows")]
-            let tray_icon_bytes: &[u8] = crate::platform::windows::pick_tray_icon_bytes();
-            #[cfg(not(target_os = "windows"))]
-            let tray_icon_bytes: &[u8] = TRAY_ICON_BYTES;
-            let tray_image = tauri::image::Image::from_bytes(tray_icon_bytes)
+            let tray_image = tauri::image::Image::from_bytes(tray_icon_bytes())
                 .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(tray_image)
@@ -566,10 +562,32 @@ pub fn run() {
                                 }
                             }
                         }
-                        if changed {
-                            reload_library(&ctx_for_sources);
-                            reindex_after_mutation(&app_for_sources, &ctx_for_sources);
+                        if !changed {
+                            return;
                         }
+                        // Caches are updated, but the library is deliberately
+                        // NOT reloaded: a third party's edits must not appear
+                        // in a live (possibly armed) app unannounced. Surface
+                        // the count and let the user apply it — see
+                        // `commands::sources::apply_source_updates`.
+                        let cfg = ctx_for_sources.config.get();
+                        let pending = crate::sources::pending_changes(
+                            &cfg.sources,
+                            &cfg.enabled_remote,
+                            &ctx_for_sources.prompts.snapshot(),
+                        );
+                        if pending.is_empty() {
+                            return;
+                        }
+                        tracing::info!(
+                            "{} prompt change(s) available from sources — not applied automatically",
+                            pending.len()
+                        );
+                        use tauri::Emitter;
+                        let _ = app_for_sources.emit(
+                            "sources-updated",
+                            serde_json::json!({ "pending": pending.len() }),
+                        );
                     });
                 }
             }
@@ -612,6 +630,25 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// The tray icon bytes for this platform.
+///
+/// macOS gets a monochrome template glyph that AppKit tints to match the menu
+/// bar; Windows has no template concept, so it picks a pre-rendered light or
+/// dark variant from the current system theme. Baked in with `include_bytes!`
+/// because runtime path resolution differs between `cargo run` and a packaged
+/// bundle. Shared with `tray_flash` so the kill-flash restores exactly the
+/// asset the tray is actually showing.
+pub fn tray_icon_bytes() -> &'static [u8] {
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::pick_tray_icon_bytes()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        include_bytes!("../../icons/tray-icon.png")
+    }
 }
 
 /// Poll the updater endpoint on startup and every 6h. Emits a frontend
@@ -908,6 +945,8 @@ fn generate_typescript_bindings() -> Result<(), String> {
         crate::commands::library::import_agent_prompts,
         crate::commands::library::agent_import_candidates,
         crate::commands::library::capture_last_typed,
+        crate::commands::sources::source_pending_changes,
+        crate::commands::sources::apply_source_updates,
     ]);
 
     // Resolve the workspace root reliably from CARGO_MANIFEST_DIR (baked in
@@ -952,8 +991,25 @@ mod binding_freshness {
             .collect();
         assert!(
             missing.is_empty(),
-            "src/lib/ipc.gen.ts is stale — run a debug launch to regenerate. Missing: {missing:?}"
+            "src/lib/ipc.gen.ts is stale. Regenerate with \
+             `PP_REGEN_BINDINGS=1 cargo test -p prompt-player --lib regenerate_bindings` \
+             (or any debug launch). Missing: {missing:?}"
         );
+    }
+
+    /// Opt-in regeneration, so refreshing the bindings doesn't require
+    /// launching the app on a machine with a display.
+    ///
+    /// Gated behind an env var rather than always-on: a test that rewrites a
+    /// committed source file would "fix" the staleness the test above exists
+    /// to catch, and CI would never see the drift.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn regenerate_bindings() {
+        if std::env::var_os("PP_REGEN_BINDINGS").is_none() {
+            return;
+        }
+        super::generate_typescript_bindings().expect("specta export");
     }
 }
 

@@ -25,6 +25,9 @@ pub fn toggle_armed(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) -> b
 #[specta::specta]
 pub fn kill(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) {
     state.cancel_playback();
+    // §2.7 — same red flash as the global kill-switch, so an abort from the
+    // tray's "Stop typing" row is as visible as one from the hotkey.
+    crate::app::tray_flash::flash_kill(&app);
     telemetry::send(&app, TelemetryEvent::PromptKilled);
 }
 

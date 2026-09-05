@@ -26,8 +26,14 @@ Beyond the stealth-trigger core it now works as a **coding-agent companion**:
 - **Shared sources.** Point at a public GitHub repo of `.pp.md` files; they
   load read-only and stay disabled until you enable them.
 - **Recents.** The palette's default order is frecency, not filesystem order.
-- **Safety.** Refuses to type into password and non-text fields, and can
-  auto-disable itself after a configurable idle period.
+- **Multi-step turns.** Put `<!-- pp:wait 25s -->` in a prompt and it becomes a
+  sequence: the first message is typed and sent, then the follow-up goes in
+  after the pause. The kill-switch reaches it while it waits.
+- **Safety.** Refuses to type into password and non-text fields, flashes the
+  tray icon red when the kill-switch fires, and can auto-disable itself after a
+  configurable idle period.
+- **Rebindable.** Every global hotkey can be changed in `promptplayer.yaml` and
+  takes effect without a restart.
 
 Cross-cutting settings live in `promptplayer.yaml` next to your prompts
 (`§7.2`); the library window's **Companion** tab edits that same file.

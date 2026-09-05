@@ -137,6 +137,11 @@ pub struct AppConfig {
     /// Refuse to type when the focused element is a password field or not
     /// editable at all (§11 password-field heuristic).
     pub text_field_guard: bool,
+    /// Allow `${{ git("rev-parse --short HEAD") }}` in prompt bodies (§6.3).
+    /// Off by default; read-only subcommands only; never applied to prompts
+    /// from a remote source. `shell()` is not implemented — see
+    /// `prompts::expressions`.
+    pub allow_git_expressions: bool,
     /// Which screen the picker opens on.
     pub picker_display: PickerDisplay,
     /// Extra RDP client identifiers, merged with the built-in list (§9.3).
@@ -172,6 +177,7 @@ impl Default for AppConfig {
             auto_disarm_minutes: 0,
             newline_mode: NewlineMode::default(),
             text_field_guard: true,
+            allow_git_expressions: false,
             picker_display: PickerDisplay::default(),
             rdp_clients: Vec::new(),
             setlist: Vec::new(),

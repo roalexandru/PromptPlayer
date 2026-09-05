@@ -54,8 +54,13 @@ fn resolve(configured: Option<&String>, default: Shortcut, label: &str) -> Short
     }
 }
 
-/// The global chords in effect this session.
-struct Globals {
+/// The global chords in effect right now.
+///
+/// Held behind an `RwLock` on `AppContext` rather than captured by the handler
+/// closure, so a rebind from `promptplayer.yaml` can take effect without a
+/// relaunch: `reregister_globals` swaps this and re-registers with the OS.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Globals {
     arm: Shortcut,
     picker: Shortcut,
     kill: Shortcut,
@@ -66,7 +71,32 @@ struct Globals {
     slower: Shortcut,
 }
 
-fn resolve_globals(cfg: &AppConfig) -> Globals {
+impl Globals {
+    /// Every chord, paired with a label for the soft-fail registration log.
+    fn labelled(&self) -> [(Shortcut, &'static str); 8] {
+        [
+            (self.arm, "arm/disarm"),
+            (self.picker, "command palette"),
+            (self.kill, "kill-switch"),
+            (self.panic, "panic-reset"),
+            (self.next_cue, "next cue"),
+            (self.pause, "pause/resume"),
+            (self.faster, "faster"),
+            (self.slower, "slower"),
+        ]
+    }
+}
+
+impl Default for Globals {
+    fn default() -> Self {
+        resolve_globals(&AppConfig::default())
+    }
+}
+
+/// Shared handle to the chords currently registered.
+pub type GlobalHotkeys = std::sync::Arc<parking_lot::RwLock<Globals>>;
+
+pub fn resolve_globals(cfg: &AppConfig) -> Globals {
     let arm_default = Shortcut::new(Some(Modifiers::SHIFT | PRIMARY), Code::KeyP);
     // ⌥⌘\ on mac, Ctrl+Alt+\ on Windows — free on stock OS, not used by major IDEs.
     let picker_default = Shortcut::new(Some(Modifiers::ALT | PRIMARY), Code::Backslash);
@@ -117,17 +147,9 @@ pub fn register(
     ctx: AppContext,
     fire: FireService,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let g = resolve_globals(&ctx.config.get());
-    let Globals {
-        arm: shortcut_arm,
-        picker: shortcut_picker,
-        kill: shortcut_kill,
-        panic: shortcut_panic,
-        next_cue: shortcut_next_cue,
-        pause: shortcut_pause,
-        faster: shortcut_faster,
-        slower: shortcut_slower,
-    } = g;
+    // Adopt whatever the config resolved to, then let the handler read the
+    // shared copy on every keypress so a later rebind needs no restart.
+    *ctx.globals.write() = resolve_globals(&ctx.config.get());
 
     let app_handle = app.handle().clone();
     let ctx_for_handler = ctx.clone();
@@ -139,18 +161,32 @@ pub fn register(
                 if event.state() != ShortcutState::Pressed {
                     return;
                 }
-                if shortcut == &shortcut_arm {
+                // Snapshot the current bindings; `Globals` is `Copy`, so this
+                // is a cheap read that can't hold the lock across a fire.
+                let g = *ctx_for_handler.globals.read();
+                let shortcut_arm = &g.arm;
+                let shortcut_picker = &g.picker;
+                let shortcut_kill = &g.kill;
+                let shortcut_panic = &g.panic;
+                let shortcut_next_cue = &g.next_cue;
+                let shortcut_pause = &g.pause;
+                let shortcut_faster = &g.faster;
+                let shortcut_slower = &g.slower;
+                if shortcut == shortcut_arm {
                     let new = ctx_for_handler.state.toggle_armed();
                     tracing::info!("hotkey arm → enabled={}", new);
                     refresh_tray_popup(&app_handle);
                     telemetry::send(&app_handle, TelemetryEvent::ArmToggled { armed: new });
-                } else if shortcut == &shortcut_picker {
+                } else if shortcut == shortcut_picker {
                     summon_picker(&app_handle, &ctx_for_handler);
-                } else if shortcut == &shortcut_kill {
+                } else if shortcut == shortcut_kill {
                     tracing::warn!("KILL-SWITCH invoked");
                     ctx_for_handler.state.cancel_playback();
+                    // §2.7 — the only feedback that an abort landed, since
+                    // cancellation is otherwise silent by design.
+                    crate::app::tray_flash::flash_kill(&app_handle);
                     telemetry::send(&app_handle, TelemetryEvent::PromptKilled);
-                } else if shortcut == &shortcut_panic {
+                } else if shortcut == shortcut_panic {
                     tracing::warn!("PANIC-RESET invoked");
                     ctx_for_handler.state.cancel_playback();
                     ctx_for_handler.state.set_armed(false);
@@ -161,8 +197,9 @@ pub fn register(
                     if let Some(w) = app_handle.get_webview_window("picker") {
                         let _ = w.hide();
                     }
+                    crate::app::tray_flash::flash_kill(&app_handle);
                     refresh_tray_popup(&app_handle);
-                } else if shortcut == &shortcut_next_cue {
+                } else if shortcut == shortcut_next_cue {
                     // One key, next thing. Under stage pressure recall fails
                     // before dexterity does, so this is the gesture the picker
                     // can't replace.
@@ -174,15 +211,15 @@ pub fn register(
                         Ok(None) => tracing::info!("next-cue pressed but the setlist is empty"),
                         Err(e) => tracing::warn!("next-cue failed: {}", e),
                     }
-                } else if shortcut == &shortcut_pause {
+                } else if shortcut == shortcut_pause {
                     match ctx_for_handler.state.toggle_pause() {
                         Some(true) => tracing::info!("playback PAUSED"),
                         Some(false) => tracing::info!("playback RESUMED"),
                         None => tracing::debug!("pause pressed with nothing playing"),
                     }
                     refresh_tray_popup(&app_handle);
-                } else if shortcut == &shortcut_faster || shortcut == &shortcut_slower {
-                    let faster = shortcut == &shortcut_faster;
+                } else if shortcut == shortcut_faster || shortcut == shortcut_slower {
+                    let faster = shortcut == shortcut_faster;
                     let factor = if faster {
                         crate::typer::SPEED_STEP
                     } else {
@@ -210,29 +247,56 @@ pub fn register(
             .build(),
     )?;
 
+    register_current(app.handle(), &ctx);
+    Ok(())
+}
+
+/// Register the chords in `ctx.globals` with the OS.
+///
+/// Soft-fails per chord: on Windows `RegisterHotKey` rejects an
+/// already-claimed combo (an installed app owns the same chord), and a single
+/// conflict must not cost us the other seven. Returns the human-readable
+/// failures so a rebind can report them.
+fn register_current(app: &AppHandle, ctx: &AppContext) -> Vec<String> {
     let gs = app.global_shortcut();
-    // Register globals with a soft-fail: on Windows, RegisterHotKey rejects
-    // already-claimed combos (e.g. an installed app owns the same chord). Log
-    // and continue so a single conflict doesn't kill the others.
-    for (sc, label) in [
-        (shortcut_arm, "arm/disarm"),
-        (shortcut_picker, "command palette"),
-        (shortcut_kill, "kill-switch"),
-        (shortcut_panic, "panic-reset"),
-        (shortcut_next_cue, "next cue"),
-        (shortcut_pause, "pause/resume"),
-        (shortcut_faster, "faster"),
-        (shortcut_slower, "slower"),
-    ] {
+    let mut failures = Vec::new();
+    for (sc, label) in ctx.globals.read().labelled() {
         if let Err(e) = gs.register(sc) {
             tracing::warn!(
                 "global shortcut '{}' failed to register: {} — likely claimed by another app",
                 label,
                 e
             );
+            failures.push(format!("{label} is already claimed by another app"));
         }
     }
-    Ok(())
+    failures
+}
+
+/// Re-resolve the global chords from the current config and swap them live.
+///
+/// Without this a rebind in `promptplayer.yaml` needed a relaunch, because the
+/// chords were baked into the handler closure at startup. Returns the chords
+/// the OS refused (see `register_current`).
+pub fn reregister_globals(app: &AppHandle, ctx: &AppContext) -> Vec<String> {
+    let next = resolve_globals(&ctx.config.get());
+    let previous = *ctx.globals.read();
+    if next == previous {
+        return Vec::new();
+    }
+    let gs = app.global_shortcut();
+    for (sc, label) in previous.labelled() {
+        if let Err(e) = gs.unregister(sc) {
+            // Not fatal: an unregister failure just means the OS never had it
+            // (it lost the original registration race), and re-registering the
+            // same chord below would then be a no-op anyway.
+            tracing::debug!("unregistering '{}' failed: {}", label, e);
+        }
+    }
+    *ctx.globals.write() = next;
+    let failures = register_current(app, ctx);
+    tracing::info!("global hotkeys re-registered from config");
+    failures
 }
 
 fn summon_picker(app: &AppHandle, ctx: &AppContext) {

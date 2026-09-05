@@ -24,6 +24,9 @@ import {
   type PromptStop,
   type PromptOrigin,
   type AgentImportSummary,
+  type PackManifest,
+  type PendingChange,
+  type PendingKind,
   type Result,
 } from "./ipc.gen";
 
@@ -46,6 +49,9 @@ export type {
   PromptStop,
   PromptOrigin,
   AgentImportSummary,
+  PackManifest,
+  PendingChange,
+  PendingKind,
 };
 
 /** Delivery mode for a picker selection (§5.3 modifier-on-Enter). */
@@ -148,6 +154,8 @@ export const ipc = {
   setRemotePromptEnabled: (promptId: string, enabled: boolean) =>
     unwrap(commands.setRemotePromptEnabled(promptId, enabled)),
   forkPrompt: (promptId: string) => unwrap(commands.forkPrompt(promptId)),
+  sourcePendingChanges: () => commands.sourcePendingChanges(),
+  applySourceUpdates: () => unwrap(commands.applySourceUpdates()),
   // agent-prompt import (.claude/commands, Cursor rules, …)
   importAgentPrompts: (dir: string) => unwrap(commands.importAgentPrompts(dir)),
   agentImportCandidates: () => commands.agentImportCandidates(),

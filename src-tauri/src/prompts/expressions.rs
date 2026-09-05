@@ -15,6 +15,7 @@
 //! are evaluated only when their slot is reached during typing.
 
 use chrono::Local;
+use rquickjs::function::Func;
 use rquickjs::{Context, Ctx, Error as QuickJsError, Runtime};
 use serde::Serialize;
 use std::time::{Duration, Instant};
@@ -30,8 +31,113 @@ pub struct ExprContext {
     pub git_branch: Option<String>,
     pub repo_name: Option<String>,
     pub repo_root: Option<String>,
-    /// If true, allow `git()` and `shell()` helpers. Off by default.
-    pub allow_shell: bool,
+    /// Allow the `git()` helper. Off by default, and forced off for prompts
+    /// from a remote source — see the note on `install_git_helper`.
+    pub allow_git: bool,
+}
+
+/// Read-only `git` subcommands the `git()` helper will run.
+///
+/// §6.3 lists `git()` and `shell()` as opt-in escape hatches. `git()` is the
+/// one with a real use case for an agent companion ("the repo is on commit
+/// ${{ git("rev-parse --short HEAD") }}"), and an allowlist of read-only
+/// subcommands makes it something I can reason about.
+///
+/// `shell()` is deliberately **not** implemented. Arbitrary command execution
+/// driven by a prompt file is a different class of feature, and the app now
+/// loads prompts from remote repositories; the two do not belong in the same
+/// binary without a much louder consent step than a YAML key.
+const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
+    "rev-parse",
+    "branch",
+    "status",
+    "log",
+    "describe",
+    "diff",
+    "show",
+    "remote",
+    "config",
+    "tag",
+    "symbolic-ref",
+];
+
+/// Cap on `git()` output pasted into a prompt body, and on how long it may run.
+const GIT_MAX_OUTPUT: usize = 8 * 1024;
+const GIT_TIMEOUT_SECS: u64 = 5;
+
+/// Split a `git()` argument string into arguments, rejecting anything that
+/// isn't a plain token.
+///
+/// No shell is involved (`Command` takes an argv), so quoting and expansion
+/// don't apply — but rejecting shell metacharacters anyway keeps the helper's
+/// contract obvious to anyone reading a prompt file.
+fn parse_git_args(raw: &str) -> Result<Vec<String>, String> {
+    let args: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
+    let Some(sub) = args.first() else {
+        return Err("git() needs a subcommand".into());
+    };
+    if !GIT_ALLOWED_SUBCOMMANDS.contains(&sub.as_str()) {
+        return Err(format!(
+            "git() only runs read-only subcommands ({}); got {sub:?}",
+            GIT_ALLOWED_SUBCOMMANDS.join(", ")
+        ));
+    }
+    if let Some(bad) = args
+        .iter()
+        .find(|a| a.contains(['|', ';', '&', '`', '$', '<', '>', '\n']))
+    {
+        return Err(format!("git() argument {bad:?} contains a shell character"));
+    }
+    // `-c key=value` can change git's behaviour arbitrarily (including
+    // `core.pager`, which runs a command), and `--upload-pack`/`--exec` style
+    // flags run helpers. Neither belongs in a read-only helper.
+    // Prefix matches, not equality: git accepts both `--config-env x` and
+    // `--config-env=x`, and an exact-match check let the latter straight
+    // through (which is how the test for this caught my own allowlist).
+    const DENIED_FLAG_PREFIXES: &[&str] =
+        &["--exec", "--upload-pack", "--receive-pack", "--config-env"];
+    if let Some(bad) = args.iter().find(|a| {
+        *a == "-c" || a.starts_with("-c=") || DENIED_FLAG_PREFIXES.iter().any(|p| a.starts_with(p))
+    }) {
+        return Err(format!("git() argument {bad:?} is not allowed"));
+    }
+    Ok(args)
+}
+
+/// Run an allowlisted `git` command in `repo_root` and return its stdout.
+fn run_git(repo_root: &str, raw: &str) -> Result<String, String> {
+    let args = parse_git_args(raw)?;
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(&args)
+        .current_dir(repo_root)
+        // Never let git prompt for anything: an expression evaluated mid-demo
+        // must not be able to block on a credential or editor prompt.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_PAGER", "cat")
+        .stdin(std::process::Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        // Don't flash a console window on top of the demo.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let start = Instant::now();
+    let out = cmd.output().map_err(|e| format!("git: {e}"))?;
+    if start.elapsed() > Duration::from_secs(GIT_TIMEOUT_SECS) {
+        return Err("git took too long".into());
+    }
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("git {}: {}", args.join(" "), err.trim()));
+    }
+    let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.len() > GIT_MAX_OUTPUT {
+        text.truncate(GIT_MAX_OUTPUT);
+        text.push('…');
+    }
+    Ok(text)
 }
 
 #[derive(Debug, thiserror::Error, Serialize)]
@@ -163,12 +269,41 @@ pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
     let deadline = Instant::now() + EVAL_BUDGET;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
     let started = Instant::now();
+    let git_root = ctx.allow_git.then(|| ctx.repo_root.clone()).flatten();
     context.with(|js| {
+        install_git_helper(&js, git_root)
+            .map_err(|e| map_quickjs_error(&js, e, started, deadline))?;
         js.eval::<(), _>(prelude)
             .map_err(|e| map_quickjs_error(&js, e, started, deadline))?;
         js.eval::<String, _>(eval_script)
             .map_err(|e| map_quickjs_error(&js, e, started, deadline))
     })
+}
+
+/// Bind `git(args)` into the sandbox.
+///
+/// Three conditions all have to hold before it runs anything: the config opts
+/// in (`allow-git-expressions`), the prompt is local (a remote repository does
+/// not get to run commands on the viewer's machine), and a repository root was
+/// actually resolved. When any of them fails the binding still exists but
+/// returns an explanatory string — a prompt that silently produced an empty
+/// commit id mid-demo would be worse than one that says why.
+fn install_git_helper(js: &Ctx<'_>, repo_root: Option<String>) -> Result<(), QuickJsError> {
+    let f = move |raw: String| -> String {
+        let Some(root) = repo_root.as_deref() else {
+            return "[git() is off: set allow-git-expressions in promptplayer.yaml, \
+                    and note it never runs for prompts from a remote source]"
+                .to_string();
+        };
+        match run_git(root, &raw) {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!("git() failed: {}", e);
+                format!("[git error: {e}]")
+            }
+        }
+    };
+    js.globals().set("git", Func::from(f))
 }
 
 fn map_quickjs_error(
@@ -279,6 +414,122 @@ pub fn expand_expressions(body: &str, ctx: &ExprContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── git() helper ──────────────────────────────────────────────────────
+
+    #[test]
+    fn git_args_allow_read_only_subcommands() {
+        assert_eq!(
+            parse_git_args("rev-parse --short HEAD").unwrap(),
+            vec!["rev-parse", "--short", "HEAD"]
+        );
+        for ok in [
+            "branch --show-current",
+            "status --porcelain",
+            "log -1 --oneline",
+        ] {
+            assert!(parse_git_args(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn git_args_reject_mutating_subcommands() {
+        // The whole point of the allowlist: a prompt body must not be able to
+        // change the repository it is describing.
+        for bad in [
+            "push origin main",
+            "commit -m x",
+            "reset --hard",
+            "clean -fdx",
+            "checkout .",
+        ] {
+            let err = parse_git_args(bad).unwrap_err();
+            assert!(err.contains("read-only"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn git_args_reject_shell_characters() {
+        for bad in [
+            "log --pretty=$(whoami)",
+            "status; rm -rf /",
+            "log | cat",
+            "show `id`",
+            "log > /tmp/x",
+        ] {
+            assert!(parse_git_args(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn git_args_reject_flags_that_can_run_helpers() {
+        // `-c core.pager=…` and friends turn a read-only subcommand into an
+        // arbitrary command runner.
+        // Both spellings of each flag: git takes `--flag value` and
+        // `--flag=value`, and only checking one form leaves the other open.
+        for bad in [
+            "-c core.pager=sh log",
+            "log --exec=sh",
+            "log --exec sh",
+            "log --upload-pack=sh",
+            "log --upload-pack sh",
+            "log --receive-pack=sh",
+            "log --config-env=x",
+            "log --config-env x",
+        ] {
+            assert!(parse_git_args(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn git_args_reject_an_empty_call() {
+        assert!(parse_git_args("").is_err());
+        assert!(parse_git_args("   ").is_err());
+    }
+
+    #[test]
+    fn git_is_disabled_by_default() {
+        // Default context has `allow_git: false`, so the helper explains
+        // itself rather than silently expanding to nothing.
+        let out = expand_expressions(
+            r#"${{ git("rev-parse --short HEAD") }}"#,
+            &ExprContext::default(),
+        );
+        assert!(out.contains("git() is off"), "{out}");
+        assert!(out.contains("allow-git-expressions"), "{out}");
+    }
+
+    #[test]
+    fn git_runs_against_a_real_repository_when_enabled() {
+        // This repo is a git checkout, so the helper has something to read.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let ctx = ExprContext {
+            repo_root: Some(root),
+            allow_git: true,
+            ..Default::default()
+        };
+        let out = expand_expressions(r#"${{ git("rev-parse --abbrev-ref HEAD") }}"#, &ctx);
+        assert!(!out.is_empty());
+        assert!(!out.contains("git() is off"), "{out}");
+        // Either a branch name or a clear error — never a silent empty string.
+        assert!(out.trim().len() > 1, "{out}");
+    }
+
+    #[test]
+    fn git_refuses_a_mutating_call_even_when_enabled() {
+        let ctx = ExprContext {
+            repo_root: Some(".".into()),
+            allow_git: true,
+            ..Default::default()
+        };
+        let out = expand_expressions(r#"${{ git("push --force") }}"#, &ctx);
+        assert!(out.contains("git error"), "{out}");
+        assert!(out.contains("read-only"), "{out}");
+    }
 
     #[test]
     fn evals_simple_arithmetic() {

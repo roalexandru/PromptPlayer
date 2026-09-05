@@ -8,8 +8,27 @@ use crate::app::context::AppContext;
 use crate::config::SourceSpec;
 use crate::error::{into_ipc, AppError, IpcResult};
 use crate::prompts::Prompt;
-use crate::sources::{self, SourceStatus};
+use crate::sources::{self, PendingChange, SourceStatus};
 use crate::telemetry::{self, TelemetryEvent};
+
+/// Refuse a library-changing source operation while a demo is live.
+///
+/// Swapping prompts out from under an armed app — or one that is mid-playback —
+/// is the one moment where "fetch the latest" is actively harmful: a trigger
+/// the user is about to type could change meaning between keystrokes.
+fn refuse_if_live(ctx: &AppContext) -> Result<(), AppError> {
+    if ctx.state.is_playing() {
+        return Err(AppError::InvalidArg(
+            "a prompt is being typed right now — try again once it finishes".into(),
+        ));
+    }
+    if ctx.state.is_armed() {
+        return Err(AppError::InvalidArg(
+            "triggers are enabled — disable them before changing prompt sources".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[tauri::command]
 #[specta::specta]
@@ -48,6 +67,9 @@ pub async fn add_source(
         enabled: true,
     };
     let ctx_owned = ctx.inner().clone();
+    if let Err(e) = refuse_if_live(&ctx_owned) {
+        return into_ipc(Err(e));
+    }
     if ctx_owned
         .config
         .get()
@@ -88,6 +110,9 @@ pub fn remove_source(
     app: tauri::AppHandle,
     ctx: tauri::State<'_, AppContext>,
 ) -> IpcResult<()> {
+    if let Err(e) = refuse_if_live(ctx.inner()) {
+        return into_ipc(Err(e));
+    }
     let cfg = ctx.config.get();
     let Some(spec) = cfg.sources.iter().find(|s| s.id() == source_id).cloned() else {
         return into_ipc(Err(AppError::InvalidArg(format!(
@@ -116,6 +141,9 @@ pub async fn refresh_sources(
     ctx: tauri::State<'_, AppContext>,
 ) -> IpcResult<Vec<SourceStatus>> {
     let ctx_owned = ctx.inner().clone();
+    if let Err(e) = refuse_if_live(&ctx_owned) {
+        return into_ipc(Err(e));
+    }
     let specs: Vec<SourceSpec> = ctx_owned
         .config
         .get()
@@ -226,4 +254,59 @@ pub fn fork_prompt(
 pub fn reload_with_sources(app: &tauri::AppHandle, ctx: &AppContext) {
     crate::app::setup::reload_library(ctx);
     crate::app::setup::reindex_after_mutation(app, ctx);
+}
+
+/// Prompts whose cached copy differs from what the app has loaded.
+///
+/// The startup refresh updates each source's cache but does not reload the
+/// library, so this is what lets the UI surface "3 prompts changed" and offer
+/// to apply, rather than a third party's edits appearing mid-demo unannounced.
+#[tauri::command]
+#[specta::specta]
+pub fn source_pending_changes(ctx: tauri::State<'_, AppContext>) -> Vec<PendingChange> {
+    let cfg = ctx.config.get();
+    sources::pending_changes(&cfg.sources, &cfg.enabled_remote, &ctx.prompts.snapshot())
+}
+
+/// Adopt the cached source updates: reload the library and reindex.
+#[tauri::command]
+#[specta::specta]
+pub fn apply_source_updates(
+    app: tauri::AppHandle,
+    ctx: tauri::State<'_, AppContext>,
+) -> IpcResult<u32> {
+    if let Err(e) = refuse_if_live(ctx.inner()) {
+        return into_ipc(Err(e));
+    }
+    let pending = {
+        let cfg = ctx.config.get();
+        sources::pending_changes(&cfg.sources, &cfg.enabled_remote, &ctx.prompts.snapshot()).len()
+    };
+    reload_with_sources(&app, ctx.inner());
+    into_ipc(Ok(pending as u32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_operations_are_refused_while_a_demo_is_live() {
+        // Swapping prompts under an armed app is the one moment where "fetch
+        // the latest" is actively harmful.
+        let ctx = AppContext::new();
+        assert!(refuse_if_live(&ctx).is_ok(), "idle is fine");
+
+        ctx.state.set_armed(true);
+        let err = refuse_if_live(&ctx).unwrap_err();
+        assert_eq!(err.kind(), "invalid-arg");
+        assert!(err.to_string().contains("disable them"), "{err}");
+        ctx.state.set_armed(false);
+
+        let _playing = ctx.state.begin_playback().unwrap();
+        let err = refuse_if_live(&ctx).unwrap_err();
+        assert!(err.to_string().contains("being typed right now"), "{err}");
+        ctx.state.end_playback();
+        assert!(refuse_if_live(&ctx).is_ok());
+    }
 }

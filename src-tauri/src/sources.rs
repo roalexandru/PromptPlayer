@@ -40,9 +40,89 @@ const MAX_ARCHIVE_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 /// Cap on extracted prompt files per source.
 const MAX_FILES: usize = 500;
+/// Optional per-repo manifest, read from the archive root.
+const PACK_FILE: &str = "promptplayer-pack.yaml";
+/// Where the pack manifest is cached, next to the source manifest.
+const PACK_CACHE_FILE: &str = ".pp-pack.yaml";
 /// GitHub requires a User-Agent on API requests.
 const USER_AGENT: &str = concat!("PromptPlayer/", env!("CARGO_PKG_VERSION"));
 const API: &str = "https://api.github.com";
+
+/// A repository's own description of the prompt pack it publishes.
+///
+/// Entirely optional — a repo of loose `.pp.md` files works with no manifest
+/// at all. Its job is to let a pack name itself, point at its own
+/// subdirectory, and refuse to load into an app that is too old to understand
+/// it (a pack using a feature this build lacks would otherwise fail in a
+/// confusing, per-prompt way).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct PackManifest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// Subdirectory holding the prompts. Used when the source entry doesn't
+    /// name one of its own.
+    pub subdir: Option<String>,
+    /// Minimum Prompt Player version this pack needs.
+    pub min_app_version: Option<String>,
+}
+
+/// Read the pack manifest out of an archive without extracting anything else.
+///
+/// A separate pass over the same bytes, because the manifest can redirect the
+/// extraction (`subdir:`) and gate it (`min-app-version:`) — both decisions
+/// have to be made before any file is written.
+fn read_pack_manifest(archive: &[u8]) -> Option<PackManifest> {
+    let gz = flate2::read::GzDecoder::new(archive);
+    let mut tar = tar::Archive::new(gz);
+    for entry in tar.entries().ok()? {
+        let mut entry = entry.ok()?;
+        let path = entry.path().ok()?.to_path_buf();
+        let Some(rel) = strip_archive_prefix(&path) else {
+            continue;
+        };
+        if rel.to_string_lossy() != PACK_FILE {
+            continue;
+        }
+        if entry.header().size().unwrap_or(0) > MAX_FILE_BYTES {
+            return None;
+        }
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut buf).ok()?;
+        match serde_yaml::from_str::<PackManifest>(&buf) {
+            Ok(m) => return Some(m),
+            Err(e) => {
+                tracing::warn!("ignoring malformed {}: {}", PACK_FILE, e);
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Check a pack's `min-app-version` against this build.
+///
+/// An unparseable requirement is ignored rather than treated as a block: a
+/// typo in someone else's repo should not be able to lock a user out of their
+/// own prompts.
+fn check_min_version(pack: &PackManifest) -> Result<(), String> {
+    let Some(raw) = pack.min_app_version.as_deref() else {
+        return Ok(());
+    };
+    let Ok(required) = semver::Version::parse(raw.trim()) else {
+        tracing::warn!("ignoring unparseable min-app-version {:?}", raw);
+        return Ok(());
+    };
+    let Ok(current) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return Ok(());
+    };
+    if current < required {
+        return Err(format!(
+            "this pack needs Prompt Player {required} or newer (this is {current})"
+        ));
+    }
+    Ok(())
+}
 
 /// Manifest written into each source's cache directory. Records exactly what
 /// was fetched so a refresh can skip an unchanged commit, and so the UI can
@@ -73,6 +153,8 @@ pub struct SourceStatus {
     pub enabled: bool,
     /// Present once the source has been fetched at least once.
     pub manifest: Option<SourceManifest>,
+    /// The repo's own `promptplayer-pack.yaml`, if it publishes one.
+    pub pack: Option<PackManifest>,
     /// Web URL for the "open on GitHub" affordance.
     pub html_url: String,
 }
@@ -176,6 +258,10 @@ pub fn read_manifest_in(root: &Path, spec: &SourceSpec) -> Option<SourceManifest
 }
 
 pub fn status(spec: &SourceSpec) -> SourceStatus {
+    let pack = crate::config::sources_root()
+        .map(|root| cache_dir_in(&root, spec))
+        .and_then(|dir| std::fs::read_to_string(dir.join(PACK_CACHE_FILE)).ok())
+        .and_then(|raw| serde_yaml::from_str::<PackManifest>(&raw).ok());
     SourceStatus {
         id: spec.id(),
         repo: spec.repo.clone(),
@@ -183,6 +269,7 @@ pub fn status(spec: &SourceSpec) -> SourceStatus {
         subdir: spec.subdir.clone(),
         enabled: spec.enabled,
         manifest: read_manifest(spec),
+        pack,
         html_url: format!("https://github.com/{}", spec.repo),
     }
 }
@@ -384,18 +471,35 @@ pub async fn fetch_into(root: &Path, spec: &SourceSpec) -> Result<FetchOutcome, 
         return Err("archive exceeded the size limit mid-download".into());
     }
 
+    // Pass one: the pack manifest, which can redirect and gate what follows.
+    let pack = read_pack_manifest(&bytes);
+    if let Some(p) = &pack {
+        check_min_version(p)?;
+    }
+    // An explicit `subdir:` on the source entry wins over the pack's, so a
+    // user can always narrow a pack further than its author did.
+    let effective_subdir = spec
+        .subdir
+        .clone()
+        .or_else(|| pack.as_ref().and_then(|p| p.subdir.clone()));
+
     // Replace the cache atomically-ish: extract into a sibling, then swap.
     // A partially-extracted directory must never be loaded as a library.
     let staging = dir.with_extension("staging");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| format!("create {staging:?}: {e}"))?;
-    let count = match extract_prompts(&bytes, &staging, spec.subdir.as_deref()) {
+    let count = match extract_prompts(&bytes, &staging, effective_subdir.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(e);
         }
     };
+    if let Some(p) = &pack {
+        if let Ok(yaml) = serde_yaml::to_string(p) {
+            let _ = std::fs::write(staging.join(PACK_CACHE_FILE), yaml);
+        }
+    }
     let manifest = SourceManifest {
         repo: spec.repo.clone(),
         git_ref: spec.git_ref.clone(),
@@ -472,6 +576,83 @@ pub fn load_cached_in(
         }
     }
     (out, errors)
+}
+
+/// One prompt-level difference between a source's cache on disk and the
+/// prompts the app currently has loaded.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingChange {
+    pub prompt_id: String,
+    /// Prompt name, from whichever side has it.
+    pub name: String,
+    pub kind: PendingKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "kebab-case")]
+pub enum PendingKind {
+    Added,
+    Removed,
+    Changed,
+}
+
+/// Compare each source's cache against the loaded prompt set.
+///
+/// A startup refresh updates the caches but deliberately does not reload the
+/// library — applying a third party's edits to a live, possibly-armed app
+/// without saying so is the wrong default. This is what lets the UI say "3
+/// prompts changed" and offer to apply, and it is computed from disk each time
+/// rather than tracked as state, so it cannot drift out of sync.
+pub fn pending_changes(
+    specs: &[SourceSpec],
+    enabled_ids: &[String],
+    loaded: &[Prompt],
+) -> Vec<PendingChange> {
+    let Some(root) = crate::config::sources_root() else {
+        return Vec::new();
+    };
+    pending_changes_in(&root, specs, enabled_ids, loaded)
+}
+
+/// `pending_changes` against an explicit sources root.
+pub fn pending_changes_in(
+    root: &Path,
+    specs: &[SourceSpec],
+    enabled_ids: &[String],
+    loaded: &[Prompt],
+) -> Vec<PendingChange> {
+    let (disk, _) = load_cached_in(root, specs, enabled_ids);
+    let mut out = Vec::new();
+    let in_memory: Vec<&Prompt> = loaded.iter().filter(|p| p.origin.is_remote()).collect();
+
+    for d in &disk {
+        match in_memory.iter().find(|m| m.id == d.id) {
+            None => out.push(PendingChange {
+                prompt_id: d.id.clone(),
+                name: d.name.clone(),
+                kind: PendingKind::Added,
+            }),
+            Some(m) if m.body != d.body || m.triggers != d.triggers || m.name != d.name => out
+                .push(PendingChange {
+                    prompt_id: d.id.clone(),
+                    name: d.name.clone(),
+                    kind: PendingKind::Changed,
+                }),
+            Some(_) => {}
+        }
+    }
+    for m in &in_memory {
+        if !disk.iter().any(|d| d.id == m.id) {
+            out.push(PendingChange {
+                prompt_id: m.id.clone(),
+                name: m.name.clone(),
+                kind: PendingKind::Removed,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.prompt_id.cmp(&b.prompt_id));
+    out
 }
 
 /// Delete a source's cache directory (called when the user removes a source).
@@ -743,6 +924,168 @@ mod tests {
         let st = status(&spec("org/team-prompts"));
         assert_eq!(st.html_url, "https://github.com/org/team-prompts");
         assert!(st.enabled);
+    }
+
+    // ── pack manifest ─────────────────────────────────────────────────────
+
+    #[test]
+    fn min_version_gate_blocks_a_pack_that_needs_a_newer_build() {
+        let pack = PackManifest {
+            min_app_version: Some("99.0.0".into()),
+            ..Default::default()
+        };
+        let err = check_min_version(&pack).unwrap_err();
+        assert!(err.contains("99.0.0"), "{err}");
+    }
+
+    #[test]
+    fn min_version_gate_allows_an_older_requirement() {
+        let pack = PackManifest {
+            min_app_version: Some("0.0.1".into()),
+            ..Default::default()
+        };
+        assert!(check_min_version(&pack).is_ok());
+    }
+
+    #[test]
+    fn an_unparseable_min_version_is_ignored_not_fatal() {
+        // A typo in someone else's repo must not lock a user out of prompts.
+        for raw in ["not-a-version", "", "v1", "1.x"] {
+            let pack = PackManifest {
+                min_app_version: Some(raw.into()),
+                ..Default::default()
+            };
+            assert!(check_min_version(&pack).is_ok(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn no_manifest_means_no_constraint() {
+        assert!(check_min_version(&PackManifest::default()).is_ok());
+    }
+
+    #[test]
+    fn reads_a_pack_manifest_from_an_archive() {
+        let archive = make_tarball(&[
+            (
+                "promptplayer-pack.yaml",
+                "name: Team prompts\ndescription: Shared demo set\nsubdir: demos\n",
+            ),
+            ("demos/x.pp.md", "---\nname: X\ntriggers: [x]\n---\nb"),
+        ]);
+        let pack = read_pack_manifest(&archive).expect("manifest found");
+        assert_eq!(pack.name.as_deref(), Some("Team prompts"));
+        assert_eq!(pack.subdir.as_deref(), Some("demos"));
+    }
+
+    #[test]
+    fn a_repo_without_a_manifest_is_fine() {
+        let archive = make_tarball(&[("x.pp.md", "---\nname: X\ntriggers: [x]\n---\nb")]);
+        assert!(read_pack_manifest(&archive).is_none());
+    }
+
+    #[test]
+    fn a_malformed_manifest_is_ignored() {
+        let archive = make_tarball(&[
+            ("promptplayer-pack.yaml", "name: [this is not a string\n"),
+            ("x.pp.md", "---\nname: X\ntriggers: [x]\n---\nb"),
+        ]);
+        assert!(read_pack_manifest(&archive).is_none());
+    }
+
+    // ── pending changes ───────────────────────────────────────────────────
+
+    fn loaded_remote(source_id: &str, stem: &str, body: &str) -> Prompt {
+        let raw = format!("---\nname: {stem}\ntriggers: [{stem}]\n---\n{body}");
+        let mut p = crate::prompts::parser::parse_str(&raw, Path::new("x.pp.md")).unwrap();
+        p.id = format!("{source_id}/{stem}");
+        p.origin = crate::prompts::PromptOrigin::Remote {
+            source_id: source_id.to_string(),
+        };
+        p
+    }
+
+    #[test]
+    fn pending_changes_reports_added_changed_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let s = spec("org/pack");
+        let sid = s.id();
+        let cache = cache_dir_in(root, &s);
+        std::fs::create_dir_all(&cache).unwrap();
+        // On disk: `kept` unchanged, `edited` with a new body, `fresh` is new.
+        std::fs::write(
+            cache.join("kept.pp.md"),
+            "---\nname: kept\ntriggers: [kept]\n---\nsame",
+        )
+        .unwrap();
+        std::fs::write(
+            cache.join("edited.pp.md"),
+            "---\nname: edited\ntriggers: [edited]\n---\nNEW BODY",
+        )
+        .unwrap();
+        std::fs::write(
+            cache.join("fresh.pp.md"),
+            "---\nname: fresh\ntriggers: [fresh]\n---\nb",
+        )
+        .unwrap();
+
+        // In memory: `kept` and `edited` (old body), plus a `gone` prompt the
+        // source no longer publishes.
+        let loaded = vec![
+            loaded_remote(&sid, "kept", "same"),
+            loaded_remote(&sid, "edited", "OLD BODY"),
+            loaded_remote(&sid, "gone", "b"),
+            // A local prompt must never appear in a source diff.
+            crate::prompts::parser::parse_str(
+                "---\nname: mine\ntriggers: [mine]\n---\nlocal",
+                Path::new("mine.pp.md"),
+            )
+            .unwrap(),
+        ];
+
+        let changes = pending_changes_in(root, &[s], &[], &loaded);
+        let by_id: std::collections::HashMap<&str, PendingKind> = changes
+            .iter()
+            .map(|c| (c.prompt_id.as_str(), c.kind))
+            .collect();
+        assert_eq!(
+            by_id.get(format!("{sid}/fresh").as_str()),
+            Some(&PendingKind::Added)
+        );
+        assert_eq!(
+            by_id.get(format!("{sid}/edited").as_str()),
+            Some(&PendingKind::Changed)
+        );
+        assert_eq!(
+            by_id.get(format!("{sid}/gone").as_str()),
+            Some(&PendingKind::Removed)
+        );
+        assert!(
+            !by_id.contains_key(format!("{sid}/kept").as_str()),
+            "an unchanged prompt is not a pending change"
+        );
+        assert!(
+            !by_id.contains_key("mine"),
+            "local prompts are not in the diff"
+        );
+    }
+
+    #[test]
+    fn pending_changes_is_empty_when_the_cache_matches_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let s = spec("org/insync");
+        let sid = s.id();
+        let cache = cache_dir_in(root, &s);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("a.pp.md"),
+            "---\nname: a\ntriggers: [a]\n---\nbody",
+        )
+        .unwrap();
+        let loaded = vec![loaded_remote(&sid, "a", "body")];
+        assert!(pending_changes_in(root, &[s], &[], &loaded).is_empty());
     }
 
     #[test]

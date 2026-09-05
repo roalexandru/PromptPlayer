@@ -69,7 +69,12 @@ Frontend `src/` is mounted through per-window HTML entry points at repo root:
     long-lived `Arc` (state, prompts, matcher, undo, focus, search, rdp,
     hotkeys, **power**).
   - `shortcuts.rs` — global shortcuts, `rebuild_prompt_hotkeys`,
-    `refresh_tray_popup`.
+    `refresh_tray_popup`. The chords live in `AppContext::globals` (an
+    `RwLock<Globals>`) rather than being captured by the handler closure, so
+    `reregister_globals` can rebind them from config without a relaunch.
+  - `tray_flash.rs` — §2.7's red tray flash on kill. Derives the red icon from
+    the baked-in tray asset at runtime, so it follows the per-platform icon
+    choice automatically.
   - `fire.rs` — `FireService`, the typing pipeline (guard → gather context →
     expand → schedule → inject). `FireRequest` bundles the per-fire inputs.
   - `lifecycle.rs` — window close-to-hide / focus-loss handlers.
@@ -102,6 +107,11 @@ Frontend `src/` is mounted through per-window HTML entry points at repo root:
   (reads `.git/HEAD`, follows worktree `gitdir:` files).
 - `prompts/agent_import.rs` — convert agent prompt files into `.pp.md`
   prompts. `$ARGUMENTS` becomes a `${1:arguments}` tab stop.
+- `prompts/steps.rs` — multi-step sequences. A `<!-- pp:wait 25s -->` line
+  splits a body into steps; `fire::play_sequence` types each, submits all but
+  the last, and waits between. The wait is a **fixed duration** — the app
+  cannot see the agent's output, and §14 rules out the injection tricks that
+  would let it.
 - `power/` — **"Keep Awake"** controller (`PowerManager`): inhibits display
   sleep / screensaver / idle system sleep. macOS = IOKit
   `PreventUserIdleDisplaySleep` assertion; Windows = `SetThreadExecutionState`
@@ -251,6 +261,17 @@ checks at startup +15s then every 6h and emits an `update-available`
   terminal targets this app exists for.
 - **Remote prompt ids are namespaced** `<source-id>/<stem>`, and locals are
   pushed into the store first so a trigger collision resolves in their favour.
+- **Source updates are fetched but not applied.** The startup refresh updates
+  each cache and emits `sources-updated`; `sources::pending_changes` diffs disk
+  against the loaded set (stateless, so it can't drift) and
+  `apply_source_updates` adopts it. Any source operation is refused while the
+  app is armed or playing.
+- **`git()` in expressions is triple-gated**: the config opts in, the prompt
+  must be local, and a repo root must resolve. `shell()` is deliberately not
+  implemented — see the note in `prompts::expressions`.
+- **A pack can describe itself** via `promptplayer-pack.yaml` at the repo root
+  (name, description, subdir, `min-app-version`). Read in a first pass over the
+  archive, because it can redirect and gate the extraction that follows.
 - **`play_controlled` may emit one key early** right after a pause or speed
   change; the next iteration rebases. That is deliberate (see the comment).
 
@@ -264,7 +285,13 @@ checks at startup +15s then every 6h and emits an `update-available`
 - `AppConfig` serializes **kebab-case** (it is the user-facing YAML), so the
   generated TS type has kebab keys — the frontend uses bracket access.
 - `src/lib/ipc.gen.ts` regenerates on debug launch; a test asserts the
-  committed file mentions every command, but never rewrites it.
+  committed file mentions every command, but never rewrites it. To refresh it
+  without a display:
+  `PP_REGEN_BINDINGS=1 cargo test -p prompt-player --lib regenerate_bindings`.
+- Tests must never depend on `PROMPT_PLAYER_PROMPTS`: it is process-global and
+  parallel tests raced each other's deleted temp dirs. `PromptStore::with_root`,
+  `ConfigStore::with_path`, `UsageStore::with_path` and the `*_in` helpers in
+  `sources` exist for that.
 - Adding a managed `.manage()` type → edit BOTH the inline block in `run()` and
   `manage_state()` (a test enforces they match). Adding a field to `AppContext`
   is the low-friction alternative (it's already managed).

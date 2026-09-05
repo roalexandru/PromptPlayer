@@ -6,6 +6,7 @@
 //! that need state can take an owned context rather than juggling state
 //! parameters individually.
 
+use crate::app::shortcuts::{GlobalHotkeys, Globals};
 use crate::config::ConfigStore;
 use crate::matcher::MatcherState;
 use crate::picker::{FocusStore, SearchIndex};
@@ -38,6 +39,9 @@ pub struct AppContext {
     pub config: ConfigStore,
     /// Frecency history backing the picker's recents tier.
     pub usage: UsageStore,
+    /// The global chords currently registered. Read by the shortcut handler on
+    /// every press, so a rebind applies without a relaunch.
+    pub globals: GlobalHotkeys,
 }
 
 impl AppContext {
@@ -54,6 +58,7 @@ impl AppContext {
             power: PowerManager::shared(),
             config: ConfigStore::new(),
             usage: UsageStore::new(),
+            globals: Arc::new(RwLock::new(Globals::default())),
         }
     }
 }

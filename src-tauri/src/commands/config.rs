@@ -36,16 +36,27 @@ pub fn get_config(ctx: tauri::State<'_, AppContext>) -> AppConfig {
 #[specta::specta]
 pub fn save_config(
     config: AppConfig,
+    app: tauri::AppHandle,
     ctx: tauri::State<'_, AppContext>,
 ) -> IpcResult<SaveConfigOutcome> {
     let previous = ctx.config.get();
     let hotkeys_changed = hotkeys_differ(&previous, &config);
     ctx.config.set(config.clone());
     match crate::config::save(&config) {
-        Ok(path) => into_ipc(Ok(SaveConfigOutcome {
-            path: path.to_string_lossy().into_owned(),
-            restart_required_for_hotkeys: hotkeys_changed,
-        })),
+        Ok(path) => {
+            // Rebind live. The chords used to be baked into the shortcut
+            // handler at startup, which meant a rebind needed a relaunch.
+            let warnings = if hotkeys_changed {
+                crate::app::shortcuts::reregister_globals(&app, ctx.inner())
+            } else {
+                Vec::new()
+            };
+            into_ipc(Ok(SaveConfigOutcome {
+                path: path.to_string_lossy().into_owned(),
+                hotkeys_rebound: hotkeys_changed,
+                hotkey_warnings: warnings,
+            }))
+        }
         Err(e) => {
             // Roll the in-memory copy back so the UI and disk can't disagree.
             ctx.config.set(previous);
@@ -58,7 +69,11 @@ pub fn save_config(
 #[serde(rename_all = "camelCase")]
 pub struct SaveConfigOutcome {
     pub path: String,
-    pub restart_required_for_hotkeys: bool,
+    /// True when the global chords were re-registered as part of this save.
+    pub hotkeys_rebound: bool,
+    /// Chords the OS refused (already claimed by another app). Non-fatal:
+    /// every other binding still took effect.
+    pub hotkey_warnings: Vec<String>,
 }
 
 fn hotkeys_differ(a: &AppConfig, b: &AppConfig) -> bool {

@@ -29,6 +29,7 @@ use crate::inject::{paste_via_clipboard, EnigoInjector};
 use crate::matcher;
 use crate::prompts::expressions::ExprContext;
 use crate::prompts::placeholders::{expand, PlaceholderContext};
+use crate::prompts::steps::{self, Step};
 use crate::prompts::Prompt;
 use crate::rdp::RdpMode;
 use crate::repo;
@@ -40,6 +41,7 @@ use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 use tauri::AppHandle;
 
 /// Pickup mode used when firing from the picker (Spec §5.3 modifier-on-Enter).
@@ -367,7 +369,9 @@ fn run_fire_pipeline(app: AppHandle, ctx: AppContext, req: FireRequest, control:
         git_branch: repo_ctx.branch.clone(),
         repo_name: repo_ctx.name.clone(),
         repo_root: repo_ctx.root.clone(),
-        ..Default::default()
+        // A remote repository does not get to run commands on this machine,
+        // whatever the config says.
+        allow_git: config.allow_git_expressions && !prompt.origin.is_remote(),
     };
     let body_after_expr = crate::prompts::expressions::expand_expressions(&prompt.body, &expr_ctx);
     let has_expressions = body_after_expr.len() != prompt.body.len();
@@ -469,6 +473,14 @@ fn run_fire_pipeline(app: AppHandle, ctx: AppContext, req: FireRequest, control:
     // the wrong side. Demote paste to the human-typed path in that case.
     if paste_mode && rdp_mode == RdpMode::HostSide {
         tracing::info!("paste demoted to typed flow under RDP host-side mode");
+        paste_mode = false;
+    }
+    // A multi-step sequence is several messages with waits between them; one
+    // clipboard blob cannot be that, so paste is demoted here too.
+    let sequence: Vec<Step> = steps::split_steps(&body);
+    let multi_step = sequence.len() > 1;
+    if paste_mode && multi_step {
+        tracing::info!("paste demoted to typed flow for a multi-step prompt");
         paste_mode = false;
     }
 
@@ -585,7 +597,18 @@ fn run_fire_pipeline(app: AppHandle, ctx: AppContext, req: FireRequest, control:
         // Hold 1ms timer resolution across the whole typed run so per-key
         // sleeps don't quantize to the OS timer period (Windows-only effect).
         let _timer = crate::typer::TimerResolutionGuard::acquire();
-        let outcome = play_controlled(&scheduled, &mut inj, &control, Some(&focus_lost));
+        let outcome = if multi_step {
+            play_sequence(
+                &sequence,
+                &profile,
+                &opts,
+                &mut inj,
+                &control,
+                Some(&focus_lost),
+            )
+        } else {
+            play_controlled(&scheduled, &mut inj, &control, Some(&focus_lost))
+        };
         completed_chars = outcome.visible_chars;
         focus_changed = outcome.focus_changed;
         drop(inj);
@@ -597,7 +620,11 @@ fn run_fire_pipeline(app: AppHandle, ctx: AppContext, req: FireRequest, control:
         // not, so this sits inside the success branch.
         ctx.usage.record(&prompt.id);
         if let Some(form) = typed_form.as_deref() {
-            if profile.send_final_enter {
+            if multi_step {
+                // Every step but the last was submitted, so backspacing would
+                // delete from whatever field has focus now, not un-send them.
+                tracing::debug!("not recording undo: multi-step sequence was submitted");
+            } else if profile.send_final_enter {
                 // The profile pressed Enter to submit the message. Backspace-
                 // undo can't un-send it, and the backspaces would delete from
                 // whatever field now has focus (often empty) — so don't arm
@@ -652,6 +679,99 @@ fn restore_suppressed_commit(ctx: &AppContext, typed_form: &str, commit: char) {
     ctx.matcher.observe_char(commit, now);
 }
 
+/// Play a multi-step sequence: type each step, submit it, wait, type the next.
+///
+/// Each step gets its own freshly-sampled schedule, so the cadence model isn't
+/// reused across a two-minute gap. The wait is polled in short slices rather
+/// than slept through in one go, because the kill-switch and the pause control
+/// have to stay responsive while the sequence is parked — the whole point is
+/// that the user is watching an agent work and may want to intervene.
+fn play_sequence(
+    sequence: &[Step],
+    profile: &crate::typer::Profile,
+    base_opts: &ScheduleOptions,
+    injector: &mut dyn Injector,
+    control: &PlaybackControl,
+    focus_lost: Option<&dyn Fn() -> bool>,
+) -> crate::typer::PlayOutcome {
+    use crate::typer::PlayOutcome;
+    /// Poll slice while parked between steps.
+    const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut visible_chars = 0usize;
+    for (i, step) in sequence.iter().enumerate() {
+        let mut step_profile = *profile;
+        // A step with a follow-up must be sent, or the wait is meaningless.
+        if step.submit() {
+            step_profile.send_final_enter = true;
+        }
+        let mut opts = *base_opts;
+        // The "I'm thinking" beat belongs before the first keystroke only; a
+        // follow-up already had a wait of its own.
+        opts.include_pre_typing_pause = base_opts.include_pre_typing_pause && i == 0;
+
+        let mut rng = ChaCha8Rng::from_entropy();
+        let scheduled = schedule(&step.body, &step_profile, &opts, &mut rng);
+        let outcome = play_controlled(&scheduled, injector, control, focus_lost);
+        visible_chars += outcome.visible_chars;
+        if !outcome.completed {
+            return PlayOutcome {
+                completed: false,
+                visible_chars,
+                focus_changed: outcome.focus_changed,
+            };
+        }
+
+        let Some(wait) = step.wait_after else {
+            continue;
+        };
+        tracing::info!(
+            target: "prompt_player::fire",
+            step = i + 1,
+            of = sequence.len(),
+            wait_ms = wait.as_millis() as u64,
+            "step sent; waiting before the follow-up"
+        );
+        let mut deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            if control.is_cancelled() {
+                injector.release_all_modifiers();
+                return PlayOutcome {
+                    completed: false,
+                    visible_chars,
+                    focus_changed: false,
+                };
+            }
+            if let Some(check) = focus_lost {
+                if check() {
+                    // The user moved to another app mid-wait. Typing the
+                    // follow-up there would be exactly the accident the
+                    // focus guard exists to prevent.
+                    injector.release_all_modifiers();
+                    return PlayOutcome {
+                        completed: false,
+                        visible_chars,
+                        focus_changed: true,
+                    };
+                }
+            }
+            // Pausing means "hold everything", so a pause pushes the deadline
+            // out instead of quietly consuming the wait the author asked for.
+            if control.is_paused() {
+                std::thread::sleep(WAIT_SLICE);
+                deadline += WAIT_SLICE;
+                continue;
+            }
+            std::thread::sleep(WAIT_SLICE.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+    PlayOutcome {
+        completed: true,
+        visible_chars,
+        focus_changed: false,
+    }
+}
+
 struct PlaybackEndGuard {
     state: Arc<crate::state::AppState>,
 }
@@ -694,4 +814,149 @@ fn classify_target_app(ctx: &scopes::ForegroundContext, rdp: RdpMode) -> TargetA
         return TargetAppKind::Native;
     }
     TargetAppKind::Unknown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typer::{Profile, RecordingInjector};
+    use std::sync::atomic::Ordering;
+
+    /// A profile fast enough to keep the sequence tests near-instant, with the
+    /// realism dials that would otherwise add seconds turned off.
+    fn quick_profile() -> Profile {
+        Profile {
+            iki_scale: 0.0,
+            iki_min_ms: 0.0,
+            pause_scale: 0.0,
+            pause_variance_scale: 0.0,
+            typos_enabled: false,
+            burst_enabled: false,
+            rephrase_enabled: false,
+            pre_submit_pause_enabled: false,
+            ..Profile::FAST_PRESENTER
+        }
+    }
+
+    fn no_pause_opts() -> ScheduleOptions {
+        ScheduleOptions {
+            rdp_mode: false,
+            include_pre_typing_pause: false,
+            newline_mode: Default::default(),
+        }
+    }
+
+    /// Reconstruct the typed text from a recording injector.
+    fn typed(inj: &RecordingInjector) -> String {
+        inj.events
+            .iter()
+            .filter_map(|k| match k {
+                Key::Char(c) => Some(*c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sequence_types_every_step_and_submits_all_but_the_last() {
+        let sequence = steps::split_steps("first\n<!-- pp:wait 10ms -->\nsecond");
+        assert_eq!(sequence.len(), 2);
+        let mut inj = RecordingInjector::default();
+        let control = PlaybackControl::new();
+        let outcome = play_sequence(
+            &sequence,
+            &quick_profile(),
+            &no_pause_opts(),
+            &mut inj,
+            &control,
+            None,
+        );
+        assert!(outcome.completed);
+        assert_eq!(typed(&inj), "firstsecond");
+        // Exactly one submitting Enter: after step one, not after step two.
+        let enters = inj
+            .events
+            .iter()
+            .filter(|k| matches!(k, Key::Enter))
+            .count();
+        assert_eq!(enters, 1, "events: {:?}", inj.events);
+    }
+
+    #[test]
+    fn cancelling_during_the_wait_stops_before_the_follow_up() {
+        // The kill-switch has to reach a sequence that is parked between
+        // steps, or a cancelled demo would still type its follow-up.
+        let sequence = steps::split_steps("first\n<!-- pp:wait 30s -->\nsecond");
+        let mut inj = RecordingInjector::default();
+        let control = PlaybackControl::new();
+        let canceller = control.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            canceller.cancel();
+        });
+        let started = Instant::now();
+        let outcome = play_sequence(
+            &sequence,
+            &quick_profile(),
+            &no_pause_opts(),
+            &mut inj,
+            &control,
+            None,
+        );
+        assert!(!outcome.completed);
+        assert_eq!(typed(&inj), "first", "the follow-up must not be typed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancel should not wait out the full 30s: {:?}",
+            started.elapsed()
+        );
+        assert!(inj.modifier_releases > 0, "modifiers released on abort");
+    }
+
+    #[test]
+    fn losing_focus_during_the_wait_abandons_the_follow_up() {
+        let sequence = steps::split_steps("first\n<!-- pp:wait 30s -->\nsecond");
+        let mut inj = RecordingInjector::default();
+        let control = PlaybackControl::new();
+        // Focus is reported lost only once the first step is on screen, so the
+        // abort happens during the wait rather than before any typing.
+        let moved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = moved.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let lost = || moved.load(Ordering::Relaxed);
+        let outcome = play_sequence(
+            &sequence,
+            &quick_profile(),
+            &no_pause_opts(),
+            &mut inj,
+            &control,
+            Some(&lost),
+        );
+        assert!(!outcome.completed);
+        assert!(outcome.focus_changed, "the reason must be reported");
+        assert_eq!(typed(&inj), "first");
+    }
+
+    #[test]
+    fn a_single_step_sequence_is_not_force_submitted() {
+        let sequence = steps::split_steps("just one");
+        let mut inj = RecordingInjector::default();
+        let outcome = play_sequence(
+            &sequence,
+            &quick_profile(),
+            &no_pause_opts(),
+            &mut inj,
+            &PlaybackControl::new(),
+            None,
+        );
+        assert!(outcome.completed);
+        assert_eq!(typed(&inj), "just one");
+        assert!(
+            !inj.events.iter().any(|k| matches!(k, Key::Enter)),
+            "a lone step follows the picker mode, so no implicit Enter"
+        );
+    }
 }

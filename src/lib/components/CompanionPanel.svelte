@@ -9,7 +9,8 @@
   a hand-edit and an in-app edit never disagree.
 -->
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { open as openDirDialog } from "@tauri-apps/plugin-dialog";
   import {
     ipc,
@@ -20,6 +21,7 @@
     type Prompt,
     type NewlineMode,
     type PickerDisplay,
+    type PendingChange,
   } from "$lib/ipc";
 
   interface Props {
@@ -35,6 +37,10 @@
   let sources = $state<SourceStatus[]>([]);
   let setlist = $state<SetlistEntry[]>([]);
   let busy = $state<string | null>(null);
+  // Source updates are fetched at startup but deliberately not applied — a
+  // third party's edits must not appear in a live app unannounced.
+  let pending = $state<PendingChange[]>([]);
+  let unlistenUpdated: UnlistenFn | null = null;
 
   // Add-source form.
   let newRepo = $state("");
@@ -70,12 +76,41 @@
       config = await ipc.getConfig();
       sources = await ipc.listSources();
       setlist = await ipc.getSetlist();
+      pending = await ipc.sourcePendingChanges();
     } catch (e) {
       onError(`Couldn't read configuration — ${fmtErr(e)}`);
     }
   }
 
-  onMount(loadAll);
+  onMount(async () => {
+    await loadAll();
+    // The backend emits this after a startup refresh finds new commits.
+    unlistenUpdated = await listen("sources-updated", async () => {
+      pending = await ipc.sourcePendingChanges();
+    });
+  });
+
+  onDestroy(() => unlistenUpdated?.());
+
+  async function applyUpdates() {
+    busy = "apply";
+    try {
+      const n = await ipc.applySourceUpdates();
+      pending = await ipc.sourcePendingChanges();
+      await onLibraryChanged();
+      onNotice(n === 1 ? "Applied 1 prompt change" : `Applied ${n} prompt changes`);
+    } catch (e) {
+      onError(fmtErr(e));
+    } finally {
+      busy = null;
+    }
+  }
+
+  function changeLabel(kind: PendingChange["kind"]): string {
+    if (kind === "added") return "new";
+    if (kind === "removed") return "gone";
+    return "edited";
+  }
 
   async function persist(patch: Partial<AppConfig>) {
     if (!config) return;
@@ -83,11 +118,16 @@
     try {
       const outcome = await ipc.saveConfig(next);
       config = next;
-      onNotice(
-        outcome.restartRequiredForHotkeys
-          ? "Saved. Hotkey changes take effect after a restart."
-          : "Saved to promptplayer.yaml",
-      );
+      if (outcome.hotkeyWarnings.length > 0) {
+        // Non-fatal: the other bindings took effect.
+        onError(`Saved, but ${outcome.hotkeyWarnings.join("; ")}.`);
+      } else {
+        onNotice(
+          outcome.hotkeysRebound
+            ? "Saved — hotkeys rebound, no restart needed."
+            : "Saved to promptplayer.yaml",
+        );
+      }
     } catch (e) {
       onError(`Couldn't save configuration — ${fmtErr(e)}`);
       await loadAll();
@@ -131,6 +171,7 @@
     busy = "refresh";
     try {
       sources = await ipc.refreshSources();
+      pending = await ipc.sourcePendingChanges();
       await onLibraryChanged();
       onNotice("Sources refreshed");
     } catch (e) {
@@ -304,6 +345,34 @@
           until you enable them, and a remote <code>hotkey:</code> is ignored.
         </span>
       </div>
+      {#if pending.length > 0}
+        <div class="pending" role="status">
+          <div class="pending-head">
+            <strong>
+              {pending.length === 1
+                ? "1 prompt changed upstream"
+                : `${pending.length} prompts changed upstream`}
+            </strong>
+            <button onclick={applyUpdates} disabled={busy === "apply"}>
+              {busy === "apply" ? "Applying…" : "Apply"}
+            </button>
+          </div>
+          <ul class="pending-list">
+            {#each pending.slice(0, 8) as change (change.promptId)}
+              <li>
+                <span class="badge">{changeLabel(change.kind)}</span>
+                {change.name}
+              </li>
+            {/each}
+            {#if pending.length > 8}
+              <li class="more">and {pending.length - 8} more…</li>
+            {/if}
+          </ul>
+          <span class="hint">
+            Fetched, not applied — nothing changes in a live demo until you say so.
+          </span>
+        </div>
+      {/if}
       {#if sources.length > 0}
         <ul class="sources">
           {#each sources as s (s.id)}
@@ -313,7 +382,7 @@
                   class="link"
                   onclick={() => ipc.openExternal(s.htmlUrl)}
                   title="Open on GitHub"
-                >{s.repo}</button>
+                >{s.pack?.name ?? s.repo}</button>
                 {#if s.gitRef}<code class="ref">@{s.gitRef}</code>{/if}
                 {#if s.subdir}<code class="ref">/{s.subdir}</code>{/if}
               </span>
@@ -389,6 +458,20 @@
           onchange={(e) => persist({ "text-field-guard": e.currentTarget.checked })}
         />
         <span class="field-label">Refuse to type into password and non-text fields</span>
+      </label>
+
+      <label class="field checkbox">
+        <input
+          type="checkbox"
+          checked={config["allow-git-expressions"]}
+          onchange={(e) => persist({ "allow-git-expressions": e.currentTarget.checked })}
+        />
+        <span class="field-label">
+          Allow <code>git()</code> in expressions
+          <span class="field-hint">
+            Read-only subcommands only, and never for prompts from a shared source.
+          </span>
+        </span>
       </label>
 
       <label class="field">
@@ -547,5 +630,37 @@
     margin: 0;
     font-size: 12px;
     color: var(--text-secondary, #6b7280);
+  }
+
+  .pending {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--accent, #3b82f6) 12%, transparent);
+    font-size: 12px;
+  }
+  .pending-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .pending-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .pending-list li {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .pending-list .more {
+    opacity: 0.7;
   }
 </style>
