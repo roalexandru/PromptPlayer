@@ -161,6 +161,7 @@ fn main() {
     let opts = ScheduleOptions {
         rdp_mode: args.rdp,
         include_pre_typing_pause: !args.no_pre_typing_pause,
+        newline_mode: Default::default(),
     };
 
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);

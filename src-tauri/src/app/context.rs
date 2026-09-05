@@ -6,6 +6,7 @@
 //! that need state can take an owned context rather than juggling state
 //! parameters individually.
 
+use crate::config::ConfigStore;
 use crate::matcher::MatcherState;
 use crate::picker::{FocusStore, SearchIndex};
 use crate::power::PowerManager;
@@ -13,6 +14,7 @@ use crate::rdp::RdpRegistry;
 use crate::state::AppState;
 use crate::store::PromptStore;
 use crate::undo::UndoLog;
+use crate::usage::UsageStore;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,6 +34,10 @@ pub struct AppContext {
     pub hotkeys: PromptHotkeyMap,
     /// "Keep Awake" controller — inhibits display/screensaver/idle-sleep.
     pub power: Arc<PowerManager>,
+    /// `promptplayer.yaml` (§7.2) — hotkeys, newline mode, sources, setlist.
+    pub config: ConfigStore,
+    /// Frecency history backing the picker's recents tier.
+    pub usage: UsageStore,
 }
 
 impl AppContext {
@@ -46,6 +52,8 @@ impl AppContext {
             rdp: Arc::new(RdpRegistry::new()),
             hotkeys: Arc::new(RwLock::new(HashMap::new())),
             power: PowerManager::shared(),
+            config: ConfigStore::new(),
+            usage: UsageStore::new(),
         }
     }
 }

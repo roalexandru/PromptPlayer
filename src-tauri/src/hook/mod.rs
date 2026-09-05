@@ -566,7 +566,7 @@ mod tests {
             process_event(&modifier_event, &deps);
         }
         assert!(
-            !cancel.load(Ordering::Relaxed),
+            !cancel.is_cancelled(),
             "pure modifiers must not trip the panic ring"
         );
     }

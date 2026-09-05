@@ -27,6 +27,9 @@ pub struct ExprContext {
     pub app_name: Option<String>,
     pub app_bundle: Option<String>,
     pub window_title: Option<String>,
+    pub git_branch: Option<String>,
+    pub repo_name: Option<String>,
+    pub repo_root: Option<String>,
     /// If true, allow `git()` and `shell()` helpers. Off by default.
     pub allow_shell: bool,
 }
@@ -60,6 +63,9 @@ struct Builtins {
     app_name: String,
     app_bundle: String,
     window_title: String,
+    git_branch: String,
+    repo_name: String,
+    repo_root: String,
 }
 
 /// Evaluate one `${{ expr }}` block. The braces should already be stripped.
@@ -77,6 +83,9 @@ pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
         clipboard: ctx.clipboard.clone().unwrap_or_default(),
         selection: ctx.selection.clone().unwrap_or_default(),
         app_name: ctx.app_name.clone().unwrap_or_default(),
+        git_branch: ctx.git_branch.clone().unwrap_or_default(),
+        repo_name: ctx.repo_name.clone().unwrap_or_default(),
+        repo_root: ctx.repo_root.clone().unwrap_or_default(),
         app_bundle: ctx.app_bundle.clone().unwrap_or_default(),
         window_title: ctx.window_title.clone().unwrap_or_default(),
     };
@@ -102,6 +111,15 @@ pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
             bundle: __pp.appBundle,
             windowTitle: __pp.windowTitle,
         }};
+        // Repo context for agent-companion prompts. Empty strings when the
+        // fire had no resolvable checkout, so `${{ repo.branch || "main" }}`
+        // is the idiom for a fallback.
+        const repo = {{
+            name: __pp.repoName,
+            branch: __pp.gitBranch,
+            root: __pp.repoRoot,
+        }};
+        Object.freeze(repo);
         const env = (k) => "";
         const random = () => Math.random();
         function random_choice(arr) {{

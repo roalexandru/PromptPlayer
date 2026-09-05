@@ -25,6 +25,17 @@ pub fn run() {
 
     let ctx = AppContext::new();
 
+    // §7.2 — read `promptplayer.yaml` before anything that depends on it
+    // (hotkeys, commit char, sources, setlist), and the frecency history that
+    // orders the picker.
+    ctx.config.load_from_disk();
+    ctx.usage.load_from_disk();
+    {
+        let cfg = ctx.config.get();
+        ctx.state.set_commit_char(cfg.commit_char());
+        ctx.rdp.extend_from_config(&cfg.rdp_clients);
+    }
+
     // Phase 5: load prompts from the library directory (with hot reload).
     let library_root = library::default_library_root()
         .unwrap_or_else(|| std::env::current_dir().unwrap().join("prompts-examples"));
@@ -68,6 +79,9 @@ pub fn run() {
         } else {
             ctx.prompts.replace_all(loaded);
         }
+        // Merge in any cached remote sources (§7.2). Locals are already in the
+        // store, so they were indexed first and win a trigger collision.
+        merge_cached_sources(&ctx);
         tracing::info!(
             "loaded {} prompt(s) from {:?}",
             ctx.prompts.len(),
@@ -193,22 +207,30 @@ pub fn run() {
             .expect("spawn ax watch thread");
     }
 
+    // Windows counterpart: re-install the low-level hook if Windows drops it
+    // (see `spawn_hook_watchdog` for why that happens silently).
+    #[cfg(target_os = "windows")]
+    spawn_hook_watchdog(
+        ctx.matcher.clone(),
+        ctx.undo.clone(),
+        ctx.state.clone(),
+        on_fire.clone(),
+        on_undo.clone(),
+        on_literal_commit.clone(),
+        on_commit_observed.clone(),
+    );
+
     // Hot-reload watcher: re-load prompts on file changes, rebuild trigger
     // index + per-prompt hotkeys, refresh tray popup.
     match library::watch(&library_root) {
         Ok(watcher) => {
             let ctx2 = ctx.clone();
             let handle2 = app_handle_holder.clone();
-            let root2 = library_root.clone();
             thread::Builder::new()
                 .name("prompt-player-watch".into())
                 .spawn(move || loop {
                     if library::drain_events(&watcher, std::time::Duration::from_millis(500)) {
-                        let (loaded, errs) = library::load_all(&root2);
-                        for e in errs {
-                            tracing::warn!("hot-reload parse: {}", e);
-                        }
-                        ctx2.prompts.replace_all(loaded);
+                        reload_library(&ctx2);
                         rebuild_match_index(&ctx2);
                         if let Some(h) = handle2.read().clone() {
                             shortcuts::rebuild_prompt_hotkeys(&h, &ctx2);
@@ -329,6 +351,25 @@ pub fn run() {
             commands::library::import_prompt,
             commands::library::export_prompt,
             commands::shell::open_external,
+            commands::config::get_config,
+            commands::config::save_config,
+            commands::config::get_setlist,
+            commands::config::set_setlist,
+            commands::config::fire_next_cue,
+            commands::config::reset_setlist,
+            commands::config::playback_status,
+            commands::config::toggle_playback_pause,
+            commands::config::nudge_playback_speed,
+            commands::picker::prompt_stops,
+            commands::sources::list_sources,
+            commands::sources::add_source,
+            commands::sources::remove_source,
+            commands::sources::refresh_sources,
+            commands::sources::set_remote_prompt_enabled,
+            commands::sources::fork_prompt,
+            commands::library::import_agent_prompts,
+            commands::library::agent_import_candidates,
+            commands::library::capture_last_typed,
         ])
         .setup(move |app| {
             // Tray icon — left-click toggles the WiFi-style stay-open popover.
@@ -491,6 +532,48 @@ pub fn run() {
                     .expect("spawn secure-input poll thread");
             }
 
+            // §5.4 — put the picker's capture exclusion in place before the
+            // window is ever composited, rather than relying on the first show.
+            if let Err(e) = crate::picker::prepare_picker(app.handle(), true) {
+                tracing::warn!("picker capture-exclusion setup failed: {e}");
+            }
+
+            // §11 auto-disarm timer (no-op unless configured).
+            spawn_auto_disarm(app.handle().clone(), ctx_for_setup.clone());
+
+            // Refresh remote sources shortly after startup, off the critical
+            // path. Anonymous GitHub requests are capped at 60/hour, so this
+            // asks for the resolved commit first and downloads only on change.
+            {
+                let app_for_sources = app.handle().clone();
+                let ctx_for_sources = ctx_for_setup.clone();
+                if !ctx_for_sources.config.get().sources.is_empty() {
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let specs: Vec<crate::config::SourceSpec> = ctx_for_sources
+                            .config
+                            .get()
+                            .sources
+                            .into_iter()
+                            .filter(|s| s.enabled)
+                            .collect();
+                        let mut changed = false;
+                        for spec in &specs {
+                            match crate::sources::fetch(spec).await {
+                                Ok(outcome) => changed |= outcome.changed(),
+                                Err(e) => {
+                                    tracing::warn!("source {} refresh failed: {}", spec.repo, e)
+                                }
+                            }
+                        }
+                        if changed {
+                            reload_library(&ctx_for_sources);
+                            reindex_after_mutation(&app_for_sources, &ctx_for_sources);
+                        }
+                    });
+                }
+            }
+
             // §13 — auto-update poller. Checks on startup and every 6h.
             // Emits a `update-available` event with `{ version, notes }` when
             // a new release is published; the frontend listens for it on the
@@ -614,6 +697,122 @@ fn copy_bundled_examples(src: &std::path::Path, dst: &std::path::Path) -> usize 
     count
 }
 
+/// Reload every prompt: the local library plus each enabled remote source's
+/// cache. Local prompts are pushed first so they are indexed first, which is
+/// what makes a local trigger win a collision with a remote one.
+pub fn reload_library(ctx: &AppContext) {
+    let Some(root) = library::default_library_root() else {
+        tracing::error!("cannot reload: library root unresolved");
+        return;
+    };
+    let (mut loaded, errs) = library::load_all(&root);
+    for e in errs {
+        tracing::warn!("library parse: {}", e);
+    }
+    let cfg = ctx.config.get();
+    let (remote, remote_errs) = crate::sources::load_cached(&cfg.sources, &cfg.enabled_remote);
+    for e in remote_errs {
+        tracing::warn!("source parse: {}", e);
+    }
+    let remote_count = remote.len();
+    loaded.extend(remote);
+    ctx.prompts.replace_all(loaded);
+    tracing::info!(
+        "library reloaded — {} prompt(s) ({} from sources)",
+        ctx.prompts.len(),
+        remote_count
+    );
+}
+
+/// Append cached remote-source prompts to an already-loaded local library.
+fn merge_cached_sources(ctx: &AppContext) {
+    let cfg = ctx.config.get();
+    if cfg.sources.is_empty() {
+        return;
+    }
+    let (remote, errs) = crate::sources::load_cached(&cfg.sources, &cfg.enabled_remote);
+    for e in errs {
+        tracing::warn!("source parse: {}", e);
+    }
+    if remote.is_empty() {
+        return;
+    }
+    let mut all = ctx.prompts.snapshot();
+    let n = remote.len();
+    all.extend(remote);
+    ctx.prompts.replace_all(all);
+    tracing::info!("merged {} prompt(s) from remote sources", n);
+}
+
+/// §11 — auto-disarm timer. Disarms the app after `auto-disarm-minutes` of
+/// being armed, so a forgotten arm doesn't fire a prompt into a private
+/// message hours later. Off when the setting is 0 (the default).
+fn spawn_auto_disarm(app: AppHandle, ctx: AppContext) {
+    let Some(limit) = ctx.config.get().auto_disarm() else {
+        return;
+    };
+    tracing::info!("auto-disarm after {:?} of being armed", limit);
+    thread::Builder::new()
+        .name("prompt-player-auto-disarm".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            // Never cut off a running playback — disarming mid-prompt would
+            // leave a half-typed body on screen with no explanation.
+            if ctx.state.is_playing() {
+                continue;
+            }
+            let Some(elapsed) = ctx.state.armed_for() else {
+                continue;
+            };
+            if elapsed >= limit {
+                tracing::info!("auto-disarm: armed for {:?}, disarming", elapsed);
+                ctx.state.set_armed(false);
+                shortcuts::refresh_tray_popup(&app);
+                telemetry::send(&app, TelemetryEvent::ArmToggled { armed: false });
+            }
+        })
+        .expect("spawn auto-disarm thread");
+}
+
+/// Windows counterpart to the macOS Accessibility watcher: re-install the
+/// low-level keyboard hook if Windows drops it.
+///
+/// Windows silently unhooks a `WH_KEYBOARD_LL` callback that overruns
+/// `LowLevelHooksTimeout`, and the app has no notification when it happens —
+/// it just stops matching triggers while still showing as armed. macOS had a
+/// respawn watcher for its own failure mode; this closes the same gap here.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_hook_watchdog(
+    matcher: Arc<crate::matcher::MatcherState>,
+    undo: Arc<crate::undo::UndoLog>,
+    app_state: Arc<crate::state::AppState>,
+    on_fire: crate::hook::windows::FireCallback,
+    on_undo: crate::hook::windows::UndoCallback,
+    on_literal_commit: crate::hook::windows::LiteralCommitCallback,
+    on_commit_observed: crate::hook::windows::CommitObservedCallback,
+) {
+    thread::Builder::new()
+        .name("prompt-player-hook-watchdog".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            if app_state.hook_alive() {
+                continue;
+            }
+            tracing::warn!("keyboard hook is not alive — reinstalling");
+            crate::hook::spawn_grabbing_hook(
+                matcher.clone(),
+                undo.clone(),
+                app_state.clone(),
+                on_fire.clone(),
+                on_undo.clone(),
+                on_literal_commit.clone(),
+                on_commit_observed.clone(),
+            );
+        })
+        .expect("spawn hook watchdog thread");
+}
+
 /// Reload the matcher index, per-prompt hotkeys, and tray popup after an
 /// in-app library mutation (save/create/delete/enable/pin/import). The
 /// hot-reload watcher does this on external file edits, but in-app CRUD must
@@ -690,6 +889,25 @@ fn generate_typescript_bindings() -> Result<(), String> {
         crate::commands::library::import_prompt,
         crate::commands::library::export_prompt,
         crate::commands::shell::open_external,
+        crate::commands::config::get_config,
+        crate::commands::config::save_config,
+        crate::commands::config::get_setlist,
+        crate::commands::config::set_setlist,
+        crate::commands::config::fire_next_cue,
+        crate::commands::config::reset_setlist,
+        crate::commands::config::playback_status,
+        crate::commands::config::toggle_playback_pause,
+        crate::commands::config::nudge_playback_speed,
+        crate::commands::picker::prompt_stops,
+        crate::commands::sources::list_sources,
+        crate::commands::sources::add_source,
+        crate::commands::sources::remove_source,
+        crate::commands::sources::refresh_sources,
+        crate::commands::sources::set_remote_prompt_enabled,
+        crate::commands::sources::fork_prompt,
+        crate::commands::library::import_agent_prompts,
+        crate::commands::library::agent_import_candidates,
+        crate::commands::library::capture_last_typed,
     ]);
 
     // Resolve the workspace root reliably from CARGO_MANIFEST_DIR (baked in
@@ -709,6 +927,34 @@ fn generate_typescript_bindings() -> Result<(), String> {
         .map_err(|e| format!("export: {}", e))?;
     tracing::info!("specta exported TS bindings → {:?}", path);
     Ok(())
+}
+
+/// Guard that the committed `src/lib/ipc.gen.ts` covers every command.
+///
+/// Regeneration itself happens on every debug launch (see
+/// `generate_typescript_bindings`); this test deliberately only *reads* the
+/// file, so a stale binding fails CI instead of being silently rewritten by
+/// the test run that was supposed to catch it.
+#[cfg(test)]
+mod binding_freshness {
+    #[test]
+    fn generated_bindings_cover_every_command() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest)
+            .parent()
+            .expect("manifest parent")
+            .join("src/lib/ipc.gen.ts");
+        let raw = std::fs::read_to_string(&path).expect("src/lib/ipc.gen.ts is committed");
+        let missing: Vec<&str> = crate::commands::COMMAND_NAMES
+            .iter()
+            .copied()
+            .filter(|name| !raw.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "src/lib/ipc.gen.ts is stale — run a debug launch to regenerate. Missing: {missing:?}"
+        );
+    }
 }
 
 fn rebuild_match_index(ctx: &AppContext) {

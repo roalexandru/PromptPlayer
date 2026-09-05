@@ -19,6 +19,15 @@ pub enum AppError {
     #[error("could not resolve library root")]
     LibraryRootUnresolved,
 
+    #[error("trigger {trigger:?} is already used by prompt {other_id}")]
+    DuplicateTrigger { trigger: String, other_id: String },
+
+    #[error("prompt {id} comes from a remote source and is read-only — fork it into your library to edit")]
+    ReadOnlyPrompt { id: String },
+
+    #[error("source error: {0}")]
+    Source(String),
+
     #[error("invalid argument: {0}")]
     InvalidArg(String),
 
@@ -70,6 +79,9 @@ impl AppError {
             AppError::PromptNotFound(_) => "prompt-not-found",
             AppError::NoSourcePath { .. } => "no-source-path",
             AppError::LibraryRootUnresolved => "library-root-unresolved",
+            AppError::DuplicateTrigger { .. } => "duplicate-trigger",
+            AppError::ReadOnlyPrompt { .. } => "read-only-prompt",
+            AppError::Source(_) => "source",
             AppError::InvalidArg(_) => "invalid-arg",
             AppError::Parse(_) => "parse",
             AppError::Yaml(_) => "yaml",

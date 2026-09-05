@@ -82,6 +82,8 @@ pub fn create_prompt(
         tags: Vec::new(),
         enabled: true,
         pinned: false,
+        newline_mode: None,
+        origin: Default::default(),
         body: " your new prompt body here.".into(),
         source_path: Some(path.clone()),
     };

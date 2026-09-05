@@ -14,6 +14,22 @@ pub struct SearchHit {
     pub highlights: Vec<u32>,
 }
 
+/// Reorder `hits` so the ids in `recents` come first, in `recents` order.
+///
+/// §5.2 puts a recently-used tier at the top of the picker list. Without it an
+/// empty query returns prompts in filesystem order, which is never the order
+/// you want mid-demo — the prompt you reach for is nearly always one you just
+/// used. Ordering is stable for everything not in `recents`, so the underlying
+/// list order still shows through below the recents.
+pub fn promote_recents(hits: &mut Vec<SearchHit>, recents: &[String]) {
+    if recents.is_empty() || hits.is_empty() {
+        return;
+    }
+    let rank = |id: &str| recents.iter().position(|r| r == id);
+    // `sort_by_key` is stable, so non-recents keep their relative order.
+    hits.sort_by_key(|h| rank(&h.prompt_id).unwrap_or(usize::MAX));
+}
+
 pub struct SearchIndex {
     matcher: Matcher,
     /// Stable list of prompts in current order; rebuilt on hot-reload.
@@ -134,9 +150,53 @@ mod tests {
             tags: Vec::new(),
             enabled: true,
             pinned: false,
+            newline_mode: None,
+            origin: Default::default(),
             body: body.into(),
             source_path: None,
         }
+    }
+
+    fn hit(id: &str) -> SearchHit {
+        SearchHit {
+            prompt_id: id.into(),
+            score: 0,
+            highlights: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn promote_recents_puts_recents_first_in_their_own_order() {
+        let mut hits = vec![hit("a"), hit("b"), hit("c"), hit("d")];
+        promote_recents(&mut hits, &["c".into(), "a".into()]);
+        let ids: Vec<&str> = hits.iter().map(|h| h.prompt_id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "a", "b", "d"]);
+    }
+
+    #[test]
+    fn promote_recents_is_stable_for_non_recents() {
+        let mut hits = vec![hit("a"), hit("b"), hit("c")];
+        promote_recents(&mut hits, &["c".into()]);
+        let ids: Vec<&str> = hits.iter().map(|h| h.prompt_id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "a", "b"], "a before b, as they came in");
+    }
+
+    #[test]
+    fn promote_recents_ignores_unknown_ids() {
+        let mut hits = vec![hit("a"), hit("b")];
+        promote_recents(&mut hits, &["ghost".into(), "b".into()]);
+        let ids: Vec<&str> = hits.iter().map(|h| h.prompt_id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn promote_recents_handles_empty_inputs() {
+        let mut hits = vec![hit("a")];
+        promote_recents(&mut hits, &[]);
+        assert_eq!(hits.len(), 1);
+        let mut empty: Vec<SearchHit> = Vec::new();
+        promote_recents(&mut empty, &["a".into()]);
+        assert!(empty.is_empty());
     }
 
     #[test]

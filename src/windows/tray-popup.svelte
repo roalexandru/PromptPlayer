@@ -20,6 +20,13 @@
   // Keep-awake: when on, the OS won't dim/screensaver/sleep. In-memory only
   // (resets each launch, like `armed`). Re-polled on every popover show.
   let keepAwake = $state(false);
+  // Transport state: pausing mid-prompt is the gesture the kill switch can't
+  // serve, since killing throws the rest of the body away.
+  let paused = $state(false);
+  let speed = $state(1);
+  // Setlist cues, so "next cue" is reachable without a hotkey.
+  let cueCount = $state(0);
+  let cueIndex = $state(0);
   let unlisten: UnlistenFn | null = null;
   let unlistenUpdate: UnlistenFn | null = null;
   let rootEl = $state<HTMLDivElement | null>(null);
@@ -78,6 +85,23 @@
       keepAwake = await ipc.getKeepAwake();
     } catch {
       keepAwake = false;
+    }
+    try {
+      const status = await ipc.playbackStatus();
+      playing = status.playing;
+      paused = status.paused;
+      speed = status.speed;
+    } catch {
+      paused = false;
+      speed = 1;
+    }
+    try {
+      const cues = await ipc.getSetlist();
+      cueCount = cues.length;
+      cueIndex = Math.max(0, cues.findIndex((c) => c.isNext));
+    } catch {
+      cueCount = 0;
+      cueIndex = 0;
     }
   }
 
@@ -152,6 +176,46 @@
       await ipc.kill();
     } catch (e) {
       console.error("kill failed", e);
+    }
+    await refresh();
+  }
+
+  // §3.5 — freeze the run so you can narrate, then pick it up where it
+  // stopped. Unlike Stop, nothing is lost.
+  async function togglePause() {
+    try {
+      const next = await ipc.togglePlaybackPause();
+      if (next !== null) paused = next;
+    } catch (e) {
+      console.error("pause failed", e);
+    }
+    await refresh();
+  }
+
+  async function nudgeSpeed(faster: boolean) {
+    try {
+      const next = await ipc.nudgePlaybackSpeed(faster);
+      if (next !== null) speed = next;
+    } catch (e) {
+      console.error("speed nudge failed", e);
+    }
+  }
+
+  // Fire the next cue, then dismiss so the typing lands in the user's app.
+  async function nextCue() {
+    try {
+      await ipc.fireNextCue();
+    } catch (e) {
+      console.error("next cue failed", e);
+    }
+    await dismiss();
+  }
+
+  async function rewindSetlist() {
+    try {
+      await ipc.resetSetlist();
+    } catch (e) {
+      console.error("rewind failed", e);
     }
     await refresh();
   }
@@ -422,6 +486,46 @@
     >
       <span class="stop-dot"></span>
       <span class="label">Stop typing</span>
+    </button>
+    <button
+      class="row plain"
+      class:hover={hoverKey === "pause"}
+      data-hkey="pause"
+      onclick={togglePause}
+      title="Freeze the playback without losing the rest of the prompt"
+    >
+      <span class="label">{paused ? "Resume typing" : "Pause typing"}</span>
+      <span class="hint">{IS_MAC ? "⌘⇧," : "Ctrl+Shift+,"}</span>
+    </button>
+    <div class="speed-row">
+      <button class="speed-btn" onclick={() => nudgeSpeed(false)} title="Slower">−</button>
+      <span class="speed-val">×{speed.toFixed(2)}</span>
+      <button class="speed-btn" onclick={() => nudgeSpeed(true)} title="Faster">+</button>
+    </div>
+    <div class="sep"></div>
+  {/if}
+
+  {#if cueCount > 0}
+    <!-- Setlist transport. One row, always the same target, so recall never
+         enters into it mid-demo. -->
+    <button
+      class="row plain"
+      class:hover={hoverKey === "cue"}
+      data-hkey="cue"
+      onclick={nextCue}
+      title="Fire the next cue in the setlist"
+    >
+      <span class="label">Next cue ({cueIndex + 1} of {cueCount})</span>
+      <span class="hint">{IS_MAC ? "⌘⇧." : "Ctrl+Shift+."}</span>
+    </button>
+    <button
+      class="row plain"
+      class:hover={hoverKey === "rewind"}
+      data-hkey="rewind"
+      onclick={rewindSetlist}
+      title="Back to the first cue"
+    >
+      <span class="label">Rewind setlist</span>
     </button>
     <div class="sep"></div>
   {/if}
@@ -929,5 +1033,32 @@
     .ctx-sep {
       background: rgba(0, 0, 0, 0.1);
     }
+  }
+
+  /* Speed nudge, shown only while a playback is in flight. */
+  .speed-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 2px 12px 6px;
+  }
+  .speed-btn {
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: transparent;
+    color: inherit;
+    border-radius: 5px;
+    width: 22px;
+    height: 20px;
+    line-height: 1;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .speed-val {
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    opacity: 0.75;
+    min-width: 44px;
+    text-align: center;
   }
 </style>

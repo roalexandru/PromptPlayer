@@ -54,6 +54,25 @@ impl Default for RdpRegistry {
 }
 
 impl RdpRegistry {
+    /// Merge extra client identifiers from `promptplayer.yaml` (§9.3 says the
+    /// recognized list is editable there). Case-insensitive; blank entries are
+    /// ignored so a stray dash in the YAML can't match every app.
+    pub fn extend_from_config(&self, extra: &[String]) {
+        let cleaned: Vec<String> = extra
+            .iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cleaned.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "added {} RDP client identifier(s) from config",
+            cleaned.len()
+        );
+        self.inner.write().extend(cleaned);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -83,7 +102,9 @@ impl RdpRegistry {
             })
             .unwrap_or("");
         for needle in ids.iter() {
-            if needle == bundle || needle == exe {
+            // Case-insensitive: Windows executable names vary in case between
+            // registry, process list, and what a user types into the config.
+            if needle.eq_ignore_ascii_case(bundle) || needle.eq_ignore_ascii_case(exe) {
                 return RdpMode::HostSide;
             }
         }
@@ -95,6 +116,28 @@ impl RdpRegistry {
 mod tests {
     use super::*;
     use crate::scopes::ForegroundContext;
+
+    #[test]
+    fn extends_the_client_list_from_config() {
+        let r = RdpRegistry::new();
+        r.extend_from_config(&["MyRemote.exe".into(), "  ".into()]);
+        let ctx = ForegroundContext {
+            executable: Some("C:\\Program Files\\MyRemote.exe".into()),
+            ..Default::default()
+        };
+        assert_eq!(r.detect(&ctx), RdpMode::HostSide);
+    }
+
+    #[test]
+    fn blank_config_entries_do_not_match_everything() {
+        let r = RdpRegistry::new();
+        r.extend_from_config(&["".into(), "   ".into()]);
+        let ctx = ForegroundContext {
+            executable: Some("/Applications/Safari.app/Contents/MacOS/Safari".into()),
+            ..Default::default()
+        };
+        assert_eq!(r.detect(&ctx), RdpMode::Off);
+    }
 
     #[test]
     fn detects_microsoft_rdc_by_bundle() {

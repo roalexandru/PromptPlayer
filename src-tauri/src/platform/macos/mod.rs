@@ -7,6 +7,7 @@
 #![allow(deprecated, unexpected_cfgs)]
 
 pub mod activation;
+pub mod ax;
 pub mod monitor;
 pub mod nsworkspace;
 pub mod panel;
@@ -21,5 +22,6 @@ pub use panel::{
     order_window_front_regardless,
 };
 pub use screen::{
-    position_centered_on_cursor, position_picker_on_cursor_screen, position_popover_under_cursor,
+    is_extended_desktop, position_centered_on_cursor, position_centered_on_primary,
+    position_picker_on_cursor_screen, position_popover_under_cursor,
 };

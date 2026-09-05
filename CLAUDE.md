@@ -5,11 +5,15 @@ Guidance for working in this repository. Read this before making changes.
 ## What it is
 
 **Prompt Player** is a **Tauri 2** desktop app — a *stealth keyboard utility for
-live demos*. You store prompts, assign each a trigger word, and when you type
-`trigger>` (trigger + a commit char, default `>`) in any text field the app
-silently backspaces the trigger and continues typing the stored prompt at a
+live demos*, and a companion for coding agents (Claude Code and friends). You
+store prompts, assign each a trigger word, and when you type `trigger>`
+(trigger + a commit char, default `>`) in any text field the app silently
+backspaces the trigger and continues typing the stored prompt at a
 statistically realistic human cadence. It also offers a Command Palette
-(fuzzy picker), a per-prompt hotkey system, and a menu-bar/tray popover.
+(fuzzy picker), a per-prompt hotkey system, a menu-bar/tray popover, an
+ordered **setlist** with a next-cue hotkey, pause/speed transport controls,
+import from agent prompt formats (`.claude/commands`, Cursor rules, …), and
+read-only prompt **sources** fetched from public GitHub repos.
 
 - **Backend:** Rust, in `src-tauri/` (a Cargo workspace).
 - **Frontend:** Svelte 5 + TypeScript + Vite, in `src/`.
@@ -66,13 +70,38 @@ Frontend `src/` is mounted through per-window HTML entry points at repo root:
     hotkeys, **power**).
   - `shortcuts.rs` — global shortcuts, `rebuild_prompt_hotkeys`,
     `refresh_tray_popup`.
-  - `fire.rs` — `FireService`, the typing pipeline (expand → schedule → inject).
+  - `fire.rs` — `FireService`, the typing pipeline (guard → gather context →
+    expand → schedule → inject). `FireRequest` bundles the per-fire inputs.
   - `lifecycle.rs` — window close-to-hide / focus-loss handlers.
-- `commands/` — **all IPC handlers**, one file per domain (`armed`, `power`,
-  `prompts`, `picker`, `tray`, `updater`, `library`, `shell`). `mod.rs` holds
-  `COMMAND_NAMES` (the single source of truth — see IPC contract below).
-- `state.rs` — `AppState`: runtime flags (`armed`, `playing`, cancel flag +
-  panic-stroke ring, `commit_char`, `hook_alive`). All in-memory.
+- `commands/` — **all IPC handlers**, one file per domain (`armed`, `config`,
+  `power`, `prompts`, `picker`, `sources`, `tray`, `updater`, `library`,
+  `shell`). `mod.rs` holds `COMMAND_NAMES` (the single source of truth — see
+  IPC contract below).
+- `state.rs` — `AppState`: runtime flags (`armed` + when it was armed,
+  `playing`, the live `PlaybackControl`, panic-stroke ring, `commit_char`,
+  setlist cursor, `hook_alive`). All in-memory.
+- `config.rs` — **`promptplayer.yaml`** (§7.2): hotkeys, commit char, newline
+  mode, text-field guard, picker display, auto-disarm, setlist, sources,
+  `enabled-remote`, repo hints. `ConfigStore` on `AppContext` is the only
+  reader/writer; `load_at`/`save_at` take an explicit path so tests are
+  hermetic. A malformed file logs and falls back to defaults — it defines the
+  global hotkeys, so it must never be able to brick them.
+- `accessibility.rs` — focused-element inspection: is it safe to type here
+  (§11 password/non-text guard) and what is selected (`$SELECTION`). Pure
+  classification lives here; the platform reads are in
+  `platform/macos/ax.rs` (AXUIElement) and `platform/windows/uia.rs`
+  (UI Automation). **Fails open**: only `Secure` and `NotEditable` block a
+  fire, because Chromium/Electron/terminal surfaces report generically.
+- `usage.rs` — frecency history (`usage.json`) behind the picker's recents
+  tier. Half-life 7 days; a completed fire is a use, a cancelled one is not.
+- `sources.rs` — remote prompt sources: GitHub tarball fetch, `.pp.md`-only
+  extraction with a path-traversal guard, per-source cache + manifest. Trust
+  rules enforced on load: read-only, hotkeys dropped, disabled until the user
+  enables them via `enabled-remote` in config.
+- `repo.rs` — `$GIT_BRANCH` / `$REPO_NAME` / `$CWD` without shelling out
+  (reads `.git/HEAD`, follows worktree `gitdir:` files).
+- `prompts/agent_import.rs` — convert agent prompt files into `.pp.md`
+  prompts. `$ARGUMENTS` becomes a `${1:arguments}` tab stop.
 - `power/` — **"Keep Awake"** controller (`PowerManager`): inhibits display
   sleep / screensaver / idle system sleep. macOS = IOKit
   `PreventUserIdleDisplaySleep` assertion; Windows = `SetThreadExecutionState`
@@ -82,7 +111,11 @@ Frontend `src/` is mounted through per-window HTML entry points at repo root:
 - `prompts/` — `Prompt` struct + `.pp.md` load/parse/watch (`library.rs`),
   placeholders, expressions (a QuickJS sandbox via `rquickjs`).
 - `typer/` — human-cadence typing engine (profiles, schedule, typos,
-  distributions).
+  distributions, false starts). `PlaybackControl` carries cancel + pause +
+  speed; `play_controlled` rebases its schedule origin on pause/speed change
+  so absolute scheduling stays drift-free within each constant-speed stretch.
+  `Key::ShiftEnter` and `ScheduleOptions::newline_mode` decide how an embedded
+  newline is delivered (chat vs terminal agent).
 - `matcher.rs` — trigger index + streaming keystroke matcher.
 - `hook/` — global keyboard hook (`macos.rs` = native CGEventTap; `windows.rs` =
   `rdev`/SetWindowsHookEx). `inject/` — keystroke synthesis (Enigo + platform).
@@ -133,9 +166,17 @@ forbids raw `invoke()` outside `$lib/ipc`.
 ## State & persistence
 
 - Runtime flags (`AppState`) and Keep Awake (`PowerManager`) are **in-memory and
-  reset every launch** — `armed` deliberately starts off (§10.1), `commit_char`
-  defaults to `>`. There is **no general settings store** (`tauri-plugin-store`
-  is not a dependency).
+  reset every launch** — `armed` deliberately starts off (§10.1).
+- **`promptplayer.yaml`** lives beside the prompts directory (i.e. in the
+  *parent* of the library root — `config::config_root()`) and is read once at
+  startup into `ConfigStore`. Everything except the global hotkeys is read
+  per-use, so it applies live; hotkeys are registered with the OS once, so a
+  rebind needs a relaunch (`save_config` returns a flag saying so).
+  `tauri-plugin-store` is still not a dependency.
+- **`usage.json`** (same directory) holds the frecency counters.
+- **`sources/<owner-repo@ref>/`** (same directory) caches each remote source's
+  `.pp.md` files plus a `.pp-source.json` manifest. The whole directory is
+  replaced on refresh, which is why remote enablement lives in config instead.
 - **Prompts persist as one `.pp.md` Markdown file each** under the OS app-data
   dir (macOS `~/Library/Application Support/PromptPlayer/prompts`, Windows
   `%APPDATA%\promptplayer\prompts`; override with `PROMPT_PLAYER_PROMPTS`).
@@ -198,11 +239,32 @@ checks at startup +15s then every 6h and emits an `update-available`
   and release also checks the tag equals `package.json` version. **Bump all three
   together.**
 
+## Companion features worth knowing about
+
+- **Newline mode matters.** Terminals deliver Shift+Enter as a plain CR, so the
+  chat-app default submits an agent prompt at its first blank line. Per-prompt
+  `newline-mode:` overrides the library default; imported agent prompts are
+  stamped `backslash-enter`.
+- **The text-field guard fails open by design.** `accessibility::FieldKind`
+  returns `Unknown` whenever the OS won't say, and `Unknown` proceeds. Adding
+  roles to the "not editable" lists risks breaking exactly the Electron and
+  terminal targets this app exists for.
+- **Remote prompt ids are namespaced** `<source-id>/<stem>`, and locals are
+  pushed into the store first so a trigger collision resolves in their favour.
+- **`play_controlled` may emit one key early** right after a pause or speed
+  change; the next iteration rebases. That is deliberate (see the comment).
+
 ## Conventions & gotchas checklist
 
 - Adding an IPC command → update `COMMAND_NAMES` + both macros in `setup.rs`
   (same order) + `ipc.ts` façade; `ipc.gen.ts` regenerates on debug launch.
 - Adding a tray item → edit both `tray-popup.svelte` (mac) and `menu.rs` (win).
+- Anything crossing IPC must avoid 64-bit integers: specta refuses to export
+  `i64`/`u64`/`usize`. Use `u32`/`i32`, or a string for timestamps.
+- `AppConfig` serializes **kebab-case** (it is the user-facing YAML), so the
+  generated TS type has kebab keys — the frontend uses bracket access.
+- `src/lib/ipc.gen.ts` regenerates on debug launch; a test asserts the
+  committed file mentions every command, but never rewrites it.
 - Adding a managed `.manage()` type → edit BOTH the inline block in `run()` and
   `manage_state()` (a test enforces they match). Adding a field to `AppContext`
   is the low-friction alternative (it's already managed).

@@ -78,6 +78,26 @@ pub enum TelemetryEvent {
         matched: bool,
         index_size_bucket: IndexSizeBucket,
     },
+    /// A fire was refused because the focused element was a password field or
+    /// could not accept text (§11). Structural only — no window titles, no
+    /// app identity, just which of the two guards fired.
+    TypingBlocked {
+        reason: &'static str,
+    },
+    /// A remote prompt source was refreshed. `changed` distinguishes "new
+    /// commit pulled" from "already current"; the count is a plain integer,
+    /// and the repo name is deliberately absent.
+    SourceRefreshed {
+        changed: bool,
+        prompt_count: u16,
+    },
+    /// Prompts imported from an agent tool's own prompt directory
+    /// (`.claude/commands`, Cursor rules, …). `kind` is the fixed format
+    /// label, never a path.
+    AgentPromptsImported {
+        kind: &'static str,
+        count: u16,
+    },
 }
 
 /// Coarse bucket for matcher index size in CommitObserved. Avoids leaking
@@ -249,6 +269,9 @@ impl TelemetryEvent {
             Self::RdpDetected => "rdp_detected",
             Self::HookInstallResult { .. } => "hook_install_result",
             Self::CommitObserved { .. } => "commit_observed",
+            Self::TypingBlocked { .. } => "typing_blocked",
+            Self::SourceRefreshed { .. } => "source_refreshed",
+            Self::AgentPromptsImported { .. } => "agent_prompts_imported",
         }
     }
 }

@@ -60,6 +60,17 @@ rquickjs = "0.11"
 # fuzzy search
 nucleo-matcher = "0.3"
 
+# GitHub prompt sources (§7.2 `uses:` refs): tarball fetch + extract. Same
+# versions the updater plugin already pulls in, so no new tree.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "charset",
+    "http2",
+    "system-proxy",
+] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = "0.4"
+
 # telemetry
 tauri-plugin-aptabase = "1"
 sysinfo = "0.31"
@@ -165,7 +176,10 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_UI_Shell",
+    "Win32_UI_Accessibility",
     "Win32_Media",
+    "Win32_System_Com",
+    "Win32_System_Variant",
 ] }
 
 [features]

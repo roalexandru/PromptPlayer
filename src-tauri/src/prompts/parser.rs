@@ -1,6 +1,7 @@
 //! §7 — `.pp.md` parser: YAML frontmatter + Markdown body.
 
-use crate::prompts::Prompt;
+use crate::config::NewlineMode;
+use crate::prompts::{Prompt, PromptOrigin};
 use crate::scopes::ScopeFilter;
 use crate::typer::{ProfileKind, TypingOverrides};
 use serde::Deserialize;
@@ -42,6 +43,7 @@ struct Frontmatter {
     id: Option<String>,
     enabled: Option<bool>,
     pinned: Option<bool>,
+    newline_mode: Option<NewlineMode>,
 }
 
 /// Parse a `.pp.md` file: leading `---\n<yaml>\n---\n<body>`.
@@ -119,6 +121,10 @@ pub fn parse_str(raw: &str, path: &Path) -> Result<Prompt, ParseError> {
         tags: fm.tags,
         enabled: fm.enabled.unwrap_or(true),
         pinned: fm.pinned.unwrap_or(false),
+        newline_mode: fm.newline_mode,
+        // Parsing alone says nothing about provenance; `sources::load_cached`
+        // stamps remote prompts after this returns.
+        origin: PromptOrigin::Local,
         body,
         source_path: None,
     })
@@ -155,6 +161,8 @@ pub fn serialize(prompt: &Prompt) -> Result<String, serde_yaml::Error> {
         enabled: bool,
         #[serde(skip_serializing_if = "is_false")]
         pinned: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        newline_mode: Option<NewlineMode>,
     }
     fn is_zero(v: &i32) -> bool {
         *v == 0
@@ -173,6 +181,8 @@ pub fn serialize(prompt: &Prompt) -> Result<String, serde_yaml::Error> {
             && v.typos_enabled.is_none()
             && v.pre_submit_pause_enabled.is_none()
             && v.send_final_enter.is_none()
+            && v.rephrase_enabled.is_none()
+            && v.rephrase_rate.is_none()
     }
 
     let normalized_overrides = prompt.typing_overrides.normalized();
@@ -191,6 +201,7 @@ pub fn serialize(prompt: &Prompt) -> Result<String, serde_yaml::Error> {
         tags: &prompt.tags,
         enabled: prompt.enabled,
         pinned: prompt.pinned,
+        newline_mode: prompt.newline_mode,
     };
     let yaml = serde_yaml::to_string(&out)?;
     Ok(format!("---\n{yaml}---\n{}", prompt.body))

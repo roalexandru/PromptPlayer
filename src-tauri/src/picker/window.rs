@@ -76,21 +76,59 @@ pub fn apply_screen_capture_exclusion(window: &WebviewWindow, hide: bool) -> Res
     plat::set_screen_capture_exclusion(window, hide)
 }
 
-/// Configure the picker window for first show: capture-exclude, position
-/// centered on the screen the user is currently looking at (the one that
-/// contains the cursor) — not the OS "main" screen, which would put the
-/// picker on the wrong display when the user is on a secondary monitor or
-/// inside a fullscreen app on another space.
+/// Configure the picker window for first show: capture-exclude and position it.
+///
+/// Called from app setup so the exclusion is in place before the window is
+/// ever composited, and again from `show_picker_window` on every show (a
+/// window that was hidden and reshown can lose the affinity flag, and on
+/// macOS the sharing type is per-window state we want re-asserted).
 pub fn prepare_picker(app: &tauri::AppHandle, hide_from_capture: bool) -> Result<(), String> {
     use tauri::Manager;
     if let Some(w) = app.get_webview_window("picker") {
-        #[cfg(target_os = "macos")]
-        crate::platform::macos::position_centered_on_cursor(&w, 0.30);
-        #[cfg(target_os = "windows")]
-        crate::platform::windows::position_centered_on_cursor(&w, 0.30);
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let _ = w.center();
+        position_picker(app, crate::config::PickerDisplay::default());
         apply_screen_capture_exclusion(&w, hide_from_capture)?;
     }
     Ok(())
+}
+
+/// Place the picker according to the configured display preference.
+///
+/// `Auto` is the interesting case. Capture exclusion keeps the picker out of a
+/// Zoom share, but an extended-desktop projector is a second physical output —
+/// the OS composites the picker onto it like any other window. So when the
+/// desktop is extended we place the picker on the primary display (the
+/// presenter's own screen) rather than following the cursor onto the
+/// projector. Mirrored setups are one logical screen, so cursor-following is
+/// correct there and `Auto` leaves it alone.
+pub fn position_picker(app: &tauri::AppHandle, display: crate::config::PickerDisplay) {
+    use crate::config::PickerDisplay;
+    use tauri::Manager;
+    let Some(w) = app.get_webview_window("picker") else {
+        return;
+    };
+    const TOP_PADDING: f64 = 0.30;
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        use crate::platform::macos as plat;
+        #[cfg(target_os = "windows")]
+        use crate::platform::windows as plat;
+
+        let on_primary = match display {
+            PickerDisplay::Cursor => false,
+            PickerDisplay::Builtin => true,
+            PickerDisplay::Auto => plat::is_extended_desktop(),
+        };
+        if on_primary {
+            plat::position_centered_on_primary(&w, TOP_PADDING);
+        } else {
+            plat::position_centered_on_cursor(&w, TOP_PADDING);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = display;
+        let _ = w.center();
+    }
 }

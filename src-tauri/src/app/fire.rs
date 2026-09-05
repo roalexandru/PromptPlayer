@@ -9,15 +9,20 @@
 //! Pipeline:
 //! 1. Capture `ForegroundContext` (what app is focused).
 //! 2. Pick best candidate via `scopes::pick_best` (priority + specificity).
-//! 3. Expand `${{ TS expr }}` blocks (with the foreground context).
-//! 4. Expand VS Code-style placeholders.
-//! 5. Apply filter chain.
-//! 6. Apply case propagation (only when there's a typed form).
-//! 7. Detect RDP host-side mode → schedule with floor + multiplier.
-//! 8. Pre-compute schedule from profile + overrides.
-//! 9. Spawn a typer thread; play schedule via Injector.
-//! 10. On completion, record undo entry (typed form + body length).
+//! 3. Pre-flight the focused element (§11): refuse to type into a password
+//!    field or a surface that can't take text at all.
+//! 4. Gather the context the body actually references — clipboard, selection,
+//!    repo/branch — each read lazily so an unrelated prompt pays nothing.
+//! 5. Expand `${{ TS expr }}` blocks, then VS Code-style placeholders.
+//! 6. Apply filter chain.
+//! 7. Apply case propagation (only when there's a typed form).
+//! 8. Detect RDP host-side mode → schedule with floor + multiplier.
+//! 9. Resolve the newline gesture for the target (chat vs terminal agent).
+//! 10. Pre-compute schedule from profile + overrides.
+//! 11. Play the schedule under a `PlaybackControl` (cancel / pause / speed).
+//! 12. On completion, record undo entry and usage history.
 
+use crate::accessibility;
 use crate::app::context::AppContext;
 use crate::filters;
 use crate::inject::{paste_via_clipboard, EnigoInjector};
@@ -26,12 +31,13 @@ use crate::prompts::expressions::ExprContext;
 use crate::prompts::placeholders::{expand, PlaceholderContext};
 use crate::prompts::Prompt;
 use crate::rdp::RdpMode;
+use crate::repo;
 use crate::scopes;
 use crate::telemetry::{self, CancelReason, CharBucket, PromptMode, TargetAppKind, TelemetryEvent};
-use crate::typer::{play_guarded, schedule, Injector, Key, ScheduleOptions};
+use crate::typer::{play_controlled, schedule, Injector, Key, PlaybackControl, ScheduleOptions};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use std::sync::atomic::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 use tauri::AppHandle;
@@ -42,6 +48,10 @@ pub enum PickMode {
     Human,
     Fast,
     Paste,
+    /// §5.3 Cmd+Enter — type the body, then submit it. The one mode the spec
+    /// listed and the picker never had; it is also what makes the app useful
+    /// against a coding agent, where "typed but not sent" is only half a turn.
+    Run,
 }
 
 impl PickMode {
@@ -49,6 +59,7 @@ impl PickMode {
         match s {
             "fast" => Self::Fast,
             "paste" => Self::Paste,
+            "run" => Self::Run,
             _ => Self::Human,
         }
     }
@@ -56,6 +67,19 @@ impl PickMode {
     pub fn is_paste(&self) -> bool {
         matches!(self, Self::Paste)
     }
+}
+
+/// Everything a single fire needs that isn't shared app state. Bundled so the
+/// pipeline takes four arguments instead of a dozen positional ones.
+struct FireRequest {
+    prompt: Prompt,
+    typed_form: Option<String>,
+    telem_mode: PromptMode,
+    foreground: scopes::ForegroundContext,
+    pick_mode: Option<PickMode>,
+    /// Pre-resolved tab-stop / choice answers from the picker (§6.4: the
+    /// picker resolves choices before it dismisses, never a modal mid-typing).
+    stop_answers: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -106,27 +130,21 @@ impl FireService {
                     // commit char (the matcher filters on it).
                     let commit = candidates[0].commit_char;
                     tracing::debug!("no scope match for trigger; re-injecting '{}'", commit);
-                    if let Ok(mut inj) = EnigoInjector::new() {
-                        inj.type_char(commit);
-                    }
-                    let now = std::time::Instant::now();
-                    for ch in typed_form.chars() {
-                        svc.ctx.matcher.observe_char(ch, now);
-                    }
-                    svc.ctx.matcher.observe_char(commit, now);
+                    restore_suppressed_commit(&svc.ctx, &typed_form, commit);
                     return;
                 };
                 let Some(prompt) = candidates.into_iter().find(|p| p.id == picked_id) else {
                     tracing::warn!("picked prompt {} not found", picked_id);
                     return;
                 };
-                svc.run_resolved(
+                svc.run_resolved(FireRequest {
                     prompt,
-                    Some(typed_form),
-                    PromptMode::Stealth,
+                    typed_form: Some(typed_form),
+                    telem_mode: PromptMode::Stealth,
                     foreground,
-                    None,
-                );
+                    pick_mode: None,
+                    stop_answers: HashMap::new(),
+                });
             })
             .expect("spawn fire dispatch thread");
     }
@@ -135,6 +153,16 @@ impl FireService {
     /// behavior (human cadence, fast, paste, run). Picker runs scope/expr/
     /// filters too — it's the same pipeline.
     pub fn fire_from_picker(&self, prompt_id: &str, mode: PickMode) {
+        self.fire_from_picker_with(prompt_id, mode, HashMap::new());
+    }
+
+    /// Picker fire carrying pre-resolved tab-stop / choice answers.
+    pub fn fire_from_picker_with(
+        &self,
+        prompt_id: &str,
+        mode: PickMode,
+        stop_answers: HashMap<String, String>,
+    ) {
         let svc = self.clone();
         let prompt_id = prompt_id.to_string();
         thread::Builder::new()
@@ -151,7 +179,14 @@ impl FireService {
                 // Picker runs after focus restore — capture foreground anew so
                 // scope/expr context reflects the target app, not Prompt Player.
                 let foreground = scopes::capture_foreground_context();
-                svc.run_resolved(prompt, None, PromptMode::Picker, foreground, Some(mode));
+                svc.run_resolved(FireRequest {
+                    prompt,
+                    typed_form: None,
+                    telem_mode: PromptMode::Picker,
+                    foreground,
+                    pick_mode: Some(mode),
+                    stop_answers,
+                });
             })
             .expect("spawn picker fire thread");
     }
@@ -170,7 +205,14 @@ impl FireService {
                     return;
                 }
                 let foreground = scopes::capture_foreground_context();
-                svc.run_resolved(prompt, None, PromptMode::Stealth, foreground, None);
+                svc.run_resolved(FireRequest {
+                    prompt,
+                    typed_form: None,
+                    telem_mode: PromptMode::Stealth,
+                    foreground,
+                    pick_mode: None,
+                    stop_answers: HashMap::new(),
+                });
             })
             .expect("spawn hotkey fire thread");
     }
@@ -178,30 +220,12 @@ impl FireService {
     /// Run a fully-resolved fire on the current (dispatch) thread. Acquires the
     /// playback lock; bails if another playback is already typing so keystrokes
     /// can't interleave into the same window.
-    fn run_resolved(
-        &self,
-        prompt: Prompt,
-        typed_form: Option<String>,
-        telem_mode: PromptMode,
-        foreground: scopes::ForegroundContext,
-        pick_mode: Option<PickMode>,
-    ) {
-        let Some(cancel) = self.ctx.state.begin_playback() else {
+    fn run_resolved(&self, req: FireRequest) {
+        let Some(control) = self.ctx.state.begin_playback() else {
             tracing::info!("fire ignored — a playback is already in progress");
             return;
         };
-        run_fire_pipeline(
-            self.app.clone(),
-            prompt,
-            typed_form,
-            telem_mode,
-            foreground,
-            pick_mode,
-            cancel,
-            self.ctx.state.clone(),
-            self.ctx.undo.clone(),
-            self.ctx.rdp.clone(),
-        );
+        run_fire_pipeline(self.app.clone(), self.ctx.clone(), req, control);
     }
 
     /// Backspace-undo flow — separate from fire because it doesn't run the
@@ -221,7 +245,7 @@ impl FireService {
                 let Some(entry) = undo.take_recent(std::time::Instant::now()) else {
                     return;
                 };
-                let Some(cancel) = app_state.begin_playback() else {
+                let Some(control) = app_state.begin_playback() else {
                     // A playback is already running — don't stomp it.
                     return;
                 };
@@ -234,7 +258,7 @@ impl FireService {
                     }
                 };
                 for _ in 0..entry.body_chars_typed {
-                    if cancel.load(Ordering::Relaxed) {
+                    if control.is_cancelled() {
                         inj.release_all_modifiers();
                         app_state.end_playback();
                         return;
@@ -257,30 +281,78 @@ impl FireService {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_fire_pipeline(
-    app: AppHandle,
-    prompt: Prompt,
-    typed_form: Option<String>,
-    telem_mode: PromptMode,
-    foreground: scopes::ForegroundContext,
-    pick_mode: Option<PickMode>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-    app_state: Arc<crate::state::AppState>,
-    undo: Arc<crate::undo::UndoLog>,
-    rdp_registry: Arc<crate::rdp::RdpRegistry>,
-) {
+fn run_fire_pipeline(app: AppHandle, ctx: AppContext, req: FireRequest, control: PlaybackControl) {
+    let FireRequest {
+        prompt,
+        typed_form,
+        telem_mode,
+        foreground,
+        pick_mode,
+        stop_answers,
+    } = req;
+    let app_state = ctx.state.clone();
     let _playback_guard = PlaybackEndGuard::new(app_state.clone());
-    // 1+2 — already done by caller (foreground capture, scope pick).
-    // Read the clipboard only when the body actually references it — avoids
-    // touching the user's clipboard on every fire (privacy + cost). Covers both
-    // the `$CLIPBOARD` placeholder and the `clipboard` expression builtin.
-    let clipboard = if prompt.body.contains("CLIPBOARD") || prompt.body.contains("clipboard") {
+    let config = ctx.config.get();
+
+    // 3 — §11 focused-element pre-flight. The one check that stops a prompt
+    // landing in a password box, a Finder window, or a file dialog. Only the
+    // two confident negatives block; "unknown" proceeds (see
+    // `accessibility::FieldKind`), because a guard that blocked Electron and
+    // terminal surfaces would break the app's primary targets.
+    if config.text_field_guard {
+        let field = accessibility::focused_field();
+        if !field.kind.allows_typing() {
+            tracing::warn!(
+                target: "prompt_player::fire",
+                role = field.role.as_deref().unwrap_or("<unknown>"),
+                verdict = field.kind.reason(),
+                "refusing to type: focused element cannot accept text"
+            );
+            telemetry::send(
+                &app,
+                TelemetryEvent::TypingBlocked {
+                    reason: field.kind.reason(),
+                },
+            );
+            // On the trigger path the hook has already swallowed the commit
+            // char and popped the trigger from the ring. Put both back, the
+            // same way the no-scope-match path does — otherwise a refusal
+            // leaves the user with a silently missing `>` and a matcher whose
+            // shadow of the screen is wrong for the next attempt.
+            if let Some(form) = typed_form.as_deref() {
+                restore_suppressed_commit(&ctx, form, prompt.commit_char);
+            }
+            return;
+        }
+    }
+
+    // 4 — gather only the context this body references. Each of these costs
+    // something real (a clipboard read, an Accessibility round-trip, a
+    // filesystem walk), so an unrelated prompt must not pay for it.
+    let body_src = prompt.body.as_str();
+    let clipboard = if body_src.contains("CLIPBOARD") || body_src.contains("clipboard") {
         crate::inject::read_clipboard_text()
     } else {
         None
     };
-    // 3 — TS expressions.
+    // §6.1 `$SELECTION` — declared in the spec, never populated until now, so
+    // every prompt referencing it (including the shipped refactor example)
+    // expanded to an empty string.
+    let selection = if body_src.contains("SELECTION") || body_src.contains("selection") {
+        accessibility::selected_text()
+    } else {
+        None
+    };
+    let wants_repo = ["GIT_BRANCH", "REPO_NAME", "REPO_ROOT", "CWD", "repo."]
+        .iter()
+        .any(|needle| body_src.contains(needle));
+    let repo_ctx = if wants_repo {
+        repo::resolve(foreground.window_title.as_deref(), &config.repo_hints)
+    } else {
+        repo::RepoContext::default()
+    };
+
+    // 5 — TS expressions, then placeholders.
     let app_name = foreground
         .executable
         .as_deref()
@@ -291,20 +363,38 @@ fn run_fire_pipeline(
         app_name,
         window_title: foreground.window_title.clone(),
         clipboard: clipboard.clone(),
+        selection: selection.clone(),
+        git_branch: repo_ctx.branch.clone(),
+        repo_name: repo_ctx.name.clone(),
+        repo_root: repo_ctx.root.clone(),
         ..Default::default()
     };
     let body_after_expr = crate::prompts::expressions::expand_expressions(&prompt.body, &expr_ctx);
     let has_expressions = body_after_expr.len() != prompt.body.len();
 
-    // 4 — placeholders.
     let ph_ctx = PlaceholderContext {
         app_bundle: foreground.bundle_id.clone(),
         app_name: expr_ctx.app_name.clone(),
         window_title: foreground.window_title.clone(),
         clipboard,
+        selection,
+        git_branch: repo_ctx.branch.clone(),
+        repo_name: repo_ctx.name.clone(),
+        repo_root: repo_ctx.root.clone(),
+        stop_answers,
         ..Default::default()
     };
     let expanded = expand(&body_after_expr, &ph_ctx);
+    if !expanded.unfilled_stops.is_empty() {
+        // Not fatal: an unanswered stop renders as its default (or empty) and
+        // the user fills it in live, which is the §6.4 "scaffold + live detail"
+        // pattern. Worth a log line so a silently-empty body has an explanation.
+        tracing::info!(
+            target: "prompt_player::fire",
+            stops = ?expanded.unfilled_stops,
+            "firing with unresolved tab stops"
+        );
+    }
 
     // 5 — filter chain.
     let filtered = filters::apply_chain(&expanded.text, &prompt.filters);
@@ -316,7 +406,7 @@ fn run_fire_pipeline(
     };
 
     // 7 — RDP detection.
-    let rdp_mode = rdp_registry.detect(&foreground);
+    let rdp_mode = ctx.rdp.detect(&foreground);
     if rdp_mode == RdpMode::HostSide {
         tracing::info!(
             "rdp host-side mode active for {:?}",
@@ -330,12 +420,17 @@ fn run_fire_pipeline(
 
     // Picker pick_mode customization.
     let mut profile = prompt.effective_profile();
+    // 9 — how a newline is delivered depends on the target surface, and
+    // getting it wrong submits the prompt at its first blank line. Per-prompt
+    // `newline-mode:` wins over the library default.
+    let newline_mode = prompt.newline_mode.unwrap_or(config.newline_mode);
     let mut opts = ScheduleOptions {
         rdp_mode: rdp_mode == RdpMode::HostSide,
         // Pre-typing pause is only meaningful for the trigger path
         // (after the suppressed `>`). Picker selections type from a
         // restored-focus app — no pause needed.
         include_pre_typing_pause: typed_form.is_some(),
+        newline_mode,
     };
     let mut paste_mode = false;
     if let Some(mode) = pick_mode {
@@ -359,7 +454,14 @@ fn run_fire_pipeline(
                 profile.burst_enabled = false;
             }
             PickMode::Paste => paste_mode = true,
-            _ => {}
+            PickMode::Run => {
+                // Type at human cadence, then submit. The pre-submit pause is
+                // §3.1's "single most realism-defining touch" and matters most
+                // here, because this is the mode where an Enter follows.
+                profile.send_final_enter = true;
+                profile.pre_submit_pause_enabled = true;
+            }
+            PickMode::Human => {}
         }
     }
     // RDP host-side: clipboard sync to the remote session is unreliable
@@ -436,7 +538,7 @@ fn run_fire_pipeline(
         // before we touch the clipboard — once Ctrl/Cmd+V is in flight
         // the paste is effectively atomic, so per-char cancellation
         // doesn't apply.
-        if cancel.load(Ordering::Relaxed) {
+        if control.is_cancelled() {
             false
         } else {
             match paste_via_clipboard(&body) {
@@ -454,10 +556,10 @@ fn run_fire_pipeline(
                     match EnigoInjector::new() {
                         Ok(mut inj) => {
                             let _timer = crate::typer::TimerResolutionGuard::acquire();
-                            let outcome = play_guarded(
+                            let outcome = play_controlled(
                                 &fallback_schedule,
                                 &mut inj,
-                                cancel.clone(),
+                                &control,
                                 Some(&focus_lost),
                             );
                             completed_chars = outcome.visible_chars;
@@ -483,7 +585,7 @@ fn run_fire_pipeline(
         // Hold 1ms timer resolution across the whole typed run so per-key
         // sleeps don't quantize to the OS timer period (Windows-only effect).
         let _timer = crate::typer::TimerResolutionGuard::acquire();
-        let outcome = play_guarded(&scheduled, &mut inj, cancel.clone(), Some(&focus_lost));
+        let outcome = play_controlled(&scheduled, &mut inj, &control, Some(&focus_lost));
         completed_chars = outcome.visible_chars;
         focus_changed = outcome.focus_changed;
         drop(inj);
@@ -491,6 +593,9 @@ fn run_fire_pipeline(
     };
 
     if completed {
+        // §5.2 recents tier — a *completed* fire is a use; a cancelled one is
+        // not, so this sits inside the success branch.
+        ctx.usage.record(&prompt.id);
         if let Some(form) = typed_form.as_deref() {
             if profile.send_final_enter {
                 // The profile pressed Enter to submit the message. Backspace-
@@ -499,7 +604,7 @@ fn run_fire_pipeline(
                 // undo for a submitted prompt.
                 tracing::debug!("not recording undo: prompt was submitted via final Enter");
             } else {
-                undo.record(form.to_string(), body_chars);
+                ctx.undo.record(form.to_string(), body_chars);
             }
         }
     } else {
@@ -527,6 +632,24 @@ fn run_fire_pipeline(
             },
         );
     }
+}
+
+/// Undo the hook's commit-char suppression when a fire doesn't happen.
+///
+/// The hook suppresses the commit char and pops the trigger from its ring the
+/// moment a trigger matches — before anything knows whether the fire will
+/// actually proceed. Every early return on the trigger path therefore has to
+/// put the character back on screen and re-observe the trigger, or the user
+/// loses a keystroke and the matcher's shadow of the screen goes stale.
+fn restore_suppressed_commit(ctx: &AppContext, typed_form: &str, commit: char) {
+    if let Ok(mut inj) = EnigoInjector::new() {
+        inj.type_char(commit);
+    }
+    let now = std::time::Instant::now();
+    for ch in typed_form.chars() {
+        ctx.matcher.observe_char(ch, now);
+    }
+    ctx.matcher.observe_char(commit, now);
 }
 
 struct PlaybackEndGuard {

@@ -8,6 +8,7 @@
 //! `{key, absolute_time_ms}` tuples; the typer thread sleeps to each
 //! absolute time. Drift stays bounded; profile statistics actually match.
 
+use crate::config::NewlineMode;
 use crate::typer::distributions::{
     jitter, sample_burst_iki, sample_iki, sample_paragraph_pause, sample_pre_submit_pause,
     sample_pre_typing_pause, sample_sentence_pause, sample_typo_noticed_pause, sample_word_pause,
@@ -33,7 +34,12 @@ pub struct ScheduledKey {
 pub enum Key {
     Char(char),
     Backspace,
+    /// A submitting Enter. Emitted for `send_final_enter` (picker "Run" mode)
+    /// and by `NewlineMode::Plain`, where the target treats Enter as a break.
     Enter,
+    /// Shift+Enter — a line break that does not submit. What chat surfaces
+    /// need for an embedded newline.
+    ShiftEnter,
 }
 
 /// Behavior options for `schedule`.
@@ -43,6 +49,9 @@ pub struct ScheduleOptions {
     pub rdp_mode: bool,
     /// §3.1 — pre-typing pause after the suppressed `>`. Skip when typing from picker.
     pub include_pre_typing_pause: bool,
+    /// How an embedded newline is delivered. Resolved per fire from the
+    /// prompt's own `newline-mode:` or the library default.
+    pub newline_mode: NewlineMode,
 }
 
 impl Default for ScheduleOptions {
@@ -50,7 +59,24 @@ impl Default for ScheduleOptions {
         Self {
             rdp_mode: false,
             include_pre_typing_pause: true,
+            newline_mode: NewlineMode::ShiftEnter,
         }
+    }
+}
+
+/// Translate one source newline into the keystrokes that produce a line break
+/// in the target surface.
+///
+/// This is the difference between a prompt landing intact in a terminal agent
+/// and one that submits at its first blank line: most terminals deliver
+/// Shift+Enter as a plain carriage return, so the chat-app default is actively
+/// wrong there.
+pub fn newline_keys(mode: NewlineMode) -> &'static [Key] {
+    match mode {
+        NewlineMode::ShiftEnter => &[Key::ShiftEnter],
+        // A literal backslash before the newline — readline-style continuation.
+        NewlineMode::BackslashEnter => &[Key::Char('\\'), Key::Enter],
+        NewlineMode::Plain => &[Key::Enter],
     }
 }
 
@@ -118,6 +144,24 @@ pub fn schedule<R: Rng + ?Sized>(
                 rng,
             );
         } else {
+            // A false start: type part of the upcoming word, hesitate, delete
+            // it, then let the main loop retype it. Humans do this constantly;
+            // it reads far more naturally on stage than typos alone, and no
+            // other implementation models it.
+            if profile.rephrase_enabled
+                && boundary.is_some()
+                && should_false_start(rng, text_pos, prompt_len, profile.rephrase_rate)
+            {
+                emit_false_start(
+                    &chars,
+                    text_pos,
+                    &mut cursor,
+                    &mut keys,
+                    profile,
+                    options,
+                    rng,
+                );
+            }
             // Plain emit.
             let in_burst = profile.burst_enabled && burst_remaining > 0;
             let iki = if in_burst {
@@ -126,8 +170,28 @@ pub fn schedule<R: Rng + ?Sized>(
                 sample_iki(rng)
             };
             cursor += apply_iki_adjustments(iki, profile, options, rng);
+            let key = match chars[text_pos] {
+                // A newline is not a character to this pipeline — it is a key
+                // gesture whose shape depends on the target surface.
+                '\n' => {
+                    let nl = newline_keys(options.newline_mode);
+                    // Emit all but the last here; the last falls through to the
+                    // push below so burst bookkeeping stays on one path.
+                    for k in &nl[..nl.len() - 1] {
+                        keys.push(ScheduledKey {
+                            key: *k,
+                            absolute_time_ms: cursor.round() as u64,
+                            is_correction: false,
+                            is_burst: false,
+                        });
+                        cursor += apply_iki_adjustments(sample_iki(rng), profile, options, rng);
+                    }
+                    nl[nl.len() - 1]
+                }
+                c => Key::Char(c),
+            };
             keys.push(ScheduledKey {
-                key: Key::Char(chars[text_pos]),
+                key,
                 absolute_time_ms: cursor.round() as u64,
                 is_correction: false,
                 is_burst: in_burst,
@@ -165,6 +229,75 @@ pub fn schedule<R: Rng + ?Sized>(
 
 fn sample_burst_word_count<R: Rng + ?Sized>(rng: &mut R) -> usize {
     rng.gen_range(6..=14)
+}
+
+/// Minimum word length worth false-starting on. Deleting a two-letter word
+/// reads as a twitch, not a rephrase.
+const FALSE_START_MIN_WORD: usize = 4;
+/// Never false-start inside the opening run — same rationale as the typo skip
+/// rules (§3.2): an immediate self-correction looks like a malfunction.
+const FALSE_START_SKIP_PREFIX: usize = 12;
+/// Below this length a prompt is too short for a rephrase to read as thinking.
+const FALSE_START_MIN_PROMPT: usize = 40;
+
+/// Should we false-start at this position?
+fn should_false_start<R: Rng + ?Sized>(
+    rng: &mut R,
+    pos: usize,
+    prompt_len: usize,
+    rate: f64,
+) -> bool {
+    if rate <= 0.0 || pos < FALSE_START_SKIP_PREFIX || prompt_len < FALSE_START_MIN_PROMPT {
+        return false;
+    }
+    rng.gen_bool(rate.clamp(0.0, 1.0))
+}
+
+/// Type a prefix of the word at `pos`, hesitate, then backspace it.
+///
+/// The prefix comes from the real text: we only know the words the author
+/// wrote, so an invented false start is not available — and typing part of the
+/// intended word then deleting it is exactly the observable behavior anyway.
+fn emit_false_start<R: Rng + ?Sized>(
+    chars: &[char],
+    pos: usize,
+    cursor: &mut f64,
+    keys: &mut Vec<ScheduledKey>,
+    profile: &Profile,
+    options: &ScheduleOptions,
+    rng: &mut R,
+) {
+    let word_len = chars[pos..]
+        .iter()
+        .take_while(|c| !c.is_whitespace())
+        .count();
+    if word_len < FALSE_START_MIN_WORD {
+        return;
+    }
+    // Type 2..word_len chars, so the word is never actually completed.
+    let take = rng.gen_range(2..word_len);
+    for i in 0..take {
+        *cursor += apply_iki_adjustments(sample_iki(rng), profile, options, rng);
+        keys.push(ScheduledKey {
+            key: Key::Char(chars[pos + i]),
+            absolute_time_ms: cursor.round() as u64,
+            is_correction: false,
+            is_burst: false,
+        });
+    }
+    // The "that's not the word I want" beat, then delete it.
+    *cursor += sample_typo_noticed_pause(rng);
+    for _ in 0..take {
+        *cursor += apply_iki_adjustments(sample_iki(rng), profile, options, rng);
+        keys.push(ScheduledKey {
+            key: Key::Backspace,
+            absolute_time_ms: cursor.round() as u64,
+            is_correction: true,
+            is_burst: false,
+        });
+    }
+    // Short regroup before the real attempt.
+    *cursor += sample_word_pause(rng, profile.pause_variance_scale) * profile.pause_scale;
 }
 
 fn sample_burst_char_count<R: Rng + ?Sized>(rng: &mut R) -> usize {
@@ -633,6 +766,7 @@ mod tests {
             &ScheduleOptions {
                 rdp_mode: false,
                 include_pre_typing_pause: false,
+                newline_mode: Default::default(),
             },
             &mut det_rng(),
         );
@@ -642,6 +776,7 @@ mod tests {
             &ScheduleOptions {
                 rdp_mode: true,
                 include_pre_typing_pause: false,
+                newline_mode: Default::default(),
             },
             &mut det_rng(),
         );
@@ -665,6 +800,7 @@ mod tests {
             &ScheduleOptions {
                 rdp_mode: false,
                 include_pre_typing_pause: true,
+                newline_mode: Default::default(),
             },
             &mut det_rng(),
         );
@@ -674,6 +810,7 @@ mod tests {
             &ScheduleOptions {
                 rdp_mode: false,
                 include_pre_typing_pause: false,
+                newline_mode: Default::default(),
             },
             &mut det_rng(),
         );
@@ -724,6 +861,7 @@ mod tests {
         let opts = ScheduleOptions {
             rdp_mode: false,
             include_pre_typing_pause: false,
+            newline_mode: Default::default(),
         };
         let text = "abcdefghijklmnopqrstuvwxyz";
         let fast_total = schedule(text, &fast, &opts, &mut det_rng())
@@ -761,6 +899,7 @@ mod tests {
         let opts = ScheduleOptions {
             rdp_mode: false,
             include_pre_typing_pause: false,
+            newline_mode: Default::default(),
         };
         // Word-heavy text amplifies the effect.
         let text = "a b c d e f g h i j k l m n o p q r s t u v w x y z";
@@ -808,6 +947,7 @@ mod tests {
             &ScheduleOptions {
                 rdp_mode: false,
                 include_pre_typing_pause: false,
+                newline_mode: Default::default(),
             },
             &mut det_rng(),
         );
