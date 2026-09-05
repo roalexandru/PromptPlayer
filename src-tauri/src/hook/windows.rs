@@ -100,7 +100,10 @@ fn run_hook_thread(app_state: Arc<AppState>) {
         )
     };
     let hook = match hook {
-        Ok(h) => h,
+        Ok(h) => {
+            tracing::info!(hhook = h.0 as usize, "WH_KEYBOARD_LL installed");
+            h
+        }
         Err(e) => {
             tracing::error!("SetWindowsHookExW(WH_KEYBOARD_LL) failed: {}", e);
             app_state.set_hook_alive(false);
@@ -135,6 +138,19 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     }
 
     let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+
+    // Trace-level raw event log. Gated to `trace` so it costs nothing in
+    // release builds with the default `info` filter; flip via
+    // `RUST_LOG=prompt_player::hook=trace` when diagnosing "hotkey doesn't
+    // fire during Zoom share" (could be Zoom's hook eating events upstream).
+    tracing::trace!(
+        target: "prompt_player::hook",
+        vk = info.vkCode,
+        scan = info.scanCode,
+        flags = info.flags.0,
+        injected = info.flags.0 & LLKHF_INJECTED.0 != 0,
+        "raw key event"
+    );
 
     // CRITICAL FILTER: skip injected events. These come from `SendInput`
     // calls — ours during playback, or any other automation tool's. Letting

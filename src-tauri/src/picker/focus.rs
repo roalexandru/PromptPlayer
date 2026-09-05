@@ -110,26 +110,51 @@ fn restore_to(pid: u64) -> bool {
 
 #[cfg(target_os = "windows")]
 fn capture_foreground() -> ForegroundSnapshot {
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
-            return ForegroundSnapshot::default();
+    use crate::platform::windows::capture::{
+        class_name_of, collect_z_order_candidates, foreground_hwnd, select_target, window_title_of,
+    };
+    let fg = foreground_hwnd();
+    if fg.0.is_null() {
+        return ForegroundSnapshot::default();
+    }
+    let fg_class = class_name_of(fg);
+
+    // Walk z-order from the foreground HWND collecting candidate metadata,
+    // then let the pure `select_target` policy pick the first one that's a
+    // plausible focus-restore target (skipping Zoom share helpers, our own
+    // windows, cloaked / minimized / hidden windows).
+    let candidates = collect_z_order_candidates(fg, 10);
+    let (handle_raw, window_title) = match select_target(&candidates) {
+        Some(c) => (c.hwnd_raw, c.title.clone()),
+        None => {
+            // Nothing in the z-order window passed the filter — fall back to
+            // the raw foreground HWND. Better to type at the wrong window
+            // than silently drop the snapshot.
+            tracing::warn!(
+                target: "prompt_player::capture",
+                fg_hwnd = fg.0 as usize,
+                fg_class = %fg_class,
+                "no acceptable target in z-order; using raw foreground HWND"
+            );
+            (fg.0 as u64, window_title_of(fg))
         }
-        let mut title = [0u16; 512];
-        let len = GetWindowTextW(hwnd, &mut title);
-        let window_title = if len > 0 {
-            Some(String::from_utf16_lossy(&title[..len as usize]))
-        } else {
-            None
-        };
-        ForegroundSnapshot {
-            bundle_id: None,
-            executable: None,
-            window_title,
-            captured_at: Some(Instant::now()),
-            handle: Some(hwnd.0 as u64),
-        }
+    };
+
+    tracing::info!(
+        target: "prompt_player::capture",
+        fg_hwnd = fg.0 as usize,
+        fg_class = %fg_class,
+        picked_hwnd = handle_raw as usize,
+        title = ?window_title,
+        "capture_foreground snapshot"
+    );
+
+    ForegroundSnapshot {
+        bundle_id: None,
+        executable: None,
+        window_title,
+        captured_at: Some(Instant::now()),
+        handle: Some(handle_raw),
     }
 }
 
@@ -196,9 +221,22 @@ fn wait_until_foreground(hwnd: u64, timeout: Duration) -> bool {
     loop {
         let fg = unsafe { GetForegroundWindow() };
         if fg.0 == target.0 {
+            tracing::debug!(
+                target: "prompt_player::capture",
+                target_hwnd = hwnd as usize,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "wait_until_foreground: target became foreground"
+            );
             return true;
         }
         if start.elapsed() >= timeout {
+            tracing::warn!(
+                target: "prompt_player::capture",
+                target_hwnd = hwnd as usize,
+                fg_hwnd = fg.0 as usize,
+                timeout_ms = timeout.as_millis() as u64,
+                "wait_until_foreground: timed out before target became foreground"
+            );
             return false;
         }
         std::thread::sleep(Duration::from_millis(1));
