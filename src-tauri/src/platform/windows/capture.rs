@@ -1,0 +1,545 @@
+//! Windows screen-capture exclusion helpers + foreground-target HWND classification.
+//!
+//! Two responsibilities, both small:
+//!   1. Apply `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` to the
+//!      picker's top-level HWND, with structured detection of the Win11
+//!      win32k `ERROR_NOT_ENOUGH_MEMORY` bug and a `WDA_MONITOR` fallback.
+//!      The API only accepts top-level windows of the calling process —
+//!      child HWNDs (WebView2's included) are rejected, see
+//!      `apply_display_affinity` — so there is deliberately no descendant walk.
+//!   2. Classify a foreground HWND so the picker's focus-snapshot can skip
+//!      Zoom-share helper windows (which become transiently foreground during
+//!      a share session) and our own tray-menu helper window when picking the
+//!      real target app to restore focus to.
+//!
+//! `platform::windows` is cfg-gated off non-Windows builds (see
+//! `platform/mod.rs`), so this module's helpers compile only on Windows.
+
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClassNameW, GetForegroundWindow, GetWindow, GetWindowDisplayAffinity, GetWindowTextW,
+    IsIconic, IsWindowVisible, SetWindowDisplayAffinity, GW_HWNDNEXT, WDA_EXCLUDEFROMCAPTURE,
+    WDA_MONITOR, WINDOW_DISPLAY_AFFINITY,
+};
+
+// --------------------------------------------------------------------------
+// Pure helpers — `&str` matchers, unit-testable without any Win32 state.
+// --------------------------------------------------------------------------
+
+/// Class names of windows Zoom puts in the foreground transiently during a
+/// screen-share session. We never want the picker's focus snapshot to capture
+/// one of these as the "target" — the user's actual target app is the next
+/// thing in z-order below them.
+///
+/// List is empirically derived from Zoom 5.x–6.x on Windows. Adding more here
+/// is the right escape hatch if a future Zoom version introduces a new helper
+/// class (no behavior change for non-Zoom users).
+pub fn is_known_share_helper(class: &str) -> bool {
+    matches!(
+        class,
+        "ZPToolBarParentWnd"
+            | "ZPContentViewWndClass"
+            | "ZPFloatVideoWndClass"
+            | "Zoom_ShareControlBar"
+            | "ZPMeetingMainFrameClassForWindow"
+            | "ZPSharingFloatToolbarClass"
+    )
+}
+
+/// Our own helper window classes that must never be a focus-restore target.
+///
+/// Today that is only the native tray-menu owner, `"PromptPlayerMenuOwner"`
+/// (see `platform/windows/menu.rs::ensure_helper`): `TrackPopupMenuEx`
+/// requires the owner to be foreground, so when the user picks "Command
+/// palette…" from the tray the raw `GetForegroundWindow()` *is* that hidden
+/// helper, and restoring focus to it would type into the void.
+///
+/// Deliberately NOT listed: Tauri's default class `"Tauri Window"`. It is
+/// shared by every webview window we own — the picker, but also the library
+/// and About windows. The focus snapshot is taken in `summon_picker` *before*
+/// the picker is shown (and is skipped when it is already visible), so a
+/// foreground `"Tauri Window"` at capture time is the library / About window
+/// the user is typing in, which is exactly where the prompt should land.
+pub fn is_own_window_class(class: &str) -> bool {
+    matches!(class, "PromptPlayerMenuOwner")
+}
+
+// --------------------------------------------------------------------------
+// Win32 wrappers.
+// --------------------------------------------------------------------------
+
+/// Fetch the class name of `hwnd`. Returns `""` for the null HWND or when
+/// the OS call fails (destroyed window, invalid handle).
+pub fn class_name_of(hwnd: HWND) -> String {
+    if hwnd.0.is_null() {
+        return String::new();
+    }
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if len <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..len as usize])
+}
+
+/// True if DWM reports the window as cloaked (per-monitor hidden, virtual-
+/// desktop hidden, or shell-cloaked). These windows are not real focus
+/// targets — typing into them types into a window the user can't see.
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    let res = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+            core::mem::size_of::<u32>() as u32,
+        )
+    };
+    res.is_ok() && cloaked != 0
+}
+
+/// Apply `affinity` (typically `WDA_EXCLUDEFROMCAPTURE` or `WDA_NONE`) to
+/// the top-level window `hwnd`. Returns the affinity actually in effect
+/// afterwards — it differs from the request only when the win32k fallback
+/// below engaged.
+///
+/// **Why top-level only.** `SetWindowDisplayAffinity` is documented as taking
+/// "a handle to the top-level window" that "must belong to the current
+/// process", and as returning FALSE for non-top-level windows. An earlier
+/// revision of this helper also walked every `EnumChildWindows` descendant to
+/// reach WebView2's GPU swap-chain HWND; on a real Windows runner the OS
+/// rejected all three same-process `WS_CHILD` test windows
+/// (`applied=1 attempted=4`), and WebView2's children are additionally owned
+/// by `msedgewebview2.exe`. `tests/screen_capture_exclusion.rs` pins that
+/// rejection so the walk is not reintroduced. WebView2Feedback #4544 (child
+/// content not covered by the parent's affinity) therefore has no host-side
+/// workaround here.
+///
+/// **Known failure mode, surfaced via logging.** On Windows 11 the kernel
+/// function `win32kfull.sys::ChangeWindowTreeProtection` has a bug that makes
+/// `SetWindowDisplayAffinity` return `ERROR_NOT_ENOUGH_MEMORY` (HRESULT
+/// `0x80070008`) for "non-traditional Win32" apps including Chromium /
+/// WebView2 / Electron. Microsoft's official workaround is the
+/// `LegacyDisplayAffinity` Application Compatibility shim (see
+/// https://aka.ms/AppCompat). This function detects it, emits a structured
+/// error, and falls back to `WDA_MONITOR` — Chromium's own choice in
+/// `desktop_window_tree_host_win.cc` — which blanks the window in captures
+/// instead of hiding it: strictly better than leaving the picker visible in
+/// the share.
+pub fn apply_display_affinity(
+    hwnd: HWND,
+    affinity: WINDOW_DISPLAY_AFFINITY,
+) -> Result<WINDOW_DISPLAY_AFFINITY, String> {
+    if hwnd.0.is_null() {
+        return Err("apply_display_affinity: null HWND".into());
+    }
+    let class = class_name_of(hwnd);
+    let err = match unsafe { SetWindowDisplayAffinity(hwnd, affinity) } {
+        Ok(()) => {
+            tracing::info!(
+                target: "prompt_player::capture",
+                hwnd = hwnd.0 as usize,
+                class = %class,
+                affinity = affinity.0,
+                "display-affinity applied"
+            );
+            return Ok(affinity);
+        }
+        Err(e) => e,
+    };
+
+    // HRESULT 0x80070008 = Win32 ERROR_NOT_ENOUGH_MEMORY. On Windows 11 this
+    // specific failure is the `ChangeWindowTreeProtection` kernel bug — not
+    // an actual memory exhaustion. Surface it as its own structured event so
+    // log-greppers can distinguish "the OS rejected us" from "the HWND was
+    // destroyed mid-call".
+    let hr = err.code().0 as u32;
+    if hr != 0x8007_0008 {
+        tracing::warn!(
+            target: "prompt_player::capture",
+            hwnd = hwnd.0 as usize,
+            class = %class,
+            hresult = format!("0x{hr:08X}"),
+            "SetWindowDisplayAffinity failed: {err}"
+        );
+        return Err(format!("SetWindowDisplayAffinity: {err}"));
+    }
+    tracing::error!(
+        target: "prompt_player::capture",
+        hwnd = hwnd.0 as usize,
+        class = %class,
+        hresult = format!("0x{hr:08X}"),
+        "win11_legacy_display_affinity_bug: SetWindowDisplayAffinity returned ERROR_NOT_ENOUGH_MEMORY (win32k bug). Capture-exclusion will NOT work until the LegacyDisplayAffinity Application Compatibility shim is applied. See https://learn.microsoft.com/en-us/answers/questions/700122/setwindowdisplayaffinity-on-windows-11"
+    );
+    if affinity != WDA_EXCLUDEFROMCAPTURE {
+        return Err(format!("SetWindowDisplayAffinity: {err}"));
+    }
+    match unsafe { SetWindowDisplayAffinity(hwnd, WDA_MONITOR) } {
+        Ok(()) => {
+            tracing::warn!(
+                target: "prompt_player::capture",
+                hwnd = hwnd.0 as usize,
+                class = %class,
+                "fell back to WDA_MONITOR after WDA_EXCLUDEFROMCAPTURE rejected by win32k bug; audience sees a black rectangle instead of see-through"
+            );
+            Ok(WDA_MONITOR)
+        }
+        Err(e2) => Err(format!(
+            "SetWindowDisplayAffinity: {err}; WDA_MONITOR fallback also failed: {e2}"
+        )),
+    }
+}
+
+/// Read the current display-affinity flag for a window. Returns `None` on
+/// failure — which, per the Win32 docs and the integration tests, includes
+/// every non-top-level window. Used by `tests/screen_capture_exclusion.rs`.
+pub fn current_display_affinity(hwnd: HWND) -> Option<WINDOW_DISPLAY_AFFINITY> {
+    // `GetWindowDisplayAffinity` is bound with a raw `*mut u32` out-param
+    // (the newtype is only used on the `Set` side), so read into a `u32`.
+    let mut raw: u32 = 0;
+    let res = unsafe { GetWindowDisplayAffinity(hwnd, &mut raw) };
+    res.ok().map(|_| WINDOW_DISPLAY_AFFINITY(raw))
+}
+
+/// Thin wrapper around `GetForegroundWindow` — kept here so the focus module's
+/// `capture_foreground_with` test seam can mock it without touching Win32.
+pub fn foreground_hwnd() -> HWND {
+    unsafe { GetForegroundWindow() }
+}
+
+/// Fetch a window's title via `GetWindowTextW`. Empty title (or failure) →
+/// `None`. Used by the foreground-snapshot path to label log entries.
+pub fn window_title_of(hwnd: HWND) -> Option<String> {
+    let mut buf = [0u16; 512];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    if len > 0 {
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    } else {
+        None
+    }
+}
+
+// --------------------------------------------------------------------------
+// CandidateWindow + select_target — pure z-order classifier used by
+// picker/focus.rs::capture_foreground. Splitting the policy from the OS
+// queries keeps F1–F5 testable without faking Win32.
+// --------------------------------------------------------------------------
+
+/// Snapshot of one top-level window's classification state. Constructed
+/// from Win32 calls by `collect_z_order_candidates`, or by hand in tests.
+#[derive(Debug, Clone)]
+pub struct CandidateWindow {
+    /// HWND value as a u64 so the struct is `Send` and doesn't carry an
+    /// HWND through test data. Production code casts back via `HWND(_ as _)`
+    /// when it needs the real handle.
+    pub hwnd_raw: u64,
+    pub class: String,
+    pub title: Option<String>,
+    pub visible: bool,
+    pub cloaked: bool,
+    pub iconic: bool,
+}
+
+impl CandidateWindow {
+    /// True iff this window is a plausible focus-restore target.
+    pub fn is_acceptable_target(&self) -> bool {
+        self.visible
+            && !self.cloaked
+            && !self.iconic
+            && !is_known_share_helper(&self.class)
+            && !is_own_window_class(&self.class)
+    }
+}
+
+/// Pure selection over a precomputed candidate list. Picks the first
+/// acceptable entry, capped at 10. Logs the picked / rejected decisions at
+/// debug level so the L2 logging test can pin them.
+///
+/// Returns `None` only if no candidate within the cap is acceptable; the
+/// caller is expected to fall back to the raw foreground HWND rather than
+/// silently drop the snapshot.
+pub fn select_target(candidates: &[CandidateWindow]) -> Option<&CandidateWindow> {
+    for (i, c) in candidates.iter().take(10).enumerate() {
+        if c.is_acceptable_target() {
+            tracing::debug!(
+                target: "prompt_player::capture",
+                index = i,
+                class = %c.class,
+                "select_target: accepted candidate"
+            );
+            return Some(c);
+        }
+        let reason = if !c.visible {
+            "not_visible"
+        } else if c.cloaked {
+            "cloaked"
+        } else if c.iconic {
+            "iconic"
+        } else if is_known_share_helper(&c.class) {
+            "share_helper"
+        } else if is_own_window_class(&c.class) {
+            "own_class"
+        } else {
+            "unknown"
+        };
+        tracing::debug!(
+            target: "prompt_player::capture",
+            index = i,
+            class = %c.class,
+            reason,
+            "select_target: rejected candidate"
+        );
+    }
+    None
+}
+
+/// Build a candidate snapshot by walking z-order from `start`, up to `cap`
+/// entries. Each entry's metadata is fetched once at collection time so the
+/// result is a coherent moment-snapshot (no torn state from candidate i's
+/// metadata being queried after candidate i+1's HWND moved).
+pub fn collect_z_order_candidates(start: HWND, cap: usize) -> Vec<CandidateWindow> {
+    let mut out = Vec::with_capacity(cap);
+    let mut cur = start;
+    for _ in 0..cap {
+        if cur.0.is_null() {
+            break;
+        }
+        out.push(snapshot_candidate(cur));
+        cur = match unsafe { GetWindow(cur, GW_HWNDNEXT) } {
+            Ok(h) if !h.0.is_null() => h,
+            _ => break,
+        };
+    }
+    out
+}
+
+fn snapshot_candidate(hwnd: HWND) -> CandidateWindow {
+    CandidateWindow {
+        hwnd_raw: hwnd.0 as u64,
+        class: class_name_of(hwnd),
+        title: window_title_of(hwnd),
+        visible: unsafe { IsWindowVisible(hwnd) }.as_bool(),
+        iconic: unsafe { IsIconic(hwnd) }.as_bool(),
+        cloaked: is_cloaked(hwnd),
+    }
+}
+
+// --------------------------------------------------------------------------
+// T1 — pure-function unit tests.
+// --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn share_helper_classes_recognised() {
+        for c in [
+            "ZPToolBarParentWnd",
+            "ZPContentViewWndClass",
+            "ZPFloatVideoWndClass",
+            "Zoom_ShareControlBar",
+            "ZPMeetingMainFrameClassForWindow",
+            "ZPSharingFloatToolbarClass",
+        ] {
+            assert!(is_known_share_helper(c), "expected share-helper: {c}");
+        }
+    }
+
+    #[test]
+    fn non_share_classes_pass_through() {
+        for c in [
+            "Chrome_WidgetWin_1",
+            "Notepad",
+            "CASCADIA_HOSTING_WINDOW_CLASS",
+            "MozillaWindowClass",
+            "",
+            "tauri window",       // lowercase, must NOT match Tauri's
+            "zptoolbarparentwnd", // case-sensitive Win32 class names
+            "Chrome_RenderWidgetHostHWND",
+        ] {
+            assert!(
+                !is_known_share_helper(c),
+                "unexpected share-helper match: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_classes_recognised() {
+        assert!(is_own_window_class("PromptPlayerMenuOwner"));
+    }
+
+    #[test]
+    fn tauri_window_class_is_a_valid_restore_target() {
+        // The library / About windows share Tauri's default class. Skipping it
+        // would redirect a prompt meant for the library into whatever app sits
+        // beneath it in z-order — see the doc comment on `is_own_window_class`.
+        assert!(!is_own_window_class("Tauri Window"));
+    }
+
+    #[test]
+    fn non_own_classes_pass_through() {
+        for c in [
+            "Chrome_WidgetWin_1",
+            "Notepad",
+            "Tauri Window",          // our webview windows — legitimate targets
+            "promptplayermenuowner", // case-sensitive
+            "PromptPlayer",          // partial / prefix
+            "ZPToolBarParentWnd",    // share-helper, not own
+            "",
+        ] {
+            assert!(!is_own_window_class(c), "unexpected own-class match: {c}");
+        }
+    }
+
+    #[test]
+    fn share_and_own_are_disjoint() {
+        let share = [
+            "ZPToolBarParentWnd",
+            "ZPContentViewWndClass",
+            "ZPFloatVideoWndClass",
+            "Zoom_ShareControlBar",
+            "ZPMeetingMainFrameClassForWindow",
+            "ZPSharingFloatToolbarClass",
+        ];
+        let own = ["PromptPlayerMenuOwner"];
+        for s in share {
+            assert!(!is_own_window_class(s), "share class also matched own: {s}");
+        }
+        for o in own {
+            assert!(
+                !is_known_share_helper(o),
+                "own class also matched share: {o}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // T3 — F1..F5: select_target classifier tests (pure, no Win32 state).
+    // ---------------------------------------------------------------------
+
+    fn cand(class: &str) -> CandidateWindow {
+        CandidateWindow {
+            hwnd_raw: 0x1000,
+            class: class.into(),
+            title: Some(format!("{class} title")),
+            visible: true,
+            cloaked: false,
+            iconic: false,
+        }
+    }
+
+    #[test]
+    fn f1_share_helper_at_head_is_skipped() {
+        let cs = vec![cand("ZPToolBarParentWnd"), cand("Chrome_WidgetWin_1")];
+        let picked = select_target(&cs).expect("must pick the non-share-helper");
+        assert_eq!(picked.class, "Chrome_WidgetWin_1");
+    }
+
+    #[test]
+    fn f2_own_class_at_head_is_skipped() {
+        let cs = vec![cand("PromptPlayerMenuOwner"), cand("Notepad")];
+        let picked = select_target(&cs).expect("must pick past our own window");
+        assert_eq!(picked.class, "Notepad");
+    }
+
+    #[test]
+    fn f3_cloaked_iconic_invisible_are_skipped() {
+        let mut cloaked = cand("Notepad");
+        cloaked.cloaked = true;
+        let mut iconic = cand("Slack");
+        iconic.iconic = true;
+        let mut hidden = cand("Edge");
+        hidden.visible = false;
+        let visible = cand("Code");
+        let cs = vec![cloaked, iconic, hidden, visible];
+        let picked = select_target(&cs).expect("must reach the first visible candidate");
+        assert_eq!(picked.class, "Code");
+    }
+
+    #[test]
+    fn f4_no_acceptable_returns_none() {
+        let cs = vec![
+            cand("ZPToolBarParentWnd"),
+            cand("ZPContentViewWndClass"),
+            cand("PromptPlayerMenuOwner"),
+            {
+                let mut c = cand("Notepad");
+                c.iconic = true;
+                c
+            },
+        ];
+        assert!(
+            select_target(&cs).is_none(),
+            "no acceptable candidate must return None"
+        );
+    }
+
+    #[test]
+    fn f5_normal_foreground_is_picked_unchanged() {
+        // Locks in the 99% case: a normal foreground class is selected as
+        // the target with no walking past — same behavior as pre-Layer-C.
+        for c in ["Chrome_WidgetWin_1", "Notepad", "MozillaWindowClass"] {
+            let cs = vec![cand(c)];
+            let picked = select_target(&cs).unwrap_or_else(|| panic!("must pick {c}"));
+            assert_eq!(picked.class, c);
+        }
+    }
+
+    #[test]
+    fn select_target_caps_at_10() {
+        let mut cs: Vec<CandidateWindow> = (0..10).map(|_| cand("PromptPlayerMenuOwner")).collect();
+        cs.push(cand("Notepad"));
+        assert!(
+            select_target(&cs).is_none(),
+            "select_target must respect the 10-iteration cap"
+        );
+    }
+
+    #[test]
+    fn select_target_picks_at_cap_boundary() {
+        let mut cs: Vec<CandidateWindow> = (0..9).map(|_| cand("PromptPlayerMenuOwner")).collect();
+        cs.push(cand("Notepad"));
+        let picked = select_target(&cs).expect("10th candidate is within the cap");
+        assert_eq!(picked.class, "Notepad");
+    }
+
+    // ---------------------------------------------------------------------
+    // T4 / L2 — logging snapshot tests for select_target's decisions.
+    // ---------------------------------------------------------------------
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn select_target_logs_accepted_decision() {
+        let cs = vec![cand("Notepad")];
+        let _ = select_target(&cs);
+        assert!(
+            logs_contain("accepted candidate"),
+            "expected an 'accepted candidate' log line"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn select_target_logs_rejection_reason() {
+        let cs = vec![cand("ZPToolBarParentWnd"), cand("Notepad")];
+        let _ = select_target(&cs);
+        assert!(logs_contain("rejected candidate"));
+        assert!(
+            logs_contain("share_helper"),
+            "rejection reason for ZP class must surface in the log"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn select_target_logs_cloaked_rejection() {
+        let mut c = cand("Notepad");
+        c.cloaked = true;
+        let cs = vec![c];
+        let _ = select_target(&cs);
+        assert!(logs_contain("cloaked"));
+    }
+}

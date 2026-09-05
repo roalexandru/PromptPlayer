@@ -72,7 +72,10 @@ fn run_hook_thread(app_state: Arc<AppState>) {
         )
     };
     let hook = match hook {
-        Ok(h) => h,
+        Ok(h) => {
+            tracing::info!(hhook = h.0 as usize, "WH_KEYBOARD_LL installed");
+            h
+        }
         Err(e) => {
             tracing::error!("SetWindowsHookExW(WH_KEYBOARD_LL) failed: {}", e);
             app_state.set_hook_alive(false);
@@ -106,6 +109,17 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     }
 
     let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+
+    // Costs nothing at the default `info` filter; flip with
+    // `RUST_LOG=prompt_player::hook=trace` to see what the hook actually sees.
+    tracing::trace!(
+        target: "prompt_player::hook",
+        vk = info.vkCode,
+        scan = info.scanCode,
+        flags = info.flags.0,
+        injected = info.flags.0 & LLKHF_INJECTED.0 != 0,
+        "raw key event"
+    );
 
     // CRITICAL: drop injected events. Ours would feed the panic ring and
     // self-cancel; other tools' would trigger prompts. macOS filters by PID.
