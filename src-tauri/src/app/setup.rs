@@ -892,7 +892,9 @@ fn generate_typescript_bindings() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(all(test, debug_assertions))]
+// Off Windows like `tests/ipc_registry.rs`: touching `tauri::Wry` retains a
+// WebView2 import the runner can't resolve at load, killing the test binary.
+#[cfg(all(test, debug_assertions, not(target_os = "windows")))]
 mod bindings_tests {
     /// Regenerate `ipc.gen.ts` and fail if the checked-in copy was stale.
     /// The regenerated file is left in place, so the fix is to commit it.
