@@ -47,12 +47,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// run would fail the second `RegisterClassExW`.
 static CLASS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-unsafe extern "system" fn wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wp: WPARAM,
-    lp: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     DefWindowProcW(hwnd, msg, wp, lp)
 }
 
@@ -189,8 +184,8 @@ fn a_recursive_apply_sets_affinity_on_full_tree() {
         "descendants must include grandchild"
     );
 
-    let (applied, attempted) =
-        apply_affinity_recursive(tree.parent, WDA_EXCLUDEFROMCAPTURE).expect("apply_affinity_recursive");
+    let (applied, attempted) = apply_affinity_recursive(tree.parent, WDA_EXCLUDEFROMCAPTURE)
+        .expect("apply_affinity_recursive");
     assert_eq!(
         applied, attempted,
         "every Set call should succeed on valid HWNDs"
@@ -228,7 +223,11 @@ fn c_recursive_apply_is_idempotent() {
         "second apply must produce identical (applied, attempted) counts"
     );
     assert_affinity(tree.parent, WDA_EXCLUDEFROMCAPTURE, "parent after 2x");
-    assert_affinity(tree.grandchild, WDA_EXCLUDEFROMCAPTURE, "grandchild after 2x");
+    assert_affinity(
+        tree.grandchild,
+        WDA_EXCLUDEFROMCAPTURE,
+        "grandchild after 2x",
+    );
 }
 
 #[test]

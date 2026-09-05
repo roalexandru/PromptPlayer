@@ -111,8 +111,7 @@ fn restore_to(pid: u64) -> bool {
 #[cfg(target_os = "windows")]
 fn capture_foreground() -> ForegroundSnapshot {
     use crate::platform::windows::capture::{
-        class_name_of, collect_z_order_candidates, foreground_hwnd, select_target,
-        window_title_of,
+        class_name_of, collect_z_order_candidates, foreground_hwnd, select_target, window_title_of,
     };
     let fg = foreground_hwnd();
     if fg.0.is_null() {

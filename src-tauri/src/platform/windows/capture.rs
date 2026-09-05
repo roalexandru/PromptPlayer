@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowDisplayAffinity,
     GetWindowTextW, IsIconic, IsWindowVisible, SetWindowDisplayAffinity, GW_HWNDNEXT,
-    WDA_MONITOR, WINDOW_DISPLAY_AFFINITY,
+    WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR, WINDOW_DISPLAY_AFFINITY,
 };
 
 // --------------------------------------------------------------------------
@@ -47,14 +47,22 @@ pub fn is_known_share_helper(class: &str) -> bool {
     )
 }
 
-/// Our own top-level window classes. The foreground-snapshot filter must walk
-/// past these when picking the real target — the picker is briefly foreground
-/// between the user's commit keystroke and our `hide()` call.
+/// Our own helper window classes that must never be a focus-restore target.
 ///
-/// Tauri's default top-level class is `"Tauri Window"`; the menu owner is
-/// `"PromptPlayerMenuOwner"` (see `platform/windows/menu.rs::ensure_helper`).
+/// Today that is only the native tray-menu owner, `"PromptPlayerMenuOwner"`
+/// (see `platform/windows/menu.rs::ensure_helper`): `TrackPopupMenuEx`
+/// requires the owner to be foreground, so when the user picks "Command
+/// palette…" from the tray the raw `GetForegroundWindow()` *is* that hidden
+/// helper, and restoring focus to it would type into the void.
+///
+/// Deliberately NOT listed: Tauri's default class `"Tauri Window"`. It is
+/// shared by every webview window we own — the picker, but also the library
+/// and About windows. The focus snapshot is taken in `summon_picker` *before*
+/// the picker is shown (and is skipped when it is already visible), so a
+/// foreground `"Tauri Window"` at capture time is the library / About window
+/// the user is typing in, which is exactly where the prompt should land.
 pub fn is_own_window_class(class: &str) -> bool {
-    matches!(class, "Tauri Window" | "PromptPlayerMenuOwner")
+    matches!(class, "PromptPlayerMenuOwner")
 }
 
 // --------------------------------------------------------------------------
@@ -132,6 +140,15 @@ pub fn enumerate_descendants(parent: HWND) -> Vec<HWND> {
 ///    official workaround is the `LegacyDisplayAffinity` Application
 ///    Compatibility shim (see https://aka.ms/AppCompat). This function
 ///    cannot fix that — it can only detect and log it.
+///
+/// **Caveat on descendants.** The `SetWindowDisplayAffinity` documentation
+/// states the handle must be *a top-level window belonging to the current
+/// process* and that the call fails for non-top-level windows. Every HWND
+/// returned by `EnumChildWindows` is non-top-level (and WebView2's are owned
+/// by the `msedgewebview2.exe` process), so descendant rejections are the
+/// documented outcome, not an anomaly: they are logged at `debug` and show
+/// up as `applied < attempted` in the summary line. The parent HWND is the
+/// one that must succeed.
 pub fn apply_affinity_recursive(
     parent: HWND,
     affinity: WINDOW_DISPLAY_AFFINITY,
@@ -141,6 +158,10 @@ pub fn apply_affinity_recursive(
     }
     let mut attempted = 0usize;
     let mut applied = 0usize;
+    // Affinity to propagate to descendants: matches what the parent actually
+    // ended up with, so a WDA_MONITOR fallback isn't paired with children
+    // still being asked for WDA_EXCLUDEFROMCAPTURE.
+    let mut effective = affinity;
 
     attempted += 1;
     match unsafe { SetWindowDisplayAffinity(parent, affinity) } {
@@ -176,11 +197,10 @@ pub fn apply_affinity_recursive(
                 // black rectangle to the audience instead of being fully
                 // excluded, which is a strictly-better failure mode than
                 // "picker fully visible in the share."
-                if affinity.0 == 0x11
-                /* WDA_EXCLUDEFROMCAPTURE */
-                {
+                if affinity == WDA_EXCLUDEFROMCAPTURE {
                     if let Ok(()) = unsafe { SetWindowDisplayAffinity(parent, WDA_MONITOR) } {
                         applied += 1;
+                        effective = WDA_MONITOR;
                         tracing::warn!(
                             target: "prompt_player::capture",
                             hwnd = parent.0 as usize,
@@ -203,21 +223,27 @@ pub fn apply_affinity_recursive(
 
     for child in enumerate_descendants(parent) {
         attempted += 1;
-        match unsafe { SetWindowDisplayAffinity(child, affinity) } {
+        match unsafe { SetWindowDisplayAffinity(child, effective) } {
             Ok(()) => {
                 applied += 1;
                 tracing::debug!(
+                    target: "prompt_player::capture",
                     hwnd = child.0 as usize,
                     class = %class_name_of(child),
-                    affinity = affinity.0,
+                    affinity = effective.0,
                     "display-affinity set (descendant)"
                 );
             }
             Err(e) => {
-                tracing::warn!(
+                // Expected for non-top-level / foreign-process HWNDs (see the
+                // doc comment) — keep it out of the default `info` log so a
+                // picker show doesn't emit one warning per WebView2 child.
+                tracing::debug!(
+                    target: "prompt_player::capture",
                     hwnd = child.0 as usize,
                     class = %class_name_of(child),
-                    "SetWindowDisplayAffinity on descendant failed: {e}"
+                    hresult = format!("0x{:08X}", e.code().0 as u32),
+                    "SetWindowDisplayAffinity on descendant rejected: {e}"
                 );
             }
         }
@@ -228,7 +254,7 @@ pub fn apply_affinity_recursive(
         parent = parent.0 as usize,
         applied,
         attempted,
-        affinity = affinity.0,
+        affinity = effective.0,
         "display-affinity applied to picker tree"
     );
 
@@ -239,9 +265,11 @@ pub fn apply_affinity_recursive(
 /// failure. Used by the T2 integration test to assert recursive-apply hit
 /// every descendant.
 pub fn current_display_affinity(hwnd: HWND) -> Option<WINDOW_DISPLAY_AFFINITY> {
-    let mut out = WINDOW_DISPLAY_AFFINITY(0);
-    let res = unsafe { GetWindowDisplayAffinity(hwnd, &mut out) };
-    res.ok().map(|_| out)
+    // `GetWindowDisplayAffinity` is bound with a raw `*mut u32` out-param
+    // (the newtype is only used on the `Set` side), so read into a `u32`.
+    let mut raw: u32 = 0;
+    let res = unsafe { GetWindowDisplayAffinity(hwnd, &mut raw) };
+    res.ok().map(|_| WINDOW_DISPLAY_AFFINITY(raw))
 }
 
 /// Thin wrapper around `GetForegroundWindow` — kept here so the focus module's
@@ -410,8 +438,15 @@ mod tests {
 
     #[test]
     fn own_classes_recognised() {
-        assert!(is_own_window_class("Tauri Window"));
         assert!(is_own_window_class("PromptPlayerMenuOwner"));
+    }
+
+    #[test]
+    fn tauri_window_class_is_a_valid_restore_target() {
+        // The library / About windows share Tauri's default class. Skipping it
+        // would redirect a prompt meant for the library into whatever app sits
+        // beneath it in z-order — see the doc comment on `is_own_window_class`.
+        assert!(!is_own_window_class("Tauri Window"));
     }
 
     #[test]
@@ -419,9 +454,10 @@ mod tests {
         for c in [
             "Chrome_WidgetWin_1",
             "Notepad",
-            "tauri window",       // case-sensitive
-            "PromptPlayer",       // partial / prefix
-            "ZPToolBarParentWnd", // share-helper, not own
+            "Tauri Window",          // our webview windows — legitimate targets
+            "promptplayermenuowner", // case-sensitive
+            "PromptPlayer",          // partial / prefix
+            "ZPToolBarParentWnd",    // share-helper, not own
             "",
         ] {
             assert!(!is_own_window_class(c), "unexpected own-class match: {c}");
@@ -438,7 +474,7 @@ mod tests {
             "ZPMeetingMainFrameClassForWindow",
             "ZPSharingFloatToolbarClass",
         ];
-        let own = ["Tauri Window", "PromptPlayerMenuOwner"];
+        let own = ["PromptPlayerMenuOwner"];
         for s in share {
             assert!(!is_own_window_class(s), "share class also matched own: {s}");
         }
@@ -474,7 +510,7 @@ mod tests {
 
     #[test]
     fn f2_own_class_at_head_is_skipped() {
-        let cs = vec![cand("Tauri Window"), cand("Notepad")];
+        let cs = vec![cand("PromptPlayerMenuOwner"), cand("Notepad")];
         let picked = select_target(&cs).expect("must pick past our own window");
         assert_eq!(picked.class, "Notepad");
     }
@@ -497,7 +533,7 @@ mod tests {
     fn f4_no_acceptable_returns_none() {
         let cs = vec![
             cand("ZPToolBarParentWnd"),
-            cand("Tauri Window"),
+            cand("ZPContentViewWndClass"),
             cand("PromptPlayerMenuOwner"),
             {
                 let mut c = cand("Notepad");
@@ -524,7 +560,7 @@ mod tests {
 
     #[test]
     fn select_target_caps_at_10() {
-        let mut cs: Vec<CandidateWindow> = (0..10).map(|_| cand("Tauri Window")).collect();
+        let mut cs: Vec<CandidateWindow> = (0..10).map(|_| cand("PromptPlayerMenuOwner")).collect();
         cs.push(cand("Notepad"));
         assert!(
             select_target(&cs).is_none(),
@@ -534,7 +570,7 @@ mod tests {
 
     #[test]
     fn select_target_picks_at_cap_boundary() {
-        let mut cs: Vec<CandidateWindow> = (0..9).map(|_| cand("Tauri Window")).collect();
+        let mut cs: Vec<CandidateWindow> = (0..9).map(|_| cand("PromptPlayerMenuOwner")).collect();
         cs.push(cand("Notepad"));
         let picked = select_target(&cs).expect("10th candidate is within the cap");
         assert_eq!(picked.class, "Notepad");

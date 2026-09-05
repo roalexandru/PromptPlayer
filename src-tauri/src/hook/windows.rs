@@ -101,10 +101,7 @@ fn run_hook_thread(app_state: Arc<AppState>) {
     };
     let hook = match hook {
         Ok(h) => {
-            tracing::info!(
-                hhook = h.0 as usize,
-                "WH_KEYBOARD_LL installed"
-            );
+            tracing::info!(hhook = h.0 as usize, "WH_KEYBOARD_LL installed");
             h
         }
         Err(e) => {
