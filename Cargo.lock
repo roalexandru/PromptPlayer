@@ -3858,7 +3858,7 @@ dependencies = [
 
 [[package]]
 name = "prompt-player"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "block",
@@ -3925,7 +3925,7 @@ dependencies = [
 
 [[package]]
 name = "prompt-player-guest-helper"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "enigo",
@@ -6318,7 +6318,7 @@ checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
 
 [[package]]
 name = "typing-engine-cli"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "prompt-player",
  "rand 0.8.6",
