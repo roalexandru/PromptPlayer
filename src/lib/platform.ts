@@ -1,9 +1,5 @@
-// Single source of truth for platform-conditional behavior in the frontend.
-//
-// Resolved once at module import time via @tauri-apps/plugin-os. Synchronous
-// access elsewhere in the app is the goal — async detection would force every
-// caller to await, which is overkill for a value that never changes during a
-// session.
+// Platform-conditional behavior for the frontend, resolved once at import so
+// callers stay synchronous — the value never changes during a session.
 
 import { platform as tauriPlatform } from "@tauri-apps/plugin-os";
 
@@ -13,9 +9,8 @@ const _plat = (() => {
   try {
     return tauriPlatform() as Plat;
   } catch {
-    // Outside a Tauri context (Vitest/jsdom), default to macOS so existing
-    // dev/test paths keep working. Tests that need Windows behavior should
-    // mock the plugin module.
+    // Outside Tauri (Vitest/jsdom) default to macOS; tests needing Windows
+    // should mock the plugin module.
     return "macos" as Plat;
   }
 })();
@@ -29,9 +24,8 @@ export const IS_LINUX = _plat === "linux";
 /// hotkey hints match what the user expects on each OS.
 export const PRIMARY_MOD: "cmd" | "ctrl" = IS_MAC ? "cmd" : "ctrl";
 
-/// Render a single normalized modifier token as the symbol (Mac) or text
-/// label (Windows) the user expects. Tokens are the lowercased forms used by
-/// hotkey.rs / HotkeyRecorder.svelte: `cmd`, `ctrl`, `alt`, `shift`, `win`.
+/// Render one modifier token as a Mac symbol or Windows label. Tokens are the
+/// lowercased forms used by `hotkey.rs` and `HotkeyRecorder.svelte`.
 export function prettyMod(token: string): string {
   const t = token.toLowerCase();
   if (IS_MAC) {

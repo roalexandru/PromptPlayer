@@ -1,23 +1,10 @@
-//! Native Windows `WH_KEYBOARD_LL` hook — mirrors the macOS `CGEventTap`
-//! architecture. `rdev` doesn't expose `LLKHF_INJECTED` on its `Event` API,
-//! which means we couldn't tell apart organic keystrokes from chars our own
-//! `SendInput` injects during playback. The result was a feedback loop: our
-//! body chars fed the §2.6 panic ring (3 keys / 300 ms) and self-cancelled
-//! after ~3 chars.
+//! Native `WH_KEYBOARD_LL` hook mirroring the macOS tap. Ours rather than
+//! `rdev`'s, which hides `LLKHF_INJECTED` and let playback self-cancel.
 //!
-//! What this module does instead: install our own low-level keyboard hook,
-//! check the `LLKHF_INJECTED` bit on every event, and short-circuit injected
-//! events before they ever reach `process_event`. This is the structural
-//! equivalent of macOS's PID filter at `hook/macos.rs:189-197`.
-//!
-//! Char translation uses `ToUnicodeEx` against the foreground window's
-//! keyboard layout (per-thread layouts are a thing on Windows), with the
-//! "don't change keyboard state" flag so dead keys don't get consumed by
-//! our hook ahead of the target app. Modifier state is read with
-//! `GetKeyState` rather than `GetKeyboardState` because the latter returns
-//! stale data when called from a non-foreground thread.
+//! `ToUnicodeEx` against the foreground layout gives chars without consuming
+//! dead keys; modifiers use `GetKeyState`, which works off-thread.
 
-use crate::hook::{process_event, HookDecision, HookDeps, KeyEvent};
+use crate::hook::{process_event, HookCallbacks, HookDecision, HookDeps, KeyEvent};
 use crate::matcher::MatcherState;
 use crate::state::AppState;
 use crate::undo::UndoLog;
@@ -26,8 +13,8 @@ use std::thread;
 use windows::Win32::Foundation::{HMODULE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, ToUnicodeEx, HKL, VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL,
-    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RMENU,
-    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB,
+    VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN,
+    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, SetWindowsHookExW,
@@ -35,21 +22,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
-pub type FireCallback = Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>;
-pub type UndoCallback = Arc<dyn Fn() + Send + Sync>;
-pub type LiteralCommitCallback = Arc<dyn Fn(char) + Send + Sync>;
-pub type CommitObservedCallback = Arc<dyn Fn(bool, usize) + Send + Sync>;
-
 /// Per-process hook context. Set once on `spawn`; the extern hook proc reads
 /// it via this `OnceLock` because it can't capture closures.
 struct HookContext {
     matcher: Arc<MatcherState>,
     undo: Arc<UndoLog>,
     app_state: Arc<AppState>,
-    on_fire: FireCallback,
-    on_undo: UndoCallback,
-    on_literal_commit: LiteralCommitCallback,
-    on_commit_observed: CommitObservedCallback,
+    cb: HookCallbacks,
 }
 
 static GLOBAL_CTX: OnceLock<HookContext> = OnceLock::new();
@@ -58,19 +37,13 @@ pub fn spawn(
     matcher: Arc<MatcherState>,
     undo: Arc<UndoLog>,
     app_state: Arc<AppState>,
-    on_fire: FireCallback,
-    on_undo: UndoCallback,
-    on_literal_commit: LiteralCommitCallback,
-    on_commit_observed: CommitObservedCallback,
+    cb: HookCallbacks,
 ) {
     let ctx = HookContext {
         matcher,
         undo,
         app_state: app_state.clone(),
-        on_fire,
-        on_undo,
-        on_literal_commit,
-        on_commit_observed,
+        cb,
     };
     if GLOBAL_CTX.set(ctx).is_err() {
         tracing::warn!("hook::windows::spawn called twice — ignoring duplicate");
@@ -86,9 +59,8 @@ pub fn spawn(
 
 fn run_hook_thread(app_state: Arc<AppState>) {
     tracing::info!("hook thread starting (native WH_KEYBOARD_LL)");
-    // Mark alive optimistically. If install fails below we flip back to
-    // false; if anything else surprises us, the watcher in setup.rs picks
-    // up the false state on its next tick.
+    // Optimistic; flipped back on install failure, and the setup.rs watcher
+    // picks up anything else on its next tick.
     app_state.set_hook_alive(true);
 
     let hook = unsafe {
@@ -108,9 +80,8 @@ fn run_hook_thread(app_state: Arc<AppState>) {
         }
     };
 
-    // Standard message pump. Low-level hooks are dispatched to `hook_proc`
-    // automatically by the OS; the pump just keeps the thread alive so the
-    // hook stays installed.
+    // The OS dispatches to `hook_proc` itself; the pump just keeps this thread
+    // alive so the hook stays installed.
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -136,12 +107,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 
     let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
 
-    // CRITICAL FILTER: skip injected events. These come from `SendInput`
-    // calls — ours during playback, or any other automation tool's. Letting
-    // them flow through `process_event` would (a) feed our own body chars
-    // into the panic-ring and self-cancel after 3 chars, and (b) let other
-    // automation tools accidentally trigger our prompts. macOS filters by
-    // PID at `hook/macos.rs:195`; we filter by the OS-tagged flag here.
+    // CRITICAL: drop injected events. Ours would feed the panic ring and
+    // self-cancel; other tools' would trigger prompts. macOS filters by PID.
     if info.flags.0 & LLKHF_INJECTED.0 != 0 {
         return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
     }
@@ -155,16 +122,14 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         matcher: &ctx.matcher,
         undo: &ctx.undo,
         app_state: &ctx.app_state,
-        on_fire: &ctx.on_fire,
-        on_undo: &ctx.on_undo,
-        on_literal_commit: &ctx.on_literal_commit,
-        on_commit_observed: &ctx.on_commit_observed,
+        cb: &ctx.cb,
+        // Windows has no Secure Event Input equivalent.
+        secure_input_active: false,
     };
     match process_event(&key_event, &deps) {
         HookDecision::Pass => CallNextHookEx(HHOOK::default(), code, wparam, lparam),
-        // Suppress the keystroke entirely — non-zero return tells Windows
-        // not to dispatch the event to the target window (this is how the
-        // commit char gets eaten when a trigger fires).
+        // Non-zero tells Windows not to dispatch to the target window — this
+        // is how the commit char gets eaten when a trigger fires.
         HookDecision::Suppress => LRESULT(1),
     }
 }
@@ -194,7 +159,9 @@ fn translate_kbdllhookstruct(info: &KBDLLHOOKSTRUCT) -> KeyEvent {
             | VK_CAPITAL
     );
 
-    let typed = if is_backspace || is_pure_modifier || is_separator {
+    let is_escape = vk == VK_ESCAPE;
+
+    let typed = if is_backspace || is_pure_modifier || is_separator || is_escape {
         None
     } else {
         unsafe { translate_to_unicode(info.vkCode, info.scanCode) }
@@ -205,15 +172,13 @@ fn translate_kbdllhookstruct(info: &KBDLLHOOKSTRUCT) -> KeyEvent {
         is_backspace,
         is_pure_modifier,
         is_separator,
+        is_escape,
     }
 }
 
 unsafe fn translate_to_unicode(vk_code: u32, scan_code: u32) -> Option<char> {
-    // Build a 256-byte key state vector covering the modifiers
-    // `ToUnicodeEx` actually consults. `GetKeyState` works from any thread
-    // (returns the synchronous virtual key state), unlike `GetKeyboardState`
-    // which returns stale data when called from a non-foreground thread —
-    // exactly our situation here.
+    // 256-byte state vector for the modifiers `ToUnicodeEx` consults.
+    // `GetKeyState` works off the foreground thread; `GetKeyboardState` doesn't.
     let mut key_state = [0u8; 256];
     for vk in [
         VK_SHIFT,
@@ -233,10 +198,8 @@ unsafe fn translate_to_unicode(vk_code: u32, scan_code: u32) -> Option<char> {
         key_state[vk.0 as usize] = ((state >> 8) as u8 & 0x80) | ((state & 1) as u8);
     }
 
-    // Use the active layout of the foreground window — Windows is per-thread
-    // about layouts, and we want the same layout the user is actually
-    // typing into. Falls back to current-thread layout if the foreground
-    // window can't be queried.
+    // Layouts are per-thread on Windows, so use the foreground window's.
+    // Falls back to this thread's layout if that can't be queried.
     let layout: HKL = {
         let hwnd = GetForegroundWindow();
         if !hwnd.is_invalid() {
@@ -248,15 +211,12 @@ unsafe fn translate_to_unicode(vk_code: u32, scan_code: u32) -> Option<char> {
     };
 
     let mut buf = [0u16; 8];
-    // `wflags = 4` (bit 2) = "do not change keyboard state" — without this,
-    // `ToUnicodeEx` would consume any pending dead-key state, breaking the
-    // user's actual composition in the target app. Requires Win10 1607+,
-    // which is universal at this point.
+    // Bit 2 = "do not change keyboard state", or we'd consume pending dead-key
+    // state and break the user's composition. Win10 1607+.
     let result = ToUnicodeEx(vk_code, scan_code, &key_state, &mut buf, 4, layout);
     if result <= 0 {
-        // 0 = no char produced (modifier alone). -1 = dead key (with the
-        // "don't change state" flag we won't consume it; the next press
-        // will translate normally).
+        // 0 = no char (modifier alone). -1 = dead key, left unconsumed for the
+        // next press.
         return None;
     }
     let s = String::from_utf16_lossy(&buf[..result as usize]);

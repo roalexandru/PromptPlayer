@@ -2,9 +2,8 @@
 //!
 //! Re-exports for tests and the `typing-engine-cli` binary.
 
-// Legacy `objc` macros emit `cargo-clippy` cfg probes that Rust's check-cfg
-// sees at our call sites. Keep validation output focused until those small
-// macOS shims finish moving to `objc2`.
+// Legacy `objc` macros emit `cargo-clippy` cfg probes at our call sites.
+// Silenced until the last macOS shims move to `objc2`.
 #![allow(unexpected_cfgs)]
 
 pub mod typer;
@@ -26,15 +25,16 @@ pub mod power;
 pub mod prompts;
 pub mod rdp;
 pub mod scopes;
+pub mod settings;
 pub mod state;
 pub mod store;
 pub mod telemetry;
+pub mod tray_icon;
 pub mod undo;
 
-#[cfg(target_os = "macos")]
+// Not cfg-gated: both carry `cfg(not(macos))` stubs for cross-platform callers,
+// and gating the modules made those stubs unreachable.
 pub mod secure_input;
-
-#[cfg(target_os = "macos")]
 pub mod tcc;
 
 pub mod picker;

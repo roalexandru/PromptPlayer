@@ -1,10 +1,8 @@
-//! NSScreen geometry helpers.
+//! NSScreen geometry — the one place that finds the cursor's screen and puts a
+//! window centered ~30% from its top (Spotlight placement).
 //!
-//! Single source of truth for "find the screen that contains the cursor and
-//! place a window centered there, ~30% from the top (Spotlight placement)".
-//!
-//! All geometry math is in AppKit bottom-left coords; we use `setFrameOrigin:`
-//! directly so no conversion to Tauri's top-left coord system is needed.
+//! All math is AppKit bottom-left coords via `setFrameOrigin:`, so nothing has
+//! to convert to Tauri's top-left space.
 
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSPoint, NSRect};
@@ -37,10 +35,8 @@ fn cursor_screen_visible_frame() -> Option<NSRect> {
     }
 }
 
-/// Reposition the picker centered horizontally on the screen that contains
-/// the cursor, with `top_padding_fraction` of the visible-frame height
-/// between the top of the screen and the top of the window (Spotlight uses
-/// ~0.30). Does NOT show or activate.
+/// Center the picker horizontally on the cursor's screen, `top_padding_fraction`
+/// of the visible height down (Spotlight uses ~0.30). Doesn't show or activate.
 pub fn position_centered_on_cursor(window: &tauri::WebviewWindow, top_padding_fraction: f64) {
     let Ok(ns_window_ptr) = window.ns_window() else {
         return;
@@ -58,10 +54,8 @@ pub fn position_centered_on_cursor(window: &tauri::WebviewWindow, top_padding_fr
     }
 }
 
-/// Position the picker on whichever screen contains the cursor (Spotlight
-/// placement). Caller is expected to invoke this on the main thread —
-/// `NSEvent.mouseLocation` and `NSScreen.screens` return stale data when
-/// called from a background thread.
+/// Place the picker on the cursor's screen. Main thread only — `mouseLocation`
+/// and `NSScreen.screens` return stale data off it.
 pub fn position_picker_on_cursor_screen(app: &AppHandle) {
     let Some(window) = app.get_webview_window("picker") else {
         return;
@@ -69,10 +63,8 @@ pub fn position_picker_on_cursor_screen(app: &AppHandle) {
     position_centered_on_cursor(&window, 0.30);
 }
 
-/// Find the visible-frame of the NSScreen containing the cursor. AppKit
-/// coords (logical points, bottom-left origin, single unified coord space
-/// across all monitors regardless of DPI). Returns None if no screen
-/// contains the cursor (rare; can happen during space transitions).
+/// Visible frame of the screen under the cursor, in AppKit points. None when
+/// no screen contains it, which happens during Space transitions.
 fn cursor_screen_frame_full() -> Option<(NSRect, NSRect)> {
     unsafe {
         let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
@@ -97,15 +89,8 @@ fn cursor_screen_frame_full() -> Option<(NSRect, NSRect)> {
     }
 }
 
-/// Position the tray popover relative to the cursor (which sits on the
-/// tray icon at click time). Uses NSEvent + NSScreen + setFrameOrigin
-/// directly — bypasses Tauri's PhysicalPosition path which is ambiguous
-/// on mixed-DPI multi-monitor setups (monitor physical-pixel bounds can
-/// overlap when scale factors differ).
-///
-/// Anchor: just below the menu bar, horizontally aligned with the cursor's
-/// x. Clamped to the click monitor's visible frame so the popup never
-/// crosses a screen edge.
+/// Place the popover under the cursor, below the menu bar, clamped to that
+/// monitor. AppKit directly — Tauri's physical-pixel path is DPI-ambiguous.
 pub fn position_popover_under_cursor(window: &tauri::WebviewWindow) {
     let Ok(ns_window_ptr) = window.ns_window() else {
         return;
@@ -118,18 +103,12 @@ pub fn position_popover_under_cursor(window: &tauri::WebviewWindow) {
         let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
         let win_frame: NSRect = msg_send![ns_window, frame];
 
-        // Cursor is in AppKit coords (Y-up from the primary screen's
-        // bottom-left). visibleFrame.size.height excludes the menu bar
-        // and Dock; visibleFrame.origin.y is just below the menu bar.
-        // Place the window's TOP edge 4 pt below the menu bar.
+        // visibleFrame excludes the menu bar and Dock, so its top edge is the
+        // menu bar; put the window 4 pt below that.
         let menu_bar_bottom_y = visible_frame.origin.y + visible_frame.size.height; // top of visible area
         let target_y = menu_bar_bottom_y - 4.0 - win_frame.size.height;
-        // Native NSMenu under NSStatusItem is LEFT-aligned with the icon's
-        // left edge — not centered under the cursor. The cursor lands
-        // approximately in the icon's center, so we shift the popup's
-        // left edge ~12 pt left of the cursor (≈ half a 22-pt icon width).
-        // Clamping below keeps the popup on the screen if the icon sits
-        // near the right edge.
+        // Native menus left-align with the icon, not the cursor, so shift left
+        // by ~half an icon width. Clamping keeps it on screen near the edge.
         const ICON_HALF_WIDTH_PT: f64 = 12.0;
         let mut target_x = cursor.x - ICON_HALF_WIDTH_PT;
 

@@ -1,33 +1,8 @@
-//! IPC registry safeguards.
+//! IPC registry safeguards: both macro lists match `COMMAND_NAMES`, and every
+//! `tauri::State<'_, T>` has a matching `.manage`.
 //!
-//! Catches regressions in three layers that unit tests do not see:
-//! - 1) The `tauri::generate_handler!` list in `app/setup.rs` agrees with
-//!      the source-of-truth list in `commands::COMMAND_NAMES`.
-//! - 2) The `tauri_specta::collect_commands!` list in `app/setup.rs` agrees
-//!      with the same source of truth (so the generated TS bindings match
-//!      the actual Tauri-registered commands).
-//! - 3) Every typed `tauri::State<'_, T>` parameter has a corresponding
-//!      `.manage(T)` call — verified by building a real `tauri::test::mock_app()`,
-//!      registering state via `manage_state`, registering commands via
-//!      `generate_handler!`, and pinging each AppHandle-free command. Any
-//!      "state not managed for field" surfaces as a test failure.
-//!
-//! Why these tests:
-//! - The May 1 picker regression was a stale `invoke("ipc_list_prompts")`
-//!   string in `picker.svelte` that no Rust unit test could see. The
-//!   `scripts/lint-ipc.sh` script now blocks that class of bug at CI time.
-//! - The `state not managed for field 'store'` regression on the same day
-//!   was caused by adding a `tauri::State<'_, PromptStore>` parameter to a
-//!   command without `.manage(ctx.prompts.clone())`. Test #3 below exercises
-//!   the exact code path that hit and fails before merge.
-//!
-//! Platform note (Windows): the runtime smoke test (#3) requires the
-//! `tauri/test` feature, which on Windows links against WebView2 at
-//! executable load time. The CI runner's WebView2 component mismatches
-//! at link load (`STATUS_ENTRYPOINT_NOT_FOUND`), so the entire test
-//! binary fails to start. We gate this whole integration test on
-//! non-Windows; the cross-check tests #1 and #2 are duplicated as unit
-//! tests inside `commands::mod` so they still run on Windows CI.
+//! The smoke test is gated off Windows, where `tauri/test` links WebView2 at
+//! load; the cross-checks are duplicated in `commands::mod` to cover it.
 
 #![cfg(not(target_os = "windows"))]
 
@@ -35,9 +10,7 @@ use prompt_player::app::context::AppContext;
 use prompt_player::app::setup::manage_state;
 use prompt_player::commands::COMMAND_NAMES;
 
-// ---------------------------------------------------------------------------
 // Cross-check #1: COMMAND_NAMES vs tauri::generate_handler! in setup.rs
-// ---------------------------------------------------------------------------
 
 const SETUP_RS: &str = include_str!("../src/app/setup.rs");
 
@@ -72,9 +45,8 @@ fn generate_handler_list_matches_command_names() {
     );
 }
 
-/// The inline `.manage()` block in `run()` and the `manage_state` helper
-/// list the same set of types. If you add a managed type to one but forget
-/// the other, this test fails before merge.
+/// `run()`'s inline `.manage()` block and the `manage_state` helper list the
+/// same types — adding to one and forgetting the other fails here.
 #[test]
 fn manage_state_helper_matches_inline_block_in_run() {
     fn extract_manage_chain(src: &str, marker: &str) -> Vec<String> {
@@ -86,10 +58,8 @@ fn manage_state_helper_matches_inline_block_in_run() {
         let mut managed = Vec::new();
         for line in chunk.lines() {
             let l = line.trim();
-            // Match .manage(...) and builder.manage(...) regardless of leading
-            // whitespace. We extract the *managed type expression* and
-            // normalize trivial differences that don't affect runtime
-            // semantics (`ctx.clone()` and `ctx` both manage AppContext).
+            // Extract the managed type expression, normalizing differences that
+            // don't change runtime semantics (`ctx.clone()` vs `ctx`).
             for prefix in [".manage(", "builder.manage("] {
                 if let Some(rest) = l.strip_prefix(prefix) {
                     if let Some(end) = rest.find(')') {
@@ -139,9 +109,8 @@ fn manage_state_helper_matches_inline_block_in_run() {
 
 #[test]
 fn collect_commands_list_matches_command_names() {
-    // tauri-specta's collect_commands! lives in `generate_typescript_bindings`
-    // — same file. Each entry has the form `crate::commands::module::name`,
-    // so `.split("::").last()` still yields the bare name.
+    // Entries here are `crate::commands::module::name`, so the same
+    // `.split("::").last()` still yields the bare name.
     let registered = extract_macro_paths(SETUP_RS, "collect_commands");
     let expected: Vec<String> = COMMAND_NAMES.iter().map(|s| s.to_string()).collect();
     assert_eq!(
@@ -152,39 +121,15 @@ fn collect_commands_list_matches_command_names() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Smoke test #2: every command resolves and finds its managed state.
-// ---------------------------------------------------------------------------
-//
-// `tauri::test::mock_builder()` returns a `Builder<MockRuntime>`, but our
-// production commands are locked to `tauri::Wry` (because downstream
-// telemetry / FireService / aptabase plugin paths are all Wry-typed). So we
-// can't reuse `manage_state` + `generate_handler!` directly here.
-//
-// Workaround: we re-register the *no-AppHandle* commands against
-// `MockRuntime` — those are the ones that depend purely on `tauri::State<>`
-// and so exercise managed-state coverage. Together they touch all three
-// state types (`Arc<AppState>`, `PromptStore`, `AppContext`), so any
-// missing `.manage()` call surfaces here.
-//
-// The AppHandle-taking commands are not exercised at runtime by this test,
-// but the cross-check tests above ensure they're registered, and the
-// `lint-ipc.sh` script ensures the frontend can never call them with stale
-// command-name strings.
+// Smoke test #2: every command resolves and finds its managed state. Production
+// commands are `Wry`-typed, so we re-register the no-AppHandle subset here.
 
 use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 
-/// Build a `tauri::test::App<MockRuntime>` with all production-equivalent
-/// state managed and the no-AppHandle commands registered.
-///
-/// IMPORTANT: redirects the prompt library to a tempdir via the
-/// `PROMPT_PLAYER_PROMPTS` env var BEFORE any IPC command that writes to
-/// disk runs (`save_prompt`, `create_prompt`, `set_prompt_enabled`). Without
-/// this, `cargo test` against the real binary would happily write
-/// `smoke-created.pp.md` etc. into the developer's actual library at
-/// `~/Library/Application Support/PromptPlayer/prompts/`.
+/// A `MockRuntime` app with production state and the no-AppHandle commands.
+/// Redirects the library to a tempdir before anything writes to disk.
 fn mock_app_with_state(prompts_dir: &std::path::Path) -> tauri::App<tauri::test::MockRuntime> {
     // Set BEFORE constructing AppContext / running any save command. The env
     // var is process-wide; we keep it set for the whole test process.
@@ -213,20 +158,12 @@ fn mock_app_with_state(prompts_dir: &std::path::Path) -> tauri::App<tauri::test:
             source_path: None,
         }]);
 
-    // Reuse the production `manage_state` function — guarantees this test
-    // sees every `.manage()` call the real app uses. If a new managed type
-    // gets added to production but a typed `tauri::State<>` consumer is
-    // forgotten, this test catches it.
+    // Reuse production's `manage_state` so this test sees every `.manage()`
+    // call the real app makes.
     manage_state(mock_builder(), ctx)
         .invoke_handler(tauri::generate_handler![
-            // No-AppHandle subset of the production registry. Every
-            // managed-state type is touched by at least one command here:
-            // `get_armed` → Arc<AppState>, `list_prompts` → PromptStore,
-            // `picker_search` → AppContext. The CRUD commands
-            // (save/create/delete/set_enabled/set_pinned) now also take an
-            // AppHandle (to reindex the matcher after a mutation), so they
-            // join the AppHandle group and can't be registered against
-            // MockRuntime — same as the armed/picker AppHandle commands.
+            // No-AppHandle subset, between them touching all three managed
+            // types. The CRUD commands take an AppHandle now, so they can't.
             prompt_player::commands::armed::get_armed,
             prompt_player::commands::prompts::list_prompts,
             prompt_player::commands::prompts::library_root,
@@ -258,20 +195,16 @@ fn ping(
 
 #[test]
 fn smoke_test_no_apphandle_commands_resolve_with_managed_state() {
-    // Isolate disk writes: every `save_prompt`/`create_prompt` invocation in
-    // this test would otherwise write a `.pp.md` file into the dev's real
-    // library. Tempdir survives the whole test (held in scope until end);
-    // dropped automatically with all files in it.
+    // Isolate disk writes, or every `save_prompt` here lands in the dev's real
+    // library. The tempdir is held in scope for the whole test.
     let prompts_dir = tempfile::tempdir().expect("tempdir");
     let app = mock_app_with_state(prompts_dir.path());
     let webview = WebviewWindowBuilder::new(&app, "smoke", WebviewUrl::App("/".into()))
         .build()
         .expect("smoke webview");
 
-    // For each command, send a mock IPC. The exact response shape varies by
-    // command; we only assert "didn't return command-not-found / state-not-managed".
-    // Tauri formats those as serde_json::Value with specific patterns; we
-    // pattern-match conservatively (any 'state not managed' substring).
+    // Send a mock IPC per command. Response shapes vary, so we only assert it
+    // isn't command-not-found or state-not-managed.
     let cases: Vec<(&str, serde_json::Value)> = vec![
         ("get_armed", serde_json::json!({})),
         ("list_prompts", serde_json::json!({})),
@@ -284,13 +217,8 @@ fn smoke_test_no_apphandle_commands_resolve_with_managed_state() {
 
     for (cmd, payload) in cases {
         let res = ping(&webview, cmd, payload);
-        // Distinguish two error layers:
-        //   - Framework errors from Tauri itself (state-not-managed,
-        //     command-not-found) come back as a JSON *string* — those are
-        //     real bugs the smoke test must catch.
-        //   - Application errors raised by our commands (e.g., our
-        //     `IpcError` shape `{kind, message}`) come back as a JSON
-        //     *object* — those are expected and not test failures.
+        // Tauri's own framework errors arrive as a JSON string and are real
+        // bugs; our `IpcError` objects are expected and not failures.
         if let Err(e) = &res {
             // Application-level error: structured {kind,message} object.
             // Skip these — they're legitimate command output.

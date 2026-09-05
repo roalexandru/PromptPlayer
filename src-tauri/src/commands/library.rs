@@ -1,15 +1,6 @@
-//! Library-window helper IPC (§10.2).
-//!
-//! Three small commands live here, all triggered from the prompt editor:
-//!  - `capture_foreground_app` — read NSWorkspace / GetForegroundWindow and
-//!    return identifying metadata. The frontend hides the library window
-//!    *before* calling so the captured app is the one the user actually
-//!    wants to scope to (not Prompt Player itself).
-//!  - `expand_prompt_text` — run the same placeholder + expression pipeline
-//!    the typing engine uses, against an arbitrary string. Powers the
-//!    "Test" button in the editor.
-//!  - `import_prompt` / `export_prompt` — file-dialog-driven copy in/out
-//!    of the library root.
+//! Library-window helper IPC (§10.2): capture the foreground app for scoping
+//! (the frontend hides itself first, so it isn't us), preview a body through
+//! the real expansion pipeline, and import/export `.pp.md` files.
 
 use crate::error::{into_ipc, AppError, IpcResult};
 use crate::prompts::{
@@ -21,9 +12,8 @@ use crate::prompts::{
 };
 use crate::store::PromptStore;
 
-/// Identifying info for a foreground app. Every field is optional because
-/// platforms surface different subsets — Mac always has bundle_id+name,
-/// Windows always has executable+window_title, neither has both.
+/// Foreground-app identity. All optional: macOS gives bundle_id + name,
+/// Windows gives executable + window_title, neither gives both.
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ForegroundAppInfo {
@@ -42,9 +32,8 @@ pub fn capture_foreground_app() -> ForegroundAppInfo {
 #[cfg(target_os = "macos")]
 fn capture_foreground_impl() -> ForegroundAppInfo {
     let snap = crate::platform::macos::nsworkspace::frontmost_app();
-    // Derive a human-readable name from the executable path (e.g.,
-    // "/Applications/Cursor.app/Contents/MacOS/Cursor" → "Cursor"). Using
-    // the bundle ID as a fallback keeps the field non-empty.
+    // Human-readable name from the executable path, falling back to the
+    // bundle id so the field is never empty.
     let name = snap
         .executable_path
         .as_deref()
@@ -134,30 +123,21 @@ fn capture_foreground_impl() -> ForegroundAppInfo {
     }
 }
 
-/// Run a string through the same placeholder + expression pipeline used at
-/// fire time. Powers the editor's "Test" button. Errors inside `${{ … }}`
-/// blocks surface inline as `[expr error: …]` (consistent with how typing
-/// would handle them). Tab-stops, choices, and selection are not resolved
-/// here — the body is rendered as if the user had no clipboard / selection
-/// context, which is the right default for an authoring preview.
+/// Run a string through the fire-time expansion pipeline for the editor's
+/// "Test" button. Tab-stops and selection stay unresolved in a preview.
 #[tauri::command]
 #[specta::specta]
 pub fn expand_prompt_text(text: String) -> String {
-    // Order matches fire.rs: expressions first (their output may contain
-    // placeholder syntax), then placeholders. Context is intentionally
-    // minimal — `clipboard` / `selection` / app metadata are not populated
-    // because the library window is the foreground, so the values would
-    // either be empty or refer to Prompt Player itself. Authors who want
-    // to see those substitute can fire the prompt for real.
+    // Same order as fire.rs: expressions (whose output may contain placeholder
+    // syntax) then placeholders. Context stays empty — we're the foreground app.
     let expr_ctx = ExprContext::default();
     let after_expr = expressions::expand_expressions(&text, &expr_ctx);
     let ph_ctx = PlaceholderContext::default();
     placeholders::expand(&after_expr, &ph_ctx).text
 }
 
-/// Import a `.pp.md` file: read it, parse it (validates frontmatter),
-/// then copy into the library root with a fresh ID if one already exists.
-/// Returns the parsed `Prompt` so the frontend can select it immediately.
+/// Read and parse a `.pp.md`, then copy it into the library root with a fresh
+/// id on collision. Returns the prompt so the frontend can select it.
 #[tauri::command]
 #[specta::specta]
 pub fn import_prompt(
@@ -190,9 +170,7 @@ pub fn import_prompt(
             source: e,
         }));
     }
-    // Pick a non-colliding destination filename based on the imported prompt's
-    // ID. Suffix `-2`, `-3`, … if needed so we never silently overwrite an
-    // existing file.
+    // Suffix `-2`, `-3`, … so an import never silently overwrites a file.
     let mut id = parsed.id.clone();
     let mut dest = root.join(format!("{id}.pp.md"));
     let mut n = 1;
@@ -213,9 +191,8 @@ pub fn import_prompt(
     into_ipc(result.map(|_| prompt))
 }
 
-/// Export a prompt to a user-chosen path. Re-serializes the in-memory
-/// `Prompt` to `.pp.md` rather than copying the source file, so unsaved
-/// edits in the library don't get exported as the older on-disk version.
+/// Export a prompt, re-serializing from memory rather than copying the file —
+/// otherwise unsaved edits export as the older on-disk version.
 #[tauri::command]
 #[specta::specta]
 pub fn export_prompt(

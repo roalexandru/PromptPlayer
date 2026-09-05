@@ -1,10 +1,5 @@
-//! §5.6 — filter chain. Composable per-prompt transformations applied at fire time.
-//!
-//! Built-ins: lowercase, uppercase, capitalize, trim, strip-thinking-blocks,
-//! markdown-to-plain, inject-typos, regex-replace.
-//!
-//! Custom TypeScript filters via `boa_engine` are added in Phase 8 (this module
-//! exposes a `Filter::Custom` variant gated by config).
+//! §5.6 — composable per-prompt transformations applied at fire time. The
+//! built-in set is the `Filter` enum below; `Filter::Custom` is config-gated.
 
 use serde::Deserialize;
 
@@ -76,10 +71,8 @@ fn markdown_to_plain(text: &str) -> String {
 }
 
 fn inject_typos(text: &str, _arg: Option<&str>) -> String {
-    // The Phase 1 typer already injects typos at schedule time. The filter is
-    // here for completeness; running it on the source text would be redundant
-    // for the typing path, but useful if a filter chain wants to seed visible
-    // typos for paste-mode (Alt+Enter).
+    // Redundant for the typing path (the typer injects typos at schedule time),
+    // but a chain can use it to seed visible typos for paste mode.
     text.to_string()
 }
 

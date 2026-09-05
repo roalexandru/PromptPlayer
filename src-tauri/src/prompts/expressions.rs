@@ -1,18 +1,8 @@
-//! §6.3 — TypeScript expressions via QuickJS.
+//! §6.3 — `${{ expr }}` in a QuickJS sandbox; double-brace so it can't clash
+//! with VS Code placeholders.
 //!
-//! Syntax: `${{ expr }}` — double-brace to disambiguate from VS Code single-brace
-//! placeholders.
-//!
-//! Sandbox guarantees per §6.3:
-//!  - No filesystem (helpers `git()` / `shell()` exist but are off by default).
-//!  - No network (host objects not exposed).
-//!  - 100 ms execution timeout via QuickJS interrupt handler.
-//!  - 10 MB runtime memory cap and 256 KB stack cap.
-//!  - Frozen built-ins: `now`, `today`, `clipboard`, `selection`, `app`, `env`,
-//!    `random`, `random_choice([...])`, `format_date(d, fmt)`, `ago(d)`.
-//!
-//! Lazy evaluation is honored at the call site (Phase 8 stub here): expressions
-//! are evaluated only when their slot is reached during typing.
+//! No filesystem or network host objects, an interrupt-handler timeout, memory
+//! and stack caps, and the frozen built-ins defined in the prelude below.
 
 use chrono::Local;
 use rquickjs::{Context, Ctx, Error as QuickJsError, Runtime};
@@ -42,10 +32,30 @@ pub enum ExprError {
     Timeout(Duration),
 }
 
-// Wall-clock ceiling for *script evaluation* (started after the QuickJS
-// runtime is built — see `eval`). Real expressions finish in single-digit ms;
-// the headroom is purely to absorb CPU contention on slow CI runners and
-// still kill genuine runaway scripts.
+impl ExprError {
+    /// Telemetry classification. Carries no message — the text can contain
+    /// fragments of the user's expression source, which §12 forbids sending.
+    pub fn kind(&self) -> crate::telemetry::ExpressionErrorKind {
+        use crate::telemetry::ExpressionErrorKind as K;
+        match self {
+            Self::Syntax(_) => K::Syntax,
+            Self::Runtime(_) => K::Runtime,
+            Self::Timeout(_) => K::Timeout,
+        }
+    }
+}
+
+/// Outcome of expanding a body's `${{ … }}` blocks.
+pub struct Expansion {
+    pub text: String,
+    /// The body contained at least one `${{ … }}` block. From the marker, not a
+    /// length comparison — that missed same-length expansions.
+    pub had_expressions: bool,
+    pub errors: Vec<ExprError>,
+}
+
+// Ceiling for script evaluation only, timed after the runtime is built. Real
+// expressions take single-digit ms; the headroom absorbs CI contention.
 const EVAL_BUDGET: Duration = Duration::from_millis(250);
 const MEMORY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const STACK_LIMIT_BYTES: usize = 256 * 1024;
@@ -138,10 +148,8 @@ pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
     "#
     );
 
-    // Start the eval clock only now — AFTER constructing the QuickJS runtime
-    // and context. Including engine cold-start in EVAL_BUDGET made the first
-    // eval spuriously time out on slow/contended CI runners (setup alone could
-    // exceed the budget), failing whichever expression test lost the CPU race.
+    // Clock starts after the runtime and context exist: counting engine
+    // cold-start made the first eval time out spuriously on loaded CI.
     let deadline = Instant::now() + EVAL_BUDGET;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
     let started = Instant::now();
@@ -211,6 +219,14 @@ fn exception_message(js: &Ctx<'_>) -> String {
 /// Parse `body` and replace every `${{ … }}` block with the evaluated string.
 /// Other content is left untouched. Errors surface as `[expr error: …]` inline.
 pub fn expand_expressions(body: &str, ctx: &ExprContext) -> String {
+    expand_expressions_reporting(body, ctx).text
+}
+
+/// Like [`expand_expressions`] but reports which blocks failed, so the caller
+/// can emit telemetry. Failures used to be `tracing::warn!`-only.
+pub fn expand_expressions_reporting(body: &str, ctx: &ExprContext) -> Expansion {
+    let mut errors = Vec::new();
+    let mut had_expressions = false;
     let mut out = String::with_capacity(body.len());
     let bytes: Vec<char> = body.chars().collect();
     let mut i = 0;
@@ -241,12 +257,14 @@ pub fn expand_expressions(body: &str, ctx: &ExprContext) -> String {
                 i += 1;
                 continue;
             }
+            had_expressions = true;
             let expr: String = bytes[i + 3..j].iter().collect();
             match eval(expr.trim(), ctx) {
                 Ok(s) => out.push_str(&s),
                 Err(e) => {
                     out.push_str(&format!("[expr error: {}]", e));
                     tracing::warn!("expression error: {}", e);
+                    errors.push(e);
                 }
             }
             i = j + 2;
@@ -255,7 +273,11 @@ pub fn expand_expressions(body: &str, ctx: &ExprContext) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    out
+    Expansion {
+        text: out,
+        had_expressions,
+        errors,
+    }
 }
 
 #[cfg(test)]

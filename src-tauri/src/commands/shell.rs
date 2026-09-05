@@ -6,9 +6,8 @@
 use crate::error::{into_ipc, AppError, IpcResult};
 use url::Url;
 
-/// Open an `http://` or `https://` URL in the user's default browser.
-/// Rejects any other scheme — keeps the IPC from doubling as a generic
-/// shell-execute primitive.
+/// Open an http(s) URL in the default browser. Other schemes are rejected, so
+/// this can't double as a shell-execute primitive.
 #[tauri::command]
 #[specta::specta]
 pub fn open_external(url: String) -> IpcResult<()> {

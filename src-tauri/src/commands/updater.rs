@@ -1,24 +1,15 @@
-//! Auto-update IPC commands (§13).
-//!
-//! Three commands surface to the frontend:
-//!  - `updater_current_version`: synchronous — current binary version.
-//!  - `updater_check`: hits the GitHub Releases endpoint, returns
-//!    `UpdateInfo { available, version?, notes? }`.
-//!  - `updater_install`: downloads the update, installs it, and restarts
-//!    the app. Blocks until the restart begins.
-//!
-//! Telemetry: every successful check fires `update_check`; a successful
-//! install fires `update_applied` before the process exits. No prompt
-//! content or update payload is ever logged.
+//! Auto-update IPC (§13). Failed checks report too — a broken updater used to
+//! look identical to an up-to-date machine — and the install path flushes
+//! before handing off, since on Windows the installer never gives us back.
 
+use crate::app::context::AppContext;
 use crate::error::{into_ipc, AppError, IpcResult};
-use crate::telemetry::{self, TelemetryEvent};
+use crate::telemetry::{self, TelemetryEvent, UpdateFailStage};
 use tauri::AppHandle;
 use tauri_plugin_updater::UpdaterExt;
 
-/// Result of a `check()` call. `version` and `notes` are populated only
-/// when an update is available; otherwise `available` is `false` and the
-/// fields are `None`.
+/// Result of a `check()`. `version` and `notes` are set only when an update is
+/// actually available.
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateInfo {
@@ -26,6 +17,8 @@ pub struct UpdateInfo {
     pub current_version: String,
     pub version: Option<String>,
     pub notes: Option<String>,
+    /// True when the user has already dismissed this exact version.
+    pub dismissed: bool,
 }
 
 #[tauri::command]
@@ -36,48 +29,82 @@ pub fn updater_current_version() -> String {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn updater_check(app: AppHandle) -> IpcResult<UpdateInfo> {
+pub async fn updater_check(
+    app: AppHandle,
+    ctx: tauri::State<'_, AppContext>,
+) -> IpcResult<UpdateInfo> {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {
+            telemetry::send(
+                &app,
+                TelemetryEvent::UpdateCheckFailed {
+                    stage: UpdateFailStage::Unavailable,
+                },
+            );
             return into_ipc(Err(AppError::UpdaterUnavailable(e.to_string())));
         }
     };
     match updater.check().await {
         Ok(Some(update)) => {
-            let info = UpdateInfo {
+            telemetry::send(&app, TelemetryEvent::UpdateCheck { available: true });
+            let dismissed = ctx.settings.get().dismissed_update.as_deref() == Some(&update.version);
+            Ok(UpdateInfo {
                 available: true,
                 current_version: current,
                 version: Some(update.version.clone()),
                 notes: update.body.clone(),
-            };
-            telemetry::send(
-                &app,
-                TelemetryEvent::UpdateCheck {
-                    available: true,
-                    current_version: env!("CARGO_PKG_VERSION"),
-                },
-            );
-            Ok(info)
+                dismissed,
+            })
         }
         Ok(None) => {
-            telemetry::send(
-                &app,
-                TelemetryEvent::UpdateCheck {
-                    available: false,
-                    current_version: env!("CARGO_PKG_VERSION"),
-                },
-            );
+            // A manual check is a deliberate user action, so it always
+            // reports — only the 6-hourly poller is throttled.
+            telemetry::send(&app, TelemetryEvent::UpdateCheck { available: false });
             Ok(UpdateInfo {
                 available: false,
                 current_version: current,
                 version: None,
                 notes: None,
+                dismissed: false,
             })
         }
-        Err(e) => into_ipc(Err(AppError::UpdaterCheckFailed(e.to_string()))),
+        Err(e) => {
+            telemetry::send(
+                &app,
+                TelemetryEvent::UpdateCheckFailed {
+                    stage: UpdateFailStage::Check,
+                },
+            );
+            into_ipc(Err(AppError::UpdaterCheckFailed(e.to_string())))
+        }
     }
+}
+
+/// The user saw an "Install update" affordance. Once per version, so a
+/// long-ignored update doesn't inflate the count on every poll.
+#[tauri::command]
+#[specta::specta]
+pub fn updater_announced(app: AppHandle, version: String, ctx: tauri::State<'_, AppContext>) {
+    let already = ctx.settings.get().announced_update.as_deref() == Some(&version);
+    if already {
+        return;
+    }
+    ctx.settings.update(|s| s.announced_update = Some(version));
+    telemetry::send(&app, TelemetryEvent::UpdateAvailableShown);
+}
+
+/// User dismissed the update. Clears the tray badge and suppresses the nag
+/// until a newer version lands.
+#[tauri::command]
+#[specta::specta]
+pub fn updater_dismiss(app: AppHandle, version: String, ctx: tauri::State<'_, AppContext>) {
+    ctx.settings.update(|s| s.dismissed_update = Some(version));
+    if ctx.attention.set_update(false) {
+        crate::tray_icon::refresh(&app);
+    }
+    telemetry::send(&app, TelemetryEvent::UpdateDismissed);
 }
 
 #[tauri::command]
@@ -85,14 +112,33 @@ pub async fn updater_check(app: AppHandle) -> IpcResult<UpdateInfo> {
 pub async fn updater_install(app: AppHandle) -> IpcResult<()> {
     let updater = match app.updater() {
         Ok(u) => u,
-        Err(e) => return into_ipc(Err(AppError::UpdaterUnavailable(e.to_string()))),
+        Err(e) => {
+            telemetry::send(
+                &app,
+                TelemetryEvent::UpdateCheckFailed {
+                    stage: UpdateFailStage::Unavailable,
+                },
+            );
+            return into_ipc(Err(AppError::UpdaterUnavailable(e.to_string())));
+        }
     };
     let update = match updater.check().await {
         Ok(Some(u)) => u,
         Ok(None) => return into_ipc(Err(AppError::UpdaterNoUpdateAvailable)),
-        Err(e) => return into_ipc(Err(AppError::UpdaterCheckFailed(e.to_string()))),
+        Err(e) => {
+            telemetry::send(
+                &app,
+                TelemetryEvent::UpdateCheckFailed {
+                    stage: UpdateFailStage::Check,
+                },
+            );
+            return into_ipc(Err(AppError::UpdaterCheckFailed(e.to_string())));
+        }
     };
     let to_version = update.version.clone();
+    // Drain BEFORE the handoff: on Windows the installer kills us inside
+    // `download_and_install`, so anything queued after this is lost.
+    telemetry::send_and_flush(&app, TelemetryEvent::UpdateInstallStarted);
     if let Err(e) = update
         .download_and_install(
             |_chunk, _total| { /* no per-chunk UI for v1 — silent install */ },
@@ -100,16 +146,35 @@ pub async fn updater_install(app: AppHandle) -> IpcResult<()> {
         )
         .await
     {
+        telemetry::send_and_flush(&app, TelemetryEvent::UpdateInstallFailed);
         return into_ipc(Err(AppError::UpdaterInstallFailed(e.to_string())));
     }
-    telemetry::send(
+    telemetry::send_and_flush(
         &app,
         TelemetryEvent::UpdateApplied {
-            from_version: env!("CARGO_PKG_VERSION"),
-            to_version: to_version.clone(),
+            to_version: truncate_version(&to_version),
         },
     );
     // Restart so the new bundle takes over. On macOS this re-launches the
     // .app; on Windows the MSI installer hands control back to a new exe.
     app.restart();
+}
+
+/// Keep the version string inside the §12 payload budget even if the manifest
+/// carries something unexpectedly long.
+fn truncate_version(v: &str) -> String {
+    v.chars().take(24).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_is_truncated_to_fit_the_payload_rule() {
+        assert_eq!(truncate_version("0.1.9"), "0.1.9");
+        let long = "9".repeat(64);
+        assert_eq!(truncate_version(&long).len(), 24);
+        assert!(truncate_version(&long).len() < 32);
+    }
 }

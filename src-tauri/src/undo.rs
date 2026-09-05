@@ -1,15 +1,7 @@
-//! §2.4 — backspace-undo for misfired expansions.
+//! §2.4 — a Backspace within 2s of an expansion erases the body; the trigger
+//! was never typed over, so it stays on screen.
 //!
-//! On expansion: record `{trigger_word, body_typed_chars, fired_at}` in a 2s ring.
-//! On Backspace within 2s of an expansion: send `body.len()` backspaces. The
-//! trigger itself is never erased during expansion (the body is typed as a
-//! continuation after it), so undo leaves the user's original trigger on screen.
-//!
-//! Espanso ships this; it's critical demo recovery (§2.4).
-//!
-//! Consumption contract: the hook checks `has_recent` (non-consuming) to decide
-//! whether to suppress the Backspace; `FireService::run_undo` is the single
-//! consumer via `take_recent`.
+//! The hook peeks with `has_recent`; `run_undo` is the sole consumer.
 
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
@@ -57,9 +49,8 @@ impl UndoLog {
         e.pop()
     }
 
-    /// Non-consuming check: is there an entry within the undo window?
-    /// Used by the hook to decide whether to suppress the Backspace; the
-    /// entry itself is consumed later by the undo executor via `take_recent`.
+    /// Non-consuming: is there an entry inside the undo window? The executor
+    /// consumes it later via `take_recent`.
     pub fn has_recent(&self, now: Instant) -> bool {
         let mut e = self.entries.lock();
         e.retain(|en| now.duration_since(en.fired_at) <= UNDO_WINDOW);
@@ -98,9 +89,8 @@ mod tests {
 
     #[test]
     fn has_recent_does_not_consume() {
-        // Regression: the hook peeks (has_recent) and the undo executor pops
-        // (take_recent). If the hook consumed the entry, the executor would
-        // find nothing and the user's Backspace would be swallowed for free.
+        // Regression: if the hook's peek consumed the entry, the executor would
+        // find nothing and the Backspace would be swallowed for free.
         let log = UndoLog::new();
         log.record("Build".into(), 10);
         let now = Instant::now();

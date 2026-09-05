@@ -1,12 +1,7 @@
-//! §3.1 — cadence distributions.
-//!
-//! All values are milliseconds. Distributions match the empirically validated
-//! keystroke biometrics literature (Aalto 2018, Sequeira 2021, Roeser 2021).
-//!
-//! Base inter-key interval is a **mixture of two log-normals**:
-//! - 85% fluent: LogNormal(μ=4.95, σ=0.35), median ≈ 140 ms
-//! - 15% micro-hesitation: LogNormal(μ=6.20, σ=0.50), median ≈ 490 ms
-//! - Clamped to [60, 3000] ms.
+//! §3.1 — cadence distributions, in milliseconds, following the keystroke
+//! biometrics literature (Aalto 2018, Sequeira 2021, Roeser 2021). The base
+//! inter-key interval mixes two log-normals — 85% fluent, 15% hesitation —
+//! with the parameters and clamp given by the constants below.
 
 use rand::Rng;
 use rand_distr::{Distribution, LogNormal, Normal};
@@ -19,12 +14,8 @@ pub const IKI_HESITATION_PROBABILITY: f64 = 0.15;
 pub const IKI_MIN_MS: f64 = 60.0;
 pub const IKI_MAX_MS: f64 = 3000.0;
 
-// Boundary pauses tuned so total throughput matches the WPM targets in
-// `profiles.rs`. Original spec values (5.7/7.0/2500/1500/1800) were calibrated
-// against keystroke-biometrics studies that don't include the rich punctuation
-// and paragraph structure that prompt bodies actually have, so they ended up
-// crowding the typing budget. New values keep the *shape* of the distributions
-// (log-normal for word/sentence, normal for paragraph) but with shorter means.
+// Tuned to hit the WPM targets in `profiles.rs`: same distribution shapes as
+// the spec, shorter means, because prompt-shaped punctuation crowds the budget.
 pub const WORD_PAUSE_MU: f64 = 5.2; // median ~180 ms (was ~300 ms)
 pub const WORD_PAUSE_SIGMA: f64 = 0.4;
 pub const SENTENCE_PAUSE_MU: f64 = 6.4; // median ~600 ms (was ~1100 ms)

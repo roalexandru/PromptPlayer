@@ -1,9 +1,6 @@
-//! Unified application error type.
-//!
-//! Replaces ad-hoc `String` errors used across the IPC layer. Implements
-//! `serde::Serialize` so Tauri commands can surface structured errors to the
-//! frontend (`{ "kind": "...", "message": "..." }`) instead of free-form
-//! strings that drift over time.
+//! Unified error type for the IPC layer. Serializes as
+//! `{ kind, message }` so the frontend gets structured errors rather than
+//! free-form strings that drift.
 
 use serde::Serialize;
 use std::path::PathBuf;
@@ -100,10 +97,8 @@ impl Serialize for AppError {
     }
 }
 
-/// Specta-friendly mirror of `AppError`. The IPC layer returns this so the
-/// generated TypeScript bindings have a clean structured-error shape:
-/// `{ kind: string; message: string }`. `From<AppError>` converts at the
-/// command boundary.
+/// Specta-friendly mirror of `AppError`, so the generated bindings get a clean
+/// `{ kind, message }`. `From<AppError>` converts at the command boundary.
 #[derive(Debug, Clone, Serialize, specta::Type)]
 pub struct IpcError {
     pub kind: String,
@@ -172,9 +167,8 @@ mod tests {
 
     #[test]
     fn from_tauri_error_lifts() {
-        // Construct a tauri::Error via its public surface — using a known
-        // variant. We'll synthesize from a custom IO error and let the
-        // From impl handle it.
+        // Build a `tauri::Error` through its public surface by synthesizing an
+        // IO error and letting the `From` impl take it.
         let e: AppError = std::io::Error::new(std::io::ErrorKind::NotFound, "nope").into();
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["kind"], "io");
