@@ -93,6 +93,7 @@ fn show_window(app: &AppHandle, label: &str) {
         // can silently fail; `orderFrontRegardless` raises it without activating.
         #[cfg(target_os = "macos")]
         crate::platform::macos::order_window_front_regardless(&w);
+        crate::app::lifecycle::notify_shown(app, label);
     }
 }
 

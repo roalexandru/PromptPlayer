@@ -814,6 +814,10 @@ fn spawn_update_poller(app: tauri::AppHandle, ctx: AppContext) {
                         );
                         let dismissed =
                             ctx.settings.get().dismissed_update.as_deref() == Some(&update.version);
+                        // Parked for the Windows native menu, which is built
+                        // on demand and can't receive the event below.
+                        *ctx.pending_update.write() =
+                            (!dismissed).then(|| update.version.to_string());
                         if !dismissed {
                             let payload = serde_json::json!({
                                 "version": update.version,
@@ -1048,6 +1052,9 @@ pub(crate) fn reindex_after_mutation(app: &AppHandle, ctx: &AppContext) {
     rebuild_match_index(ctx);
     shortcuts::rebuild_prompt_hotkeys(app, ctx);
     shortcuts::refresh_tray_popup(app);
+    // Tell the library window instead of making it ask twice a second for the
+    // lifetime of the process.
+    lifecycle::emit_to_window(app, "library", lifecycle::LIBRARY_CHANGED, ());
 }
 
 /// The bundled `prompts-examples` dir inside the .app/.msi. None under

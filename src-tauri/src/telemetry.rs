@@ -92,6 +92,12 @@ pub enum TelemetryEvent {
     PickerSearchChars {
         chars_typed: u8,
     },
+    /// §5.4 did not fully take effect on this show, so the picker may be
+    /// visible to a screen share. Rare enough to report per occurrence — a
+    /// machine that hits it hits it on every open, which is the point.
+    CaptureExclusionDegraded {
+        reason: CaptureDegradeReason,
+    },
     /// `hook_alive` rides along because arming a dead hook is a silent no-op —
     /// the user arms, nothing fires, they disarm, and nothing said why.
     ArmToggled {
@@ -313,6 +319,17 @@ pub enum ExpressionErrorKind {
     Timeout,
 }
 
+/// How far short of full capture exclusion the picker ended up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureDegradeReason {
+    /// Windows fell back to `WDA_MONITOR` — content hidden, but the audience
+    /// sees a black rectangle where the picker sits.
+    MonitorFallback,
+    /// The syscall failed outright; assume the picker is fully visible.
+    Failed,
+}
+
 /// Which entry point summoned the palette. Three copy-pasted open sequences
 /// existed and only one emitted anything, so the funnel was invisible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -478,6 +495,7 @@ impl TelemetryEvent {
             Self::PickerOpened { .. } => "picker_opened",
             Self::PickerDismissed => "picker_dismissed",
             Self::PickerSearchChars { .. } => "picker_search_chars",
+            Self::CaptureExclusionDegraded { .. } => "capture_exclusion_degraded",
             Self::ArmToggled { .. } => "arm_toggled",
             Self::KeepAwakeToggled { .. } => "keep_awake_toggled",
             Self::KeepAwakeExpired => "keep_awake_expired",
@@ -633,6 +651,9 @@ mod tests {
                 kind: "claude-command",
                 count: 7,
             },
+            TelemetryEvent::CaptureExclusionDegraded {
+                reason: CaptureDegradeReason::MonitorFallback,
+            },
         ]
     }
 
@@ -678,7 +699,8 @@ mod tests {
                 | TelemetryEvent::SelfTestCompleted { .. }
                 | TelemetryEvent::TypingBlocked { .. }
                 | TelemetryEvent::SourceRefreshed { .. }
-                | TelemetryEvent::AgentPromptsImported { .. } => 1,
+                | TelemetryEvent::AgentPromptsImported { .. }
+                | TelemetryEvent::CaptureExclusionDegraded { .. } => 1,
             };
             assert_eq!(counted, 1);
         }

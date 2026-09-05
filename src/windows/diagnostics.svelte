@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import { ipc } from "$lib/ipc";
+  import { ipc, fmtErr } from "$lib/ipc";
   import { IS_MAC } from "$lib/platform";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { pollWhileVisible } from "$lib/events";
   import type { Diagnostics, SelfTestReport, UiSettings } from "$lib/ipc";
 
   let diag = $state<Diagnostics | null>(null);
@@ -12,7 +13,8 @@
   let probeValue = $state("");
   let probeEl = $state<HTMLInputElement | null>(null);
   let roundtrip = $state<"idle" | "waiting" | "pass" | "fail">("idle");
-  let timer: ReturnType<typeof setInterval> | null = null;
+  let closeError = $state<string | null>(null);
+  let stopPolling: (() => void) | null = null;
 
   async function refresh() {
     try {
@@ -23,14 +25,14 @@
     }
   }
 
-  onMount(() => {
-    refresh();
+  onMount(async () => {
     // The whole point is watching status change while the user fixes it in
-    // System Settings, so poll rather than snapshotting once.
-    timer = setInterval(refresh, 2000);
+    // System Settings, so poll — but only while this window is on screen.
+    // Tauri creates it at launch even though it starts hidden.
+    stopPolling = await pollWhileVisible(refresh, 2000);
   });
   onDestroy(() => {
-    if (timer) clearInterval(timer);
+    stopPolling?.();
   });
 
   async function runSelfTest() {
@@ -89,9 +91,14 @@
   }
 
   async function close() {
+    // Don't swallow this: a denied `core:window:allow-close` looks exactly
+    // like a dead button, which is how the missing capability went unnoticed.
     try {
       await getCurrentWindow().close();
-    } catch {}
+    } catch (e) {
+      console.error("diagnostics close failed", e);
+      closeError = fmtErr(e);
+    }
   }
 
   function onKey(e: KeyboardEvent) {
@@ -156,6 +163,13 @@
             <span class="value">{diag.secureInputActive ? "Active — triggers gated" : "Clear"}</span>
           </div>
         {/if}
+        <div class="row" class:warn={diag.captureDegraded}>
+          <span class="mark">{diag.captureDegraded ? "!" : "✓"}</span>
+          <span class="label">Hidden from screen capture</span>
+          <span class="value">
+            {diag.captureDegraded ? "Not fully — picker may be visible" : "Yes"}
+          </span>
+        </div>
         <div class="row">
           <span class="mark">{diag.armed ? "●" : "○"}</span>
           <span class="label">Armed</span>
@@ -253,6 +267,9 @@
       <div class="kv"><span>Prompts</span><code>{diag.libraryRoot}</code></div>
       <div class="kv"><span>Logs</span><code>{diag.logDir}</code></div>
     </section>
+    {#if closeError}
+      <p class="hint error">Couldn't close this window: {closeError}</p>
+    {/if}
   {:else}
     <p class="hint">Loading…</p>
   {/if}
@@ -400,6 +417,9 @@
     align-items: center;
     gap: 8px;
     font-size: 12.5px;
+  }
+  .hint.error {
+    color: #ff9a8f;
   }
   .hint {
     font-size: 11.5px;

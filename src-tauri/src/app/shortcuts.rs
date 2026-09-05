@@ -329,6 +329,12 @@ pub fn set_armed_and_report(app: &AppHandle, ctx: &AppContext, armed: bool) {
     ctx.state.set_armed(armed);
     ctx.settings.update(|s| s.armed = armed);
     refresh_tray_popup(app);
+    crate::app::lifecycle::emit_to_window(
+        app,
+        "library",
+        crate::app::lifecycle::ARMED_CHANGED,
+        armed,
+    );
     telemetry::send(
         app,
         TelemetryEvent::ArmToggled {

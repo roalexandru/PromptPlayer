@@ -16,6 +16,8 @@
   let hookStatus = $state<"ok" | "dead" | "unknown">("ok");
   // macOS Secure Input is engaged, so triggers are gated off right now.
   let secureInput = $state(false);
+  // §5.4 exclusion is not fully in effect — see `report_capture_exclusion`.
+  let captureDegraded = $state(false);
   // Keep-awake, with the auto-off the backend is enforcing.
   let keepAwake = $state<KeepAwakeState | null>(null);
   let showAwakeMenu = $state(false);
@@ -77,9 +79,11 @@
       const d = await ipc.getDiagnostics();
       hookStatus = d.hookAlive ? "ok" : "dead";
       secureInput = d.secureInputActive;
+      captureDegraded = d.captureDegraded;
     } catch {
       hookStatus = "unknown";
       secureInput = false;
+      captureDegraded = false;
     }
     try {
       keepAwake = await ipc.getKeepAwake();
@@ -598,6 +602,20 @@
       <span class="warn-dot"></span>
       <span class="label">Secure Input active — triggers paused</span>
     </div>
+    <div class="sep"></div>
+  {/if}
+
+  {#if captureDegraded}
+    <!-- §5.4 didn't fully take: the audience may be able to see the picker.
+         Mid-demo, the log file this used to live in is no use to anyone. -->
+    <button
+      class="row warn"
+      onclick={openDiagnostics}
+      title="The picker's screen-capture exclusion is not fully in effect"
+    >
+      <span class="warn-dot"></span>
+      <span class="label">Picker may be visible on screen share</span>
+    </button>
     <div class="sep"></div>
   {/if}
 

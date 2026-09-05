@@ -10,6 +10,8 @@
     type NewlineMode,
   } from "$lib/ipc";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { onWindowShown, LIBRARY_CHANGED, ARMED_CHANGED } from "$lib/events";
   import { open as openFileDialog, save as saveFileDialog, confirm } from "@tauri-apps/plugin-dialog";
   import { IS_MAC } from "$lib/platform";
   import CadencePreview from "$lib/components/CadencePreview.svelte";
@@ -503,11 +505,28 @@
     refresh();
     refreshArmed();
     ipc.libraryRoot().then((r) => (libRoot = r)).catch(() => {});
-    const t = setInterval(() => {
-      refreshArmed();
-      if (!dirty) refresh();
-    }, 2000);
-    return () => clearInterval(t);
+
+    // Event-driven, not polled. The backend already knows every mutation
+    // (`reindex_after_mutation`) and every arm change (`set_armed_and_report`),
+    // and this window is created at launch and stays alive but hidden for the
+    // whole session — so a timer here re-serialized the entire prompt library
+    // twice a minute, forever, for a window that may never be opened.
+    const subs: Promise<UnlistenFn>[] = [
+      listen(LIBRARY_CHANGED, () => {
+        if (!dirty) refresh();
+      }),
+      listen<boolean>(ARMED_CHANGED, (e) => {
+        armed = e.payload;
+      }),
+      onWindowShown(() => {
+        refreshArmed();
+        if (!dirty) refresh();
+      }),
+    ];
+
+    return () => {
+      for (const s of subs) s.then((u) => u()).catch(() => {});
+    };
   });
 </script>
 

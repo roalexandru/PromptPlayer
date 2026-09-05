@@ -1,13 +1,30 @@
 //! §5.4 — the picker is hidden from screen capture by default, via
 //! `NSWindowSharingNone` on macOS and `WDA_EXCLUDEFROMCAPTURE` on Windows.
 //! Recorders and capture cards render it black. No toggle.
+//!
+//! The applied result is returned rather than discarded: Windows can fall back
+//! to `WDA_MONITOR`, which still hides the content but paints a black rectangle
+//! the audience *can* see. That is a different promise, so the caller reports it.
 
 use tauri::WebviewWindow;
+
+/// What the OS actually granted. Windows can downgrade; macOS cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureExclusion {
+    /// The window is absent from captures entirely.
+    Full,
+    /// Hidden, but the audience sees a black rectangle where it sits
+    /// (`WDA_MONITOR`, the Win11 win32k-bug fallback).
+    Degraded,
+    /// Exclusion is off — only when the caller asked for it.
+    Off,
+}
 
 #[cfg(target_os = "macos")]
 mod plat {
     #![allow(deprecated)]
 
+    use super::CaptureExclusion;
     use cocoa::base::id;
     use objc::{msg_send, sel, sel_impl};
     use tauri::WebviewWindow;
@@ -17,7 +34,10 @@ mod plat {
     /// `NSWindowSharingReadOnly = 1`.
     const NS_WINDOW_SHARING_READ_ONLY: u64 = 1;
 
-    pub fn set_screen_capture_exclusion(window: &WebviewWindow, hide: bool) -> Result<(), String> {
+    pub fn set_screen_capture_exclusion(
+        window: &WebviewWindow,
+        hide: bool,
+    ) -> Result<CaptureExclusion, String> {
         let ns_win: id = window
             .ns_window()
             .map_err(|e| format!("ns_window: {}", e))? as id;
@@ -29,7 +49,12 @@ mod plat {
         unsafe {
             let _: () = msg_send![ns_win, setSharingType: kind];
         }
-        Ok(())
+        // AppKit has no partial mode and no failure signal here.
+        Ok(if hide {
+            CaptureExclusion::Full
+        } else {
+            CaptureExclusion::Off
+        })
     }
 }
 
@@ -38,33 +63,55 @@ mod plat {
     //! `WDA_EXCLUDEFROMCAPTURE` on the picker's top-level HWND.
     //! `SetWindowDisplayAffinity` rejects child windows, WebView2's included,
     //! so there is no descendant walk — see `windows::capture`.
+    use super::CaptureExclusion;
     use crate::platform::windows::capture::apply_display_affinity;
     use tauri::WebviewWindow;
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{WDA_EXCLUDEFROMCAPTURE, WDA_NONE};
+    use windows::Win32::UI::WindowsAndMessaging::{WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR, WDA_NONE};
 
-    pub fn set_screen_capture_exclusion(window: &WebviewWindow, hide: bool) -> Result<(), String> {
+    pub fn set_screen_capture_exclusion(
+        window: &WebviewWindow,
+        hide: bool,
+    ) -> Result<CaptureExclusion, String> {
         let hwnd = HWND(window.hwnd().map_err(|e| format!("hwnd: {}", e))?.0 as _);
         let affinity = if hide {
             WDA_EXCLUDEFROMCAPTURE
         } else {
             WDA_NONE
         };
-        apply_display_affinity(hwnd, affinity).map(|_| ())
+        let effective = apply_display_affinity(hwnd, affinity)?;
+        Ok(if effective == WDA_EXCLUDEFROMCAPTURE {
+            CaptureExclusion::Full
+        } else if effective == WDA_MONITOR {
+            CaptureExclusion::Degraded
+        } else {
+            CaptureExclusion::Off
+        })
     }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod plat {
+    use super::CaptureExclusion;
     use tauri::WebviewWindow;
-    pub fn set_screen_capture_exclusion(_w: &WebviewWindow, _hide: bool) -> Result<(), String> {
-        Ok(())
+    pub fn set_screen_capture_exclusion(
+        _w: &WebviewWindow,
+        hide: bool,
+    ) -> Result<CaptureExclusion, String> {
+        Ok(if hide {
+            CaptureExclusion::Full
+        } else {
+            CaptureExclusion::Off
+        })
     }
 }
 
 /// Apply the §5.4 screen-capture exclusion to the picker window.
 /// `hide=true` (default) makes the window invisible to recorders.
-pub fn apply_screen_capture_exclusion(window: &WebviewWindow, hide: bool) -> Result<(), String> {
+pub fn apply_screen_capture_exclusion(
+    window: &WebviewWindow,
+    hide: bool,
+) -> Result<CaptureExclusion, String> {
     plat::set_screen_capture_exclusion(window, hide)
 }
 
