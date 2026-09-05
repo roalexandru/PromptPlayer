@@ -3,7 +3,7 @@ resolver = "2"
 members = ["src-tauri", "guest-helper", "typing-engine-cli"]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 authors = ["Alex <roalexandru@users.noreply.github.com>"]
 edition = "2021"
 license = "MIT"

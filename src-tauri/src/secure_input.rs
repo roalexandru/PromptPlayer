@@ -9,6 +9,7 @@
 
 #[cfg(target_os = "macos")]
 extern "C" {
+    #[allow(dead_code)]
     fn IsSecureEventInputEnabled() -> u8;
 }
 
@@ -21,7 +22,7 @@ extern "C" {
 pub fn is_active() -> bool {
     #[cfg(test)]
     {
-        return false;
+        false
     }
     #[cfg(all(target_os = "macos", not(test)))]
     unsafe {

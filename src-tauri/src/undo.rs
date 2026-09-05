@@ -1,10 +1,15 @@
 //! §2.4 — backspace-undo for misfired expansions.
 //!
 //! On expansion: record `{trigger_word, body_typed_chars, fired_at}` in a 2s ring.
-//! On Backspace within 2s of an expansion: send `body.len()` backspaces and
-//! retype the original trigger.
+//! On Backspace within 2s of an expansion: send `body.len()` backspaces. The
+//! trigger itself is never erased during expansion (the body is typed as a
+//! continuation after it), so undo leaves the user's original trigger on screen.
 //!
 //! Espanso ships this; it's critical demo recovery (§2.4).
+//!
+//! Consumption contract: the hook checks `has_recent` (non-consuming) to decide
+//! whether to suppress the Backspace; `FireService::run_undo` is the single
+//! consumer via `take_recent`.
 
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
@@ -52,6 +57,15 @@ impl UndoLog {
         e.pop()
     }
 
+    /// Non-consuming check: is there an entry within the undo window?
+    /// Used by the hook to decide whether to suppress the Backspace; the
+    /// entry itself is consumed later by the undo executor via `take_recent`.
+    pub fn has_recent(&self, now: Instant) -> bool {
+        let mut e = self.entries.lock();
+        e.retain(|en| now.duration_since(en.fired_at) <= UNDO_WINDOW);
+        !e.is_empty()
+    }
+
     pub fn clear(&self) {
         self.entries.lock().clear();
     }
@@ -80,6 +94,20 @@ mod tests {
         // Force the entry to look stale by passing a "now" far in the future.
         let future = Instant::now() + Duration::from_secs(5);
         assert!(log.take_recent(future).is_none());
+    }
+
+    #[test]
+    fn has_recent_does_not_consume() {
+        // Regression: the hook peeks (has_recent) and the undo executor pops
+        // (take_recent). If the hook consumed the entry, the executor would
+        // find nothing and the user's Backspace would be swallowed for free.
+        let log = UndoLog::new();
+        log.record("Build".into(), 10);
+        let now = Instant::now();
+        assert!(log.has_recent(now));
+        assert!(log.has_recent(now), "peek must not consume");
+        assert!(log.take_recent(now).is_some(), "entry still consumable");
+        assert!(!log.has_recent(now));
     }
 
     #[test]

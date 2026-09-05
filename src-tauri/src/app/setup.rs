@@ -37,15 +37,34 @@ pub fn run() {
             tracing::warn!("prompt parse: {}", e);
         }
         if loaded.is_empty() {
-            // Bootstrap from the bundled `prompts-examples` resource on
-            // first run. We try the bundled resource first; falling back
-            // to the CWD-relative path (dev convenience).
-            let bootstrap = first_run_bundled_examples()
-                .unwrap_or_else(|| std::env::current_dir().unwrap().join("prompts-examples"));
-            if bootstrap != library_root && bootstrap.exists() {
-                let (l2, _) = library::load_all(&bootstrap);
-                ctx.prompts.replace_all(l2);
+            // First run (empty library): COPY the bundled examples into the
+            // user's writable library root, then load from there. Loading them
+            // in place from the bundle was a bug — `source_path` pointed inside
+            // the signed .app / Program Files, so any edit/toggle/delete tried
+            // to write into the bundle (breaks code-signing on macOS, denied
+            // under Program Files on Windows) and the watcher (which watches
+            // library_root, not the bundle) never saw the changes; worse, the
+            // first user-created prompt triggered a load-all that dropped every
+            // bundled example from memory.
+            let bundle = first_run_bundled_examples().or_else(|| {
+                let cwd = std::env::current_dir().ok()?.join("prompts-examples");
+                cwd.exists().then_some(cwd)
+            });
+            if let Some(bundle) = bundle {
+                if bundle != library_root {
+                    let copied = copy_bundled_examples(&bundle, &library_root);
+                    tracing::info!(
+                        "first run: copied {} bundled example(s) into {:?}",
+                        copied,
+                        library_root
+                    );
+                }
             }
+            let (loaded2, errs2) = library::load_all(&library_root);
+            for e in &errs2 {
+                tracing::warn!("prompt parse (post-bootstrap): {}", e);
+            }
+            ctx.prompts.replace_all(loaded2);
         } else {
             ctx.prompts.replace_all(loaded);
         }
@@ -88,6 +107,20 @@ pub fn run() {
         })
     };
 
+    let on_literal_commit = Arc::new(move |commit: char| {
+        thread::Builder::new()
+            .name("prompt-player-literal-commit".into())
+            .spawn(move || match crate::inject::EnigoInjector::new() {
+                Ok(mut inj) => {
+                    use crate::typer::Injector;
+                    inj.press_backspace();
+                    inj.type_char(commit);
+                }
+                Err(e) => tracing::error!("literal commit injector init failed: {:?}", e),
+            })
+            .expect("spawn literal commit injector");
+    });
+
     // Telemetry callback for the commit-char path. Plumbs through
     // app_handle_holder because the AppHandle isn't constructed yet at this
     // point (Tauri builds it inside setup()). We do nothing if the AppHandle
@@ -114,6 +147,7 @@ pub fn run() {
         ctx.state.clone(),
         on_fire.clone(),
         on_undo.clone(),
+        on_literal_commit.clone(),
         on_commit_observed.clone(),
     );
 
@@ -133,6 +167,7 @@ pub fn run() {
         let app_state = ctx.state.clone();
         let on_fire2 = on_fire.clone();
         let on_undo2 = on_undo.clone();
+        let on_literal2 = on_literal_commit.clone();
         let on_commit2 = on_commit_observed.clone();
         thread::Builder::new()
             .name("prompt-player-ax-watch".into())
@@ -151,6 +186,7 @@ pub fn run() {
                     app_state.clone(),
                     on_fire2.clone(),
                     on_undo2.clone(),
+                    on_literal2.clone(),
                     on_commit2.clone(),
                 );
             })
@@ -159,28 +195,42 @@ pub fn run() {
 
     // Hot-reload watcher: re-load prompts on file changes, rebuild trigger
     // index + per-prompt hotkeys, refresh tray popup.
-    if let Ok(watcher) = library::watch(&library_root) {
-        let ctx2 = ctx.clone();
-        let handle2 = app_handle_holder.clone();
-        let root2 = library_root.clone();
-        thread::Builder::new()
-            .name("prompt-player-watch".into())
-            .spawn(move || loop {
-                if library::drain_events(&watcher, std::time::Duration::from_millis(500)) {
-                    let (loaded, errs) = library::load_all(&root2);
-                    for e in errs {
-                        tracing::warn!("hot-reload parse: {}", e);
+    match library::watch(&library_root) {
+        Ok(watcher) => {
+            let ctx2 = ctx.clone();
+            let handle2 = app_handle_holder.clone();
+            let root2 = library_root.clone();
+            thread::Builder::new()
+                .name("prompt-player-watch".into())
+                .spawn(move || loop {
+                    if library::drain_events(&watcher, std::time::Duration::from_millis(500)) {
+                        let (loaded, errs) = library::load_all(&root2);
+                        for e in errs {
+                            tracing::warn!("hot-reload parse: {}", e);
+                        }
+                        ctx2.prompts.replace_all(loaded);
+                        rebuild_match_index(&ctx2);
+                        if let Some(h) = handle2.read().clone() {
+                            shortcuts::rebuild_prompt_hotkeys(&h, &ctx2);
+                            shortcuts::refresh_tray_popup(&h);
+                        }
+                        tracing::info!("library hot-reloaded — {} prompt(s)", ctx2.prompts.len());
                     }
-                    ctx2.prompts.replace_all(loaded);
-                    rebuild_match_index(&ctx2);
-                    if let Some(h) = handle2.read().clone() {
-                        shortcuts::rebuild_prompt_hotkeys(&h, &ctx2);
-                        shortcuts::refresh_tray_popup(&h);
-                    }
-                    tracing::info!("library hot-reloaded — {} prompt(s)", ctx2.prompts.len());
-                }
-            })
-            .expect("spawn watch thread");
+                })
+                .expect("spawn watch thread");
+        }
+        Err(e) => {
+            // Don't fail silently: with no watcher, on-disk edits won't
+            // hot-reload. The IPC mutation commands still reindex directly
+            // (see `reindex_after_mutation`), so in-app CRUD stays correct —
+            // but external file edits won't be picked up until restart.
+            tracing::error!(
+                "library watcher failed to start ({}); external edits to {:?} \
+                 won't hot-reload until restart",
+                e,
+                library_root
+            );
+        }
     }
 
     let ctx_for_setup = ctx.clone();
@@ -207,7 +257,19 @@ pub fn run() {
         // "launch the app" still feels like it did something.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             tracing::info!("duplicate launch detected — surfacing picker");
-            crate::commands::picker::show_picker_window(app);
+            // Route through the same `summon_picker` path as the shortcut/tray
+            // so the relaunch also captures focus, refreshes the search index,
+            // and positions on the cursor's screen — not a bare show() that
+            // skipped all three.
+            if let Some(ctx) = app.try_state::<AppContext>() {
+                let ctx = ctx.inner().clone();
+                let app2 = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    crate::commands::picker::summon_picker(&app2, &ctx);
+                });
+            } else {
+                crate::commands::picker::show_picker_window(app);
+            }
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -242,6 +304,8 @@ pub fn run() {
             commands::armed::is_playing,
             commands::armed::is_hook_alive,
             commands::armed::open_accessibility_settings,
+            commands::power::get_keep_awake,
+            commands::power::toggle_keep_awake,
             commands::prompts::list_prompts,
             commands::prompts::library_root,
             commands::prompts::save_prompt,
@@ -519,6 +583,49 @@ fn spawn_update_poller(app: tauri::AppHandle) {
     });
 }
 
+/// Copy bundled `.pp.md` example files into the user's library root on first
+/// run. Skips any file that already exists (idempotent) and non-`.pp.md`
+/// files (e.g. the examples README). Returns the count copied.
+fn copy_bundled_examples(src: &std::path::Path, dst: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let is_pp = p
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(|s| s.ends_with(".pp.md"))
+            .unwrap_or(false);
+        if !p.is_file() || !is_pp {
+            continue;
+        }
+        let Some(name) = p.file_name() else { continue };
+        let target = dst.join(name);
+        if target.exists() {
+            continue;
+        }
+        match std::fs::copy(&p, &target) {
+            Ok(_) => count += 1,
+            Err(e) => tracing::warn!("failed to copy bundled example {:?}: {}", p, e),
+        }
+    }
+    count
+}
+
+/// Reload the matcher index, per-prompt hotkeys, and tray popup after an
+/// in-app library mutation (save/create/delete/enable/pin/import). The
+/// hot-reload watcher does this on external file edits, but in-app CRUD must
+/// not depend on the watcher (it may have failed to start, and a freshly
+/// deleted prompt must stop firing immediately rather than after the next
+/// filesystem event).
+pub(crate) fn reindex_after_mutation(app: &AppHandle, ctx: &AppContext) {
+    rebuild_match_index(ctx);
+    shortcuts::rebuild_prompt_hotkeys(app, ctx);
+    shortcuts::refresh_tray_popup(app);
+}
+
 /// Look up the bundled `prompts-examples` directory in the .app's Resources
 /// folder. Returns None when running from `cargo run` (CWD-relative path is
 /// used as fallback) or in test contexts.
@@ -558,6 +665,8 @@ fn generate_typescript_bindings() -> Result<(), String> {
         crate::commands::armed::is_playing,
         crate::commands::armed::is_hook_alive,
         crate::commands::armed::open_accessibility_settings,
+        crate::commands::power::get_keep_awake,
+        crate::commands::power::toggle_keep_awake,
         crate::commands::prompts::list_prompts,
         crate::commands::prompts::library_root,
         crate::commands::prompts::save_prompt,
@@ -606,6 +715,12 @@ fn rebuild_match_index(ctx: &AppContext) {
     let prompts = ctx.prompts.read();
     let mut entries = Vec::new();
     for p in prompts.iter() {
+        // Skip disabled prompts: indexing them would suppress the user's
+        // commit char (and pop their trigger from the ring) even though
+        // nothing fires — eating the `>` mid-demo with no expansion.
+        if !p.enabled {
+            continue;
+        }
         for t in &p.triggers {
             entries.push(TriggerEntry {
                 canonical: t.to_lowercase(),
@@ -616,9 +731,9 @@ fn rebuild_match_index(ctx: &AppContext) {
         }
     }
     let entry_count = entries.len();
-    if let Err(e) = ctx.matcher.rebuild_index(entries) {
-        tracing::error!("trigger conflict: {}", e);
-        return;
+    let skipped = ctx.matcher.rebuild_index(entries);
+    if skipped > 0 {
+        tracing::warn!("matcher rebuild skipped {} duplicate trigger(s)", skipped);
     }
     // Single-line diagnostic so a Console.app filter on subsystem catches
     // the actual trigger count without needing to grep across multiple lines.

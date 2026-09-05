@@ -36,6 +36,21 @@ async isHookAlive() : Promise<boolean> {
 async openAccessibilitySettings() : Promise<void> {
     await TAURI_INVOKE("open_accessibility_settings");
 },
+/**
+ * Current keep-awake state. Read by the macOS tray popover on every show.
+ */
+async getKeepAwake() : Promise<boolean> {
+    return await TAURI_INVOKE("get_keep_awake");
+},
+/**
+ * Flip keep-awake, apply the OS-level assertion, and return the new state.
+ * Refreshes the tray popover (macOS) so the checkmark stays in sync; the
+ * Windows native menu is rebuilt from a fresh snapshot on every open, so it
+ * needs no explicit refresh.
+ */
+async toggleKeepAwake() : Promise<boolean> {
+    return await TAURI_INVOKE("toggle_keep_awake");
+},
 async listPrompts() : Promise<Prompt[]> {
     return await TAURI_INVOKE("list_prompts");
 },
@@ -202,6 +217,19 @@ async importPrompt(sourcePath: string) : Promise<Result<Prompt, IpcError>> {
 async exportPrompt(promptId: string, destPath: string) : Promise<Result<null, IpcError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("export_prompt", { promptId, destPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Open an `http://` or `https://` URL in the user's default browser.
+ * Rejects any other scheme — keeps the IPC from doubling as a generic
+ * shell-execute primitive.
+ */
+async openExternal(url: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_external", { url }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

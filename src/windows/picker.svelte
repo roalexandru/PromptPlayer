@@ -2,7 +2,7 @@
   import { onMount, onDestroy, tick } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { ipc, type Prompt, type SearchHit } from "$lib/ipc";
+  import { ipc, fmtErr, type Prompt, type SearchHit } from "$lib/ipc";
   import { IS_MAC } from "$lib/platform";
 
   let q = $state("");
@@ -11,25 +11,44 @@
   let selected = $state(0);
   let inputEl = $state<HTMLInputElement | null>(null);
   let listEl = $state<HTMLUListElement | null>(null);
+  // One-line delivery failure surfaced near the footer; the palette stays
+  // open so the user can retry or pick a different prompt.
+  let pickError = $state<string | null>(null);
 
   async function loadPrompts() {
     const all = await ipc.listPrompts();
     prompts = new Map(all.map((p) => [p.id, p]));
   }
 
+  // Monotonic request token: responses can arrive out of order while the
+  // user types, and applying a stale response would show results for an
+  // older query (and reset the selection against the wrong list).
+  let searchSeq = 0;
   async function search() {
-    hits = await ipc.pickerSearch(q, 50);
+    const seq = ++searchSeq;
+    const res = await ipc.pickerSearch(q, 50);
+    if (seq !== searchSeq) return; // Stale — a newer query is in flight.
+    hits = res;
     selected = 0;
+    pickError = null;
   }
 
   async function pick(mode: "human" | "fast" | "paste") {
     const hit = hits[selected];
     if (!hit) return;
-    await ipc.pickerSelect(hit.prompt_id, mode);
+    pickError = null;
+    try {
+      await ipc.pickerSelect(hit.prompt_id, mode);
+    } catch (e) {
+      // Keep the palette open — silent unhandled rejection mid-demo is the
+      // worst outcome. The user can retry or Esc out.
+      pickError = `Couldn't deliver — ${fmtErr(e)}`;
+    }
   }
 
   async function dismiss() {
     q = "";
+    pickError = null;
     // Hide AND restore focus to the previously-foreground app (so the next
     // user keystroke goes there, not nowhere). Backend handles both.
     await ipc.pickerDismiss();
@@ -48,9 +67,48 @@
     return 80;
   }
 
+  // For `custom` profiles, derive WPM from the iki-median-ms override:
+  // ~5 chars/word → WPM ≈ 60000 / (iki × 5). Baseline 140 ms ≈ 85 wpm.
+  function promptWpm(p: Prompt): number {
+    const k = p.typing_profile ?? "sales-engineer";
+    if (k === "custom") {
+      const iki = p.typing_overrides?.["iki-median-ms"] ?? 140;
+      return Math.max(1, 12000 / iki);
+    }
+    return profileWpm(k);
+  }
+
   function estimateSeconds(p: Prompt): number {
     const words = p.body.trim().split(/\s+/).filter((w) => w.length).length;
-    return Math.max(1, Math.round((words / profileWpm(p.typing_profile ?? "sales-engineer")) * 60));
+    return Math.max(1, Math.round((words / promptWpm(p)) * 60));
+  }
+
+  // Split a prompt name into plain/highlighted runs from the backend's
+  // match offsets. Offsets index the search haystack (name-first), so only
+  // those < name.length apply here — the rest hit triggers/tags/etc.
+  function nameSegments(
+    name: string,
+    highlights: number[],
+  ): { text: string; hit: boolean }[] {
+    const set = new Set(
+      (highlights ?? []).filter((i) => i >= 0 && i < name.length),
+    );
+    if (set.size === 0) return [{ text: name, hit: false }];
+    const segs: { text: string; hit: boolean }[] = [];
+    let cur = "";
+    let curHit = set.has(0);
+    for (let i = 0; i < name.length; i++) {
+      const hit = set.has(i);
+      if (hit === curHit) {
+        cur += name[i];
+      } else {
+        segs.push({ text: cur, hit: curHit });
+        cur = name[i];
+        curHit = hit;
+      }
+    }
+    if (cur) segs.push({ text: cur, hit: curHit });
+    return segs;
   }
 
   async function ensureSelectedVisible() {
@@ -81,13 +139,14 @@
     }
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      selected = Math.min(selected + 1, hits.length - 1);
+      // Clamp both ends — on an empty list `min(…, length - 1)` is -1.
+      selected = Math.max(0, Math.min(selected + 1, hits.length - 1));
       ensureSelectedVisible();
       return;
     }
     if (e.key === "ArrowUp") {
       e.preventDefault();
-      selected = Math.max(selected - 1, 0);
+      selected = Math.max(0, Math.min(selected - 1, hits.length - 1));
       ensureSelectedVisible();
       return;
     }
@@ -176,7 +235,9 @@
   onMount(async () => {
     document.addEventListener("keydown", onKeyCapture, true);
     await loadPrompts();
-    await search();
+    // No explicit search() here — the `$effect` above runs once on mount
+    // (and again on every q change), so calling it here too would fire a
+    // duplicate initial query.
     await focusInput();
     // Refocus + clear query each time the picker is shown so subsequent
     // open cycles start fresh with the input ready.
@@ -236,7 +297,9 @@
             onmousemove={() => (selected = i)}
           >
             <span class="row-left">
-              <span class="row-name">{p.name}</span>
+              <!-- Single line: whitespace between blocks would render as
+                   stray spaces inside the name. -->
+              <span class="row-name">{#each nameSegments(p.name, h.highlights) as seg}{#if seg.hit}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}</span>
               {#if p.description}
                 <span class="row-desc">{p.description}</span>
               {/if}
@@ -259,6 +322,10 @@
       </li>
     {/if}
   </ul>
+
+  {#if pickError}
+    <div class="pick-error" role="alert">{pickError}</div>
+  {/if}
 
   <footer>
     <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
@@ -405,6 +472,20 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* Search-match highlight — accent color only (same weight/metrics, so no
+     layout shift). Underline keeps it visible on the blue active row. */
+  .row-name mark.hl {
+    background: transparent;
+    color: rgba(120, 175, 255, 1);
+    font-weight: inherit;
+    text-decoration: underline;
+    text-decoration-color: rgba(120, 175, 255, 0.6);
+    text-underline-offset: 2px;
+  }
+  .list li.active .row-name mark.hl {
+    color: #fff;
+    text-decoration-color: rgba(255, 255, 255, 0.7);
+  }
   .row-desc {
     font-size: 11px;
     color: rgba(255, 255, 255, 0.5);
@@ -450,6 +531,18 @@
   .list li.active .trigger {
     background: rgba(255, 255, 255, 0.22);
     color: #fff;
+  }
+
+  /* Delivery failure — one-line inline error pinned above the footer. */
+  .pick-error {
+    padding: 6px 14px;
+    border-top: 0.5px solid rgba(255, 99, 92, 0.35);
+    background: rgba(255, 69, 58, 0.14);
+    color: rgba(255, 150, 145, 0.95);
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   /* Footer — keyboard hints. */

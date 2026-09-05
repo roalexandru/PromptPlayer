@@ -15,48 +15,92 @@ use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode}
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-use objc2_foundation::NSString;
+use objc2_foundation::{NSArray, NSData, NSString};
 use std::time::Duration;
 
 const KC_V: CGKeyCode = 9; // ANSI_V
 
 pub(super) fn paste_via_clipboard(body: &str) -> Result<(), PasteError> {
-    // 1. Snapshot current pasteboard text.
-    let saved = read_pasteboard_string();
+    // 1. Snapshot current pasteboard formats.
+    let saved = snapshot_pasteboard();
 
     // 2. Set ours.
     if let Err(e) = write_pasteboard_string(body) {
-        if let Some(s) = saved {
-            let _ = write_pasteboard_string(&s);
-        }
+        restore_pasteboard(&saved);
         return Err(PasteError::Clipboard(e));
     }
 
     // 3. Synthesize Cmd+V.
     if let Err(e) = synth_cmd_v() {
-        if let Some(s) = saved {
-            let _ = write_pasteboard_string(&s);
-        }
+        restore_pasteboard(&saved);
         return Err(PasteError::Injection(e));
     }
 
-    // 4. Let the paste land before we overwrite the pasteboard.
-    std::thread::sleep(Duration::from_millis(60));
+    // 4. Let the paste land before we overwrite the pasteboard. The Cmd+V
+    //    keystroke is delivered asynchronously; Electron/browser chat apps
+    //    (the main target) can read the pasteboard well after the keystroke
+    //    under load. Restoring too early makes them paste the user's PREVIOUS
+    //    clipboard — potentially private content, live on stage. 250ms is
+    //    imperceptible (the text is already on screen) and covers slow
+    //    consumers; with playbacks mutually exclusive nothing else needs the
+    //    fire thread during this window.
+    std::thread::sleep(Duration::from_millis(250));
 
-    // 5. Restore.
-    if let Some(s) = saved {
-        if let Err(e) = write_pasteboard_string(&s) {
-            tracing::warn!("pasteboard restore failed: {}", e);
-        }
+    // 5. Restore every pasteboard flavor we could snapshot.
+    if !restore_pasteboard(&saved) {
+        tracing::warn!("pasteboard restore failed");
     }
     Ok(())
 }
 
-fn read_pasteboard_string() -> Option<String> {
+struct PasteboardSnapshot {
+    entries: Vec<(Retained<objc2_app_kit::NSPasteboardType>, Vec<u8>)>,
+}
+
+fn snapshot_pasteboard() -> PasteboardSnapshot {
     unsafe {
         let pb: Retained<NSPasteboard> = NSPasteboard::generalPasteboard();
-        let nsstr = pb.stringForType(NSPasteboardTypeString)?;
-        Some(nsstr.to_string())
+        let Some(types) = pb.types() else {
+            return PasteboardSnapshot {
+                entries: Vec::new(),
+            };
+        };
+        let mut entries = Vec::new();
+        for i in 0..types.count() {
+            let ty = types.objectAtIndex(i);
+            if let Some(data) = pb.dataForType(&ty) {
+                entries.push((ty, data.bytes().to_vec()));
+            }
+        }
+        PasteboardSnapshot { entries }
+    }
+}
+
+fn restore_pasteboard(snapshot: &PasteboardSnapshot) -> bool {
+    unsafe {
+        let pb: Retained<NSPasteboard> = NSPasteboard::generalPasteboard();
+        let _ = pb.clearContents();
+        if snapshot.entries.is_empty() {
+            return true;
+        }
+        let types: Vec<Retained<objc2_app_kit::NSPasteboardType>> =
+            snapshot.entries.iter().map(|(ty, _)| ty.clone()).collect();
+        let type_array = NSArray::from_vec(types);
+        let _ = pb.declareTypes_owner(&type_array, None);
+        snapshot.entries.iter().all(|(ty, bytes)| {
+            let data = NSData::with_bytes(bytes);
+            pb.setData_forType(Some(&data), ty)
+        })
+    }
+}
+
+/// Read the current pasteboard's plain-text flavor, if any. Used to populate
+/// the `$CLIPBOARD` placeholder / `clipboard` expression builtin at fire time.
+pub(crate) fn read_clipboard_string() -> Option<String> {
+    unsafe {
+        let pb: Retained<NSPasteboard> = NSPasteboard::generalPasteboard();
+        pb.stringForType(NSPasteboardTypeString)
+            .map(|s| s.to_string())
     }
 }
 

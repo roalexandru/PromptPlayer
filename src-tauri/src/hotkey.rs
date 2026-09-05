@@ -20,6 +20,7 @@
 /// - `space | spacebar` → `Space`
 /// - `tab` → `Tab`
 /// - `backspace` → `Backspace`
+/// - `up | down | left | right` → `ArrowUp` etc.
 ///
 /// Anything else is title-cased and passed through (so `Comma`, `Period`,
 /// `F1..F12` etc. work without explicit mapping).
@@ -47,6 +48,10 @@ pub fn normalize(input: &str) -> String {
             "space" | "spacebar" => "Space".into(),
             "tab" => "Tab".into(),
             "backspace" => "Backspace".into(),
+            "up" | "arrowup" => "ArrowUp".into(),
+            "down" | "arrowdown" => "ArrowDown".into(),
+            "left" | "arrowleft" => "ArrowLeft".into(),
+            "right" | "arrowright" => "ArrowRight".into(),
             "\\" => "Backslash".into(),
             "/" => "Slash".into(),
             "," => "Comma".into(),
@@ -113,6 +118,8 @@ mod tests {
         assert_eq!(normalize("enter"), "Enter");
         assert_eq!(normalize("tab"), "Tab");
         assert_eq!(normalize("backspace"), "Backspace");
+        assert_eq!(normalize("up"), "ArrowUp");
+        assert_eq!(normalize("cmd+right"), "CmdOrCtrl+ArrowRight");
     }
 
     #[test]

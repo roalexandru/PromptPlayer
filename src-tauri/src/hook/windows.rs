@@ -26,8 +26,8 @@ use std::thread;
 use windows::Win32::Foundation::{HMODULE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, ToUnicodeEx, HKL, VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL,
-    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
-    VK_SHIFT,
+    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RMENU,
+    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, SetWindowsHookExW,
@@ -37,6 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub type FireCallback = Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>;
 pub type UndoCallback = Arc<dyn Fn() + Send + Sync>;
+pub type LiteralCommitCallback = Arc<dyn Fn(char) + Send + Sync>;
 pub type CommitObservedCallback = Arc<dyn Fn(bool, usize) + Send + Sync>;
 
 /// Per-process hook context. Set once on `spawn`; the extern hook proc reads
@@ -47,6 +48,7 @@ struct HookContext {
     app_state: Arc<AppState>,
     on_fire: FireCallback,
     on_undo: UndoCallback,
+    on_literal_commit: LiteralCommitCallback,
     on_commit_observed: CommitObservedCallback,
 }
 
@@ -58,6 +60,7 @@ pub fn spawn(
     app_state: Arc<AppState>,
     on_fire: FireCallback,
     on_undo: UndoCallback,
+    on_literal_commit: LiteralCommitCallback,
     on_commit_observed: CommitObservedCallback,
 ) {
     let ctx = HookContext {
@@ -66,6 +69,7 @@ pub fn spawn(
         app_state: app_state.clone(),
         on_fire,
         on_undo,
+        on_literal_commit,
         on_commit_observed,
     };
     if GLOBAL_CTX.set(ctx).is_err() {
@@ -172,6 +176,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         app_state: &ctx.app_state,
         on_fire: &ctx.on_fire,
         on_undo: &ctx.on_undo,
+        on_literal_commit: &ctx.on_literal_commit,
         on_commit_observed: &ctx.on_commit_observed,
     };
     match process_event(&key_event, &deps) {
@@ -186,6 +191,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 fn translate_kbdllhookstruct(info: &KBDLLHOOKSTRUCT) -> KeyEvent {
     let vk = VIRTUAL_KEY(info.vkCode as u16);
     let is_backspace = vk == VK_BACK;
+    // Return / Tab produce no character but break the word run — surface them
+    // as separators so a trigger typed right after Enter still matches.
+    let is_separator = vk == VK_RETURN || vk == VK_TAB;
 
     // Pure-modifier detection — events on Shift / Ctrl / Alt / Win / Caps
     // don't represent typed characters.
@@ -205,7 +213,7 @@ fn translate_kbdllhookstruct(info: &KBDLLHOOKSTRUCT) -> KeyEvent {
             | VK_CAPITAL
     );
 
-    let typed = if is_backspace || is_pure_modifier {
+    let typed = if is_backspace || is_pure_modifier || is_separator {
         None
     } else {
         unsafe { translate_to_unicode(info.vkCode, info.scanCode) }
@@ -215,6 +223,7 @@ fn translate_kbdllhookstruct(info: &KBDLLHOOKSTRUCT) -> KeyEvent {
         typed,
         is_backspace,
         is_pure_modifier,
+        is_separator,
     }
 }
 

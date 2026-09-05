@@ -13,10 +13,8 @@ use core_foundation::mach_port::CFMachPortRef;
 use core_foundation::runloop::{
     kCFRunLoopCommonModes, CFRunLoop, CFRunLoopRun, CFRunLoopSourceRef,
 };
-use core_graphics::event::{
-    CGEvent, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
-};
 use std::os::raw::c_void;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -73,6 +71,12 @@ pub type Decision = Option<()>;
 /// Per-event callback invoked from the tap thread. Returns Pass or Suppress.
 pub type EventHandler = Arc<dyn Fn(NativeKeyEvent) -> Decision + Send + Sync>;
 
+struct TapContext {
+    handler: EventHandler,
+    status: Arc<crate::state::AppState>,
+    tap_port: AtomicPtr<c_void>,
+}
+
 /// Native macOS key event before translation into the cross-platform
 /// `crate::hook::KeyEvent`.
 #[derive(Debug, Clone)]
@@ -113,8 +117,13 @@ pub fn spawn(handler: EventHandler, status: std::sync::Arc<crate::state::AppStat
 }
 
 fn run_tap_thread(handler: EventHandler, status: std::sync::Arc<crate::state::AppState>) {
-    // Box the handler to a stable address; pass to the C callback via user_info.
-    let handler_ptr = Box::into_raw(Box::new(handler)) as *mut c_void;
+    // Box the callback context to a stable address; pass to C via user_info.
+    let ctx_ptr = Box::into_raw(Box::new(TapContext {
+        handler,
+        status: status.clone(),
+        tap_port: AtomicPtr::new(std::ptr::null_mut()),
+    }));
+    let user_info = ctx_ptr as *mut c_void;
     let mask = (1u64 << KCG_EVENT_KEY_DOWN) | (1u64 << KCG_EVENT_FLAGS_CHANGED);
 
     let tap_port = unsafe {
@@ -124,7 +133,7 @@ fn run_tap_thread(handler: EventHandler, status: std::sync::Arc<crate::state::Ap
             KCG_EVENT_TAP_OPTION_DEFAULT,
             mask,
             tap_callback,
-            handler_ptr,
+            user_info,
         )
     };
     if tap_port.is_null() {
@@ -143,8 +152,13 @@ fn run_tap_thread(handler: EventHandler, status: std::sync::Arc<crate::state::Ap
         );
         status.set_hook_alive(false);
         // Reclaim the boxed handler since no run loop will own it.
-        unsafe { drop(Box::from_raw(handler_ptr as *mut EventHandler)) };
+        unsafe { drop(Box::from_raw(ctx_ptr)) };
         return;
+    }
+    unsafe {
+        (*ctx_ptr)
+            .tap_port
+            .store(tap_port as *mut c_void, Ordering::Release);
     }
 
     let runloop_source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), tap_port, 0) };
@@ -167,7 +181,7 @@ fn run_tap_thread(handler: EventHandler, status: std::sync::Arc<crate::state::Ap
     status.set_hook_alive(false);
 
     // Reclaim the boxed handler.
-    unsafe { drop(Box::from_raw(handler_ptr as *mut EventHandler)) };
+    unsafe { drop(Box::from_raw(ctx_ptr)) };
 }
 
 extern "C" fn tap_callback(
@@ -178,8 +192,15 @@ extern "C" fn tap_callback(
 ) -> *mut c_void {
     // Re-enable on auto-disable.
     if etype == KCG_EVENT_TAP_DISABLED_BY_TIMEOUT || etype == KCG_EVENT_TAP_DISABLED_BY_USER_INPUT {
-        // We can't re-enable from within the callback safely; log and return.
         tracing::warn!("CGEventTap disabled by system (etype={:#x})", etype);
+        let ctx = unsafe { &*(user_info as *const TapContext) };
+        ctx.status.set_hook_alive(false);
+        let tap = ctx.tap_port.load(Ordering::Acquire);
+        if !tap.is_null() {
+            unsafe { CGEventTapEnable(tap as CFMachPortRef, true) };
+            ctx.status.set_hook_alive(true);
+            tracing::info!("CGEventTap re-enabled after disable event");
+        }
         return event;
     }
     if etype != KCG_EVENT_KEY_DOWN {
@@ -196,7 +217,8 @@ extern "C" fn tap_callback(
         return event;
     }
 
-    let handler = unsafe { &*(user_info as *const EventHandler) };
+    let ctx = unsafe { &*(user_info as *const TapContext) };
+    let handler = &ctx.handler;
 
     // Extract typed Unicode (no TSM — this is dispatch-queue safe).
     let mut buf = [0u16; 8];

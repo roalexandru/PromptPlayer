@@ -1,5 +1,7 @@
 //! Prompt CRUD IPC commands.
 
+use crate::app::context::AppContext;
+use crate::app::setup::reindex_after_mutation;
 use crate::error::{into_ipc, AppError, IpcResult};
 use crate::prompts::{library, parser, Prompt};
 use crate::store::PromptStore;
@@ -23,12 +25,19 @@ pub fn library_root() -> IpcResult<String> {
 
 #[tauri::command]
 #[specta::specta]
-pub fn save_prompt(prompt: Prompt, store: tauri::State<'_, PromptStore>) -> IpcResult<String> {
-    into_ipc(
-        store
-            .save(&prompt)
-            .map(|p| p.to_string_lossy().into_owned()),
-    )
+pub fn save_prompt(
+    prompt: Prompt,
+    store: tauri::State<'_, PromptStore>,
+    ctx: tauri::State<'_, AppContext>,
+    app: tauri::AppHandle,
+) -> IpcResult<String> {
+    let result = store.save(&prompt);
+    if result.is_ok() {
+        // Rebuild the trigger index/hotkeys directly so edited triggers fire
+        // without waiting on (or depending on) the file watcher.
+        reindex_after_mutation(&app, &ctx);
+    }
+    into_ipc(result.map(|p| p.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]
@@ -36,6 +45,8 @@ pub fn save_prompt(prompt: Prompt, store: tauri::State<'_, PromptStore>) -> IpcR
 pub fn create_prompt(
     name: Option<String>,
     store: tauri::State<'_, PromptStore>,
+    ctx: tauri::State<'_, AppContext>,
+    app: tauri::AppHandle,
 ) -> IpcResult<Prompt> {
     let name = name.unwrap_or_else(|| "Untitled prompt".into());
     let mut id = parser::slugify(&name);
@@ -74,13 +85,27 @@ pub fn create_prompt(
         body: " your new prompt body here.".into(),
         source_path: Some(path.clone()),
     };
-    into_ipc(store.save(&prompt).map(|_| prompt))
+    let result = store.save(&prompt);
+    if result.is_ok() {
+        reindex_after_mutation(&app, &ctx);
+    }
+    into_ipc(result.map(|_| prompt))
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn delete_prompt(prompt_id: String, store: tauri::State<'_, PromptStore>) -> IpcResult<()> {
-    into_ipc(store.delete(&prompt_id))
+pub fn delete_prompt(
+    prompt_id: String,
+    store: tauri::State<'_, PromptStore>,
+    ctx: tauri::State<'_, AppContext>,
+    app: tauri::AppHandle,
+) -> IpcResult<()> {
+    let result = store.delete(&prompt_id);
+    if result.is_ok() {
+        // Reindex now so the deleted prompt stops firing immediately.
+        reindex_after_mutation(&app, &ctx);
+    }
+    into_ipc(result)
 }
 
 #[tauri::command]
@@ -89,10 +114,16 @@ pub fn set_prompt_enabled(
     prompt_id: String,
     enabled: bool,
     store: tauri::State<'_, PromptStore>,
+    ctx: tauri::State<'_, AppContext>,
+    app: tauri::AppHandle,
 ) -> IpcResult<()> {
-    into_ipc(store.set_enabled(&prompt_id, enabled).map(|updated| {
+    let result = store.set_enabled(&prompt_id, enabled);
+    if let Ok(updated) = &result {
         tracing::info!("prompt {} → enabled={}", updated.id, updated.enabled);
-    }))
+        // Toggling enabled changes whether the trigger is indexed at all.
+        reindex_after_mutation(&app, &ctx);
+    }
+    into_ipc(result.map(|_| ()))
 }
 
 #[tauri::command]
@@ -101,8 +132,14 @@ pub fn set_prompt_pinned(
     prompt_id: String,
     pinned: bool,
     store: tauri::State<'_, PromptStore>,
+    ctx: tauri::State<'_, AppContext>,
+    app: tauri::AppHandle,
 ) -> IpcResult<()> {
-    into_ipc(store.set_pinned(&prompt_id, pinned).map(|updated| {
+    let result = store.set_pinned(&prompt_id, pinned);
+    if let Ok(updated) = &result {
         tracing::info!("prompt {} → pinned={}", updated.id, updated.pinned);
-    }))
+        // Pinned prompts surface in the tray menu — refresh it.
+        reindex_after_mutation(&app, &ctx);
+    }
+    into_ipc(result.map(|_| ()))
 }

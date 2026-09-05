@@ -44,6 +44,10 @@ pub struct KeyEvent {
     /// Meta with no other key). Set by the platform layer; macOS' callback
     /// already filters these out at the OS layer, Windows surfaces them.
     pub is_pure_modifier: bool,
+    /// True for keys that produce no character but still separate words —
+    /// Return and Tab. The matcher records a synthetic boundary so a trigger
+    /// typed right after Enter (the most common demo flow) still matches.
+    pub is_separator: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +68,7 @@ pub struct HookDeps<'a> {
     pub app_state: &'a Arc<AppState>,
     pub on_fire: &'a Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
     pub on_undo: &'a Arc<dyn Fn() + Send + Sync>,
+    pub on_literal_commit: &'a Arc<dyn Fn(char) + Send + Sync>,
     /// Fires every time the user types the commit char while armed, regardless
     /// of whether a trigger matched. Used to plumb the `commit_observed`
     /// telemetry event without forcing the hook crate to know about the
@@ -98,7 +103,12 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
     let now = Instant::now();
 
     if evt.is_backspace {
-        if deps.undo.take_recent(now).is_some() {
+        // Peek only — `run_undo` is the single consumer of the entry. (A
+        // consuming check here would pop the entry, leaving `run_undo` with
+        // nothing: the Backspace would be suppressed AND no undo performed.)
+        // During playback, Backspace counts toward the §2.6 panic ring
+        // instead of triggering undo.
+        if !deps.app_state.is_playing() && deps.undo.has_recent(now) {
             (deps.on_undo)();
             return HookDecision::Suppress;
         }
@@ -115,7 +125,16 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
         }
         if let Some(c) = evt.typed {
             deps.matcher.observe_char(c, now);
+        } else if evt.is_separator {
+            deps.matcher.observe_separator(now);
         }
+        return HookDecision::Pass;
+    }
+
+    // Return / Tab carry no character but break the word run — without a
+    // boundary, `<line>\nbuild>` glues into one token and never matches.
+    if evt.is_separator {
+        deps.matcher.observe_separator(now);
         return HookDecision::Pass;
     }
 
@@ -124,11 +143,15 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
     };
 
     let global_commit = deps.app_state.commit_char();
-    if c == global_commit {
+    // Per-prompt `commit-char:` overrides (§2.3) register their chars in the
+    // matcher index; without this check only the global char could ever fire.
+    if c == global_commit || deps.matcher.is_commit_char(c) {
         // §2.4 — escape hatch: `\>` types a literal `>`.
         if deps.matcher.last_char() == Some('\\') {
             deps.matcher.pop_last_chars(1);
-            return HookDecision::Pass;
+            deps.matcher.observe_char(c, now);
+            (deps.on_literal_commit)(c);
+            return HookDecision::Suppress;
         }
         let candidates = deps.matcher.try_match_all(c, now);
         // Single high-signal diagnostic line on the commit-char path. Fires
@@ -155,14 +178,19 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
         (deps.on_commit_observed)(matched, index_len);
         if matched {
             let typed_form = candidates[0].typed_form.clone();
-            let trigger_chars = candidates[0].trigger_chars;
+            // Pop everything from the trigger start to the buffer end —
+            // `pop_chars` includes any trailing whitespace typed between the
+            // trigger and the commit char (`build >`), which `trigger_chars`
+            // excludes. Popping the shorter count would leave residue that
+            // poisons the next 2s of matching.
+            let pop_chars = candidates[0].pop_chars;
             let candidate_ids: Vec<String> = candidates.into_iter().map(|m| m.prompt_id).collect();
             tracing::info!(
                 "fire: trigger='{}' candidates={:?}",
                 typed_form,
                 candidate_ids
             );
-            deps.matcher.pop_last_chars(trigger_chars);
+            deps.matcher.pop_last_chars(pop_chars);
             (deps.on_fire)(candidate_ids, typed_form);
             return HookDecision::Suppress;
         }
@@ -180,6 +208,7 @@ pub fn spawn_grabbing_hook(
     app_state: Arc<AppState>,
     on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
     on_undo: Arc<dyn Fn() + Send + Sync>,
+    on_literal_commit: Arc<dyn Fn(char) + Send + Sync>,
     on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
 ) -> HookHandle {
     #[cfg(target_os = "macos")]
@@ -190,6 +219,7 @@ pub fn spawn_grabbing_hook(
             app_state,
             on_fire,
             on_undo,
+            on_literal_commit,
             on_commit_observed,
         );
     }
@@ -201,6 +231,7 @@ pub fn spawn_grabbing_hook(
             app_state,
             on_fire,
             on_undo,
+            on_literal_commit,
             on_commit_observed,
         );
     }
@@ -212,6 +243,7 @@ pub fn spawn_grabbing_hook(
             app_state,
             on_fire,
             on_undo,
+            on_literal_commit,
             on_commit_observed,
         );
     }
@@ -227,15 +259,19 @@ fn spawn_macos(
     app_state: Arc<AppState>,
     on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
     on_undo: Arc<dyn Fn() + Send + Sync>,
+    on_literal_commit: Arc<dyn Fn(char) + Send + Sync>,
     on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
 ) {
     use macos::EventHandler;
     let app_state_for_handler = app_state.clone();
     let handler: EventHandler = Arc::new(move |evt: macos::NativeKeyEvent| {
+        // macOS virtual keycodes: Return=36, Tab=48, KeypadEnter=76.
+        let is_separator = matches!(evt.keycode, 36 | 48 | 76);
         let key = KeyEvent {
             typed: evt.typed,
             is_backspace: evt.is_backspace,
             is_pure_modifier: false, // macOS tap filters these at OS layer.
+            is_separator,
         };
         let deps = HookDeps {
             matcher: &matcher,
@@ -243,6 +279,7 @@ fn spawn_macos(
             app_state: &app_state_for_handler,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_literal_commit: &on_literal_commit,
             on_commit_observed: &on_commit_observed,
         };
         match process_event(&key, &deps) {
@@ -265,6 +302,7 @@ pub fn respawn_macos(
     app_state: Arc<AppState>,
     on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
     on_undo: Arc<dyn Fn() + Send + Sync>,
+    on_literal_commit: Arc<dyn Fn(char) + Send + Sync>,
     on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
 ) {
     spawn_macos(
@@ -273,6 +311,7 @@ pub fn respawn_macos(
         app_state,
         on_fire,
         on_undo,
+        on_literal_commit,
         on_commit_observed,
     );
 }
@@ -284,6 +323,7 @@ fn spawn_windows(
     app_state: Arc<AppState>,
     on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
     on_undo: Arc<dyn Fn() + Send + Sync>,
+    on_literal_commit: Arc<dyn Fn(char) + Send + Sync>,
     on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
 ) {
     // Native `WH_KEYBOARD_LL` hook — see `hook/windows.rs` for the full
@@ -296,6 +336,7 @@ fn spawn_windows(
         app_state,
         on_fire,
         on_undo,
+        on_literal_commit,
         on_commit_observed,
     );
 }
@@ -306,6 +347,8 @@ mod tests {
     use crate::matcher::TriggerEntry;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    type FireCallback = Arc<dyn Fn(Vec<String>, String) + Send + Sync>;
+
     fn make_deps_default() -> (Arc<MatcherState>, Arc<UndoLog>, Arc<AppState>) {
         (
             MatcherState::shared(),
@@ -314,13 +357,10 @@ mod tests {
         )
     }
 
-    fn fire_count_callback() -> (
-        Arc<dyn Fn(Vec<String>, String) + Send + Sync>,
-        Arc<AtomicUsize>,
-    ) {
+    fn fire_count_callback() -> (FireCallback, Arc<AtomicUsize>) {
         let count = Arc::new(AtomicUsize::new(0));
         let count2 = count.clone();
-        let cb: Arc<dyn Fn(Vec<String>, String) + Send + Sync> = Arc::new(move |_ids, _form| {
+        let cb: FireCallback = Arc::new(move |_ids, _form| {
             count2.fetch_add(1, Ordering::Relaxed);
         });
         (cb, count)
@@ -328,6 +368,10 @@ mod tests {
 
     fn no_op_undo_callback() -> Arc<dyn Fn() + Send + Sync> {
         Arc::new(|| {})
+    }
+
+    fn no_op_literal_callback() -> Arc<dyn Fn(char) + Send + Sync> {
+        Arc::new(|_| {})
     }
 
     fn no_op_commit_callback() -> Arc<dyn Fn(bool, usize) + Send + Sync> {
@@ -339,6 +383,7 @@ mod tests {
             typed: Some(c),
             is_backspace: false,
             is_pure_modifier: false,
+            is_separator: false,
         }
     }
 
@@ -347,6 +392,7 @@ mod tests {
         let (matcher, undo, app_state) = make_deps_default();
         let (on_fire, count) = fire_count_callback();
         let on_undo = no_op_undo_callback();
+        let on_literal_commit = no_op_literal_callback();
         let on_commit_observed = no_op_commit_callback();
         let deps = HookDeps {
             matcher: &matcher,
@@ -354,6 +400,7 @@ mod tests {
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_literal_commit: &on_literal_commit,
             on_commit_observed: &on_commit_observed,
         };
         // Disarmed (default) — every event is Pass and never matches.
@@ -370,6 +417,7 @@ mod tests {
         app_state.set_armed(true);
         let (on_fire, count) = fire_count_callback();
         let on_undo = no_op_undo_callback();
+        let on_literal_commit = no_op_literal_callback();
         let on_commit_observed = no_op_commit_callback();
         let deps = HookDeps {
             matcher: &matcher,
@@ -377,6 +425,7 @@ mod tests {
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_literal_commit: &on_literal_commit,
             on_commit_observed: &on_commit_observed,
         };
         for ch in ['x', 'y', '>'] {
@@ -389,17 +438,16 @@ mod tests {
     fn armed_with_matching_trigger_fires_and_suppresses_commit() {
         let (matcher, undo, app_state) = make_deps_default();
         app_state.set_armed(true);
-        matcher
-            .rebuild_index(vec![TriggerEntry {
-                canonical: "build".into(),
-                prompt_id: "p1".into(),
-                word_count: 1,
-                commit_char: '>',
-            }])
-            .unwrap();
+        matcher.rebuild_index(vec![TriggerEntry {
+            canonical: "build".into(),
+            prompt_id: "p1".into(),
+            word_count: 1,
+            commit_char: '>',
+        }]);
 
         let (on_fire, count) = fire_count_callback();
         let on_undo = no_op_undo_callback();
+        let on_literal_commit = no_op_literal_callback();
         let on_commit_observed = no_op_commit_callback();
         let deps = HookDeps {
             matcher: &matcher,
@@ -407,6 +455,7 @@ mod tests {
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_literal_commit: &on_literal_commit,
             on_commit_observed: &on_commit_observed,
         };
         for ch in ['B', 'u', 'i', 'l', 'd'] {
@@ -427,6 +476,12 @@ mod tests {
         app_state.set_armed(true);
         let (on_fire, count) = fire_count_callback();
         let on_undo = no_op_undo_callback();
+        let literal_count = Arc::new(AtomicUsize::new(0));
+        let literal_count2 = literal_count.clone();
+        let on_literal_commit: Arc<dyn Fn(char) + Send + Sync> = Arc::new(move |c| {
+            assert_eq!(c, '>');
+            literal_count2.fetch_add(1, Ordering::Relaxed);
+        });
         let on_commit_observed = no_op_commit_callback();
         let deps = HookDeps {
             matcher: &matcher,
@@ -434,13 +489,17 @@ mod tests {
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_literal_commit: &on_literal_commit,
             on_commit_observed: &on_commit_observed,
         };
-        // Type `\` then `>` — the `>` should pass through without firing.
+        // Type `\` then `>` — the hook suppresses `>` and asks the injector
+        // to replace the visible backslash with a literal commit char.
         let _ = process_event(&ke('\\'), &deps);
         let d = process_event(&ke('>'), &deps);
-        assert!(matches!(d, HookDecision::Pass));
+        assert!(matches!(d, HookDecision::Suppress));
         assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert_eq!(literal_count.load(Ordering::Relaxed), 1);
+        assert_eq!(matcher.last_char(), Some('>'));
     }
 
     #[test]
@@ -453,6 +512,7 @@ mod tests {
         let on_undo: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             undo_count2.fetch_add(1, Ordering::Relaxed);
         });
+        let on_literal_commit = no_op_literal_callback();
         let on_commit_observed = no_op_commit_callback();
         // Seed the undo log with a recent expansion.
         undo.record("Build".into(), 50);
@@ -462,12 +522,14 @@ mod tests {
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_literal_commit: &on_literal_commit,
             on_commit_observed: &on_commit_observed,
         };
         let key = KeyEvent {
             typed: None,
             is_backspace: true,
             is_pure_modifier: false,
+            is_separator: false,
         };
         let d = process_event(&key, &deps);
         assert!(matches!(d, HookDecision::Suppress));
@@ -478,9 +540,10 @@ mod tests {
     fn pure_modifier_during_playback_does_not_count_toward_panic_ring() {
         let (matcher, undo, app_state) = make_deps_default();
         app_state.set_armed(true);
-        let _cancel = app_state.begin_playback();
+        let cancel = app_state.begin_playback().expect("playback starts");
         let (on_fire, _) = fire_count_callback();
         let on_undo = no_op_undo_callback();
+        let on_literal_commit = no_op_literal_callback();
         let on_commit_observed = no_op_commit_callback();
         let deps = HookDeps {
             matcher: &matcher,
@@ -488,6 +551,7 @@ mod tests {
             app_state: &app_state,
             on_fire: &on_fire,
             on_undo: &on_undo,
+            on_literal_commit: &on_literal_commit,
             on_commit_observed: &on_commit_observed,
         };
         // Three pure-modifier events in fast succession should NOT trigger
@@ -496,12 +560,14 @@ mod tests {
             typed: None,
             is_backspace: false,
             is_pure_modifier: true,
+            is_separator: false,
         };
         for _ in 0..3 {
             process_event(&modifier_event, &deps);
         }
-        assert!(!app_state.begin_playback().load(Ordering::Relaxed));
-        // (begin_playback returns the cancel flag fresh, so we test that
-        // it's not pre-set.)
+        assert!(
+            !cancel.load(Ordering::Relaxed),
+            "pure modifiers must not trip the panic ring"
+        );
     }
 }

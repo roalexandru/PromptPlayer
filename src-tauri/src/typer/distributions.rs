@@ -45,6 +45,14 @@ pub const TYPO_NOTICED_STDDEV: f64 = 100.0;
 pub const BURST_MU: f64 = 4.7;
 pub const BURST_SIGMA: f64 = 0.25;
 
+fn safe_sigma_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
 /// Sample base IKI from the 85/15 log-normal mixture, clamped.
 pub fn sample_iki<R: Rng + ?Sized>(rng: &mut R) -> f64 {
     let (mu, sigma) = if rng.gen::<f64>() < IKI_HESITATION_PROBABILITY {
@@ -68,42 +76,57 @@ pub fn sample_burst_iki<R: Rng + ?Sized>(rng: &mut R) -> f64 {
 
 /// Hierarchical pause for a word boundary (after `space`, before next word).
 pub fn sample_word_pause<R: Rng + ?Sized>(rng: &mut R, sigma_scale: f64) -> f64 {
-    LogNormal::new(WORD_PAUSE_MU, WORD_PAUSE_SIGMA * sigma_scale)
-        .expect("valid lognormal")
-        .sample(rng)
-        .max(0.0)
+    LogNormal::new(
+        WORD_PAUSE_MU,
+        WORD_PAUSE_SIGMA * safe_sigma_scale(sigma_scale),
+    )
+    .expect("valid lognormal")
+    .sample(rng)
+    .max(0.0)
 }
 
 /// Hierarchical pause for a sentence boundary (`. ! ?` then space).
 pub fn sample_sentence_pause<R: Rng + ?Sized>(rng: &mut R, sigma_scale: f64) -> f64 {
-    LogNormal::new(SENTENCE_PAUSE_MU, SENTENCE_PAUSE_SIGMA * sigma_scale)
-        .expect("valid lognormal")
-        .sample(rng)
-        .max(0.0)
+    LogNormal::new(
+        SENTENCE_PAUSE_MU,
+        SENTENCE_PAUSE_SIGMA * safe_sigma_scale(sigma_scale),
+    )
+    .expect("valid lognormal")
+    .sample(rng)
+    .max(0.0)
 }
 
 /// Hierarchical pause for paragraph boundary (`\n\n`).
 pub fn sample_paragraph_pause<R: Rng + ?Sized>(rng: &mut R, sigma_scale: f64) -> f64 {
-    Normal::new(PARAGRAPH_PAUSE_MEAN, PARAGRAPH_PAUSE_STDDEV * sigma_scale)
-        .expect("valid normal")
-        .sample(rng)
-        .max(100.0)
+    Normal::new(
+        PARAGRAPH_PAUSE_MEAN,
+        PARAGRAPH_PAUSE_STDDEV * safe_sigma_scale(sigma_scale),
+    )
+    .expect("valid normal")
+    .sample(rng)
+    .max(100.0)
 }
 
 /// Pre-typing pause after the suppressed `>` (§3.1, §2.1).
 pub fn sample_pre_typing_pause<R: Rng + ?Sized>(rng: &mut R, sigma_scale: f64) -> f64 {
-    Normal::new(PRE_TYPING_MEAN, PRE_TYPING_STDDEV * sigma_scale)
-        .expect("valid normal")
-        .sample(rng)
-        .max(200.0)
+    Normal::new(
+        PRE_TYPING_MEAN,
+        PRE_TYPING_STDDEV * safe_sigma_scale(sigma_scale),
+    )
+    .expect("valid normal")
+    .sample(rng)
+    .max(200.0)
 }
 
 /// Pre-submit pause before the final Enter (§3.1 — "single most realism-defining touch").
 pub fn sample_pre_submit_pause<R: Rng + ?Sized>(rng: &mut R, sigma_scale: f64) -> f64 {
-    Normal::new(PRE_SUBMIT_MEAN, PRE_SUBMIT_STDDEV * sigma_scale)
-        .expect("valid normal")
-        .sample(rng)
-        .max(300.0)
+    Normal::new(
+        PRE_SUBMIT_MEAN,
+        PRE_SUBMIT_STDDEV * safe_sigma_scale(sigma_scale),
+    )
+    .expect("valid normal")
+    .sample(rng)
+    .max(300.0)
 }
 
 /// "I noticed the typo" pause before correction (§3.2).
@@ -183,6 +206,18 @@ mod tests {
             let j = jitter(&mut rng);
             assert!((-4.0..=4.0).contains(&j));
             assert!(j.abs() >= 2.0);
+        }
+    }
+
+    #[test]
+    fn invalid_pause_variance_does_not_panic() {
+        let mut rng = ChaCha8Rng::seed_from_u64(123);
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(sample_word_pause(&mut rng, scale) >= 0.0);
+            assert!(sample_sentence_pause(&mut rng, scale) >= 0.0);
+            assert!(sample_paragraph_pause(&mut rng, scale) >= 100.0);
+            assert!(sample_pre_typing_pause(&mut rng, scale) >= 200.0);
+            assert!(sample_pre_submit_pause(&mut rng, scale) >= 300.0);
         }
     }
 }

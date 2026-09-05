@@ -14,9 +14,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # Files allowed to use raw invoke():
-#   - src/lib/ipc.ts          — the façade itself, but it doesn't call invoke directly any more
 #   - src/lib/ipc.gen.ts      — the auto-generated tauri-specta bindings
-ALLOWED='^src/lib/(ipc\.ts|ipc\.gen\.ts)$'
+ALLOWED='^src/lib/ipc\.gen\.ts$'
 
 # Anywhere else under src/, look for `invoke(` or `invoke<...>(`.
 HITS=$(
@@ -27,7 +26,7 @@ HITS=$(
 )
 
 if [[ -n "$HITS" ]]; then
-  echo "✗ Raw invoke() calls found outside src/lib/ipc{,gen}.ts:" >&2
+  echo "✗ Raw invoke() calls found outside src/lib/ipc.gen.ts:" >&2
   echo "" >&2
   for f in $HITS; do
     grep -nE 'invoke[[:space:]]*[<(]' "$f" | sed "s|^|  $f:|" >&2
@@ -39,4 +38,4 @@ if [[ -n "$HITS" ]]; then
   exit 1
 fi
 
-echo "✓ no raw invoke() calls outside src/lib/ipc{,gen}.ts"
+echo "✓ no raw invoke() calls outside src/lib/ipc.gen.ts"
