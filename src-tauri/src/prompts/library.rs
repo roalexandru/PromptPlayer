@@ -51,15 +51,38 @@ pub fn load_all(root: &Path) -> (Vec<Prompt>, Vec<String>) {
     (prompts, errors)
 }
 
+/// How deep the library may nest. The prompts directory is user-writable and
+/// documented, so an accidental symlink loop in it would otherwise recurse
+/// until the stack overflows — which, with `panic = "abort"`, kills the app at
+/// startup and again on every hot-reload.
+const MAX_LIBRARY_DEPTH: usize = 16;
+
 fn walk(root: &Path, f: &mut dyn FnMut(&Path)) {
+    walk_depth(root, f, 0)
+}
+
+fn walk_depth(root: &Path, f: &mut dyn FnMut(&Path), depth: usize) {
+    if depth >= MAX_LIBRARY_DEPTH {
+        tracing::warn!(
+            "library walk hit the {} level depth cap at {:?}; not descending further",
+            MAX_LIBRARY_DEPTH,
+            root
+        );
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.is_dir() {
-            walk(&p, f);
-        } else {
+        // `symlink_metadata` does not follow the link, so a directory symlink
+        // is treated as a leaf rather than a branch to descend into.
+        let is_symlink = std::fs::symlink_metadata(&p)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if p.is_dir() && !is_symlink {
+            walk_depth(&p, f, depth + 1);
+        } else if !is_symlink {
             f(&p);
         }
     }
@@ -174,6 +197,26 @@ mod tests {
         assert_eq!(steps.len(), 2, "{steps:?}");
         assert!(steps[0].submit(), "the first message has to be sent");
         assert!(steps[0].wait_after.is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_all_survives_a_symlink_loop() {
+        // The prompts directory is user-writable, and this used to recurse
+        // until the stack overflowed — which `panic = "abort"` turns into a
+        // crash at startup and on every hot-reload.
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("ok.pp.md"),
+            "---\nname: Ok\ntriggers: [ok]\n---\nbody",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path(), sub.join("loop")).unwrap();
+
+        let (prompts, _errors) = load_all(dir.path());
+        assert_eq!(prompts.len(), 1, "the real prompt is still found");
     }
 
     #[test]

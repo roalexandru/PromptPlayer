@@ -20,6 +20,7 @@ pub mod commands;
 pub mod config;
 pub mod error;
 pub mod filters;
+pub mod fsutil;
 pub mod hotkey;
 pub mod matcher;
 pub mod platform;
