@@ -251,7 +251,15 @@ metrics, customer names, secrets, or absolute paths under `/Users/<name>`.
   the other OS.** `cargo check -p prompt-player --target x86_64-pc-windows-gnu`
   from a Mac. A `cfg`-gated module is not compiled on the other host, so a
   refactor of `hook/mod.rs` can leave `hook/windows.rs` broken with a fully
-  green local build; only the CI matrix would catch it.
+  green local build; only the CI matrix would catch it. That check compiles
+  only — it does not link or run, so it cannot catch the next item.
+- **A `#[cfg(test)]` module in the lib must not touch a Tauri runtime type.**
+  Referencing `tauri::Wry` / `App` / `WebviewWindow` from a test retains a
+  WebView2 import that the linker would otherwise strip; the Windows runner
+  cannot resolve it at load and the entire lib test binary dies with
+  `STATUS_ENTRYPOINT_NOT_FOUND` before a single test runs. Gate such tests with
+  `not(target_os = "windows")` — see `app::setup::bindings_tests` and
+  `tests/ipc_registry.rs`.
 - Icons are baked into the binary via `include_bytes!` (runtime paths differ
   between `cargo run` and the packaged bundle).
 - Bump version in all three manifests together.
