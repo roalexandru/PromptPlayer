@@ -126,9 +126,9 @@ HDMI mirror = the GPU duplicates one monitor's output to another physical displa
 
 After running §1–§3, open `%LOCALAPPDATA%\PromptPlayer\logs\prompt-player.log` and confirm:
 
-- `display-affinity applied to picker tree` lines exist, each with `applied >= 2` (parent + at least one WebView2 descendant). Zero would mean only the parent got the flag — the regression.
-- `display-affinity set (descendant)` debug lines list `Chrome_WidgetWin_*` or similar WebView2 class names, not just the parent `Tauri Window`.
-- No `WARN` lines about `SetWindowDisplayAffinity on parent failed`.
+- One `display-affinity applied` line per picker show, with `class="Tauri Window"` and `affinity=17` (`WDA_EXCLUDEFROMCAPTURE`). This is the top-level HWND; it is the only HWND the OS lets us flag (see §7.1).
+- No `win11_legacy_display_affinity_bug` ERROR line. If one appears, the very next line must be `fell back to WDA_MONITOR` (`affinity=1`) — see §7.2 for what that means and how to fix it properly.
+- No `WARN` lines matching `SetWindowDisplayAffinity failed`.
 - `capture_foreground` (Windows) snapshot log lines show the target app's class (e.g., `Notepad`, `Chrome_WidgetWin_1`), **not** any `ZP*` Zoom-helper class even during an active share.
 - `wait_until_foreground` outcomes never hit the 400ms timeout cap (`elapsed_ms` always < 400). One or two cap-hits during heavy load is acceptable; if every fire times out, focus restore has regressed.
 
@@ -144,10 +144,10 @@ Always run before signing off:
 cd C:\promptPlayer\src-tauri
 cargo test --lib                              # T1 pure-function + T3/T4 in-source tests
 cargo test --test screen_capture_exclusion    # T2 — Win32 HWND-tree integration tests
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets -- -D clippy::correctness   # matches CI
 ```
 
-Expected: T2 cases A/B/C/D/E all green. Any T2 failure means the recursive walk in `capture.rs::apply_affinity_recursive` is broken — DO NOT ship.
+Expected: T2 cases A–E all green. Cases A–D cover apply / toggle-back / idempotency / null HWND on a top-level window. Case E asserts that Windows **rejects** `SetWindowDisplayAffinity` and `GetWindowDisplayAffinity` on a `WS_CHILD` window — if E ever fails because a child *accepted* the flag, the Win32 contract has changed and a descendant walk (§7.1) is worth revisiting. Any A–D failure means `capture.rs::apply_display_affinity` is broken — DO NOT ship.
 
 ---
 
@@ -170,21 +170,23 @@ Sign-off (release-blocking): the above must be all-green for a release build to 
 
 ## §7 — Troubleshooting matrix
 
-Two distinct Windows bugs can cause "picker doesn't function during Zoom share." This PR addresses one of them via code; the other requires deployment-time intervention. Use the log signals below to tell them apart.
+Three distinct Windows failure modes can cause "picker doesn't function during Zoom share." §7.1 cannot be fixed from the host process at all; §7.2 is detected and partially mitigated in code but needs deployment-time intervention for a full fix; §7.3 is a Zoom-side setting. Use the log signals below to tell them apart.
 
-### §7.1 — WebView2 child-HWND inheritance (this PR fixes)
+**Context that matters for all three:** `picker::window::prepare_picker` lost its only caller in the `1d33436` refactor (2026-05-01), so between then and this PR the picker was **not** capture-excluded at all, on either platform. On Windows this PR re-applies the flag from `show_picker_window` on every show; the macOS `setSharingType` path is still dormant (tracked separately). Any "blank picker during share" observation made on a build between 1d33436 and this PR was therefore *not* caused by display affinity.
 
-**Microsoft-confirmed root cause** for "tooltips and HTML select dropdowns remain visible in screenshots when SetWindowDisplayAffinity is used on a WebView2 host" — WebView2Feedback #4544 (tracked as AB#50877897). Same class of bug surfaces against full screen capture too: the parent HWND gets the flag, the GPU swap-chain child does not, and DWM's compositor mitigation leaves the WebView2 surface blank to the local user.
+### §7.1 — WebView2 child-HWND inheritance (not fixable from the host process)
 
-**Log signal that the fix is engaging:**
+**Microsoft-confirmed** in WebView2Feedback #4544 (tracked as AB#50877897): content WebView2 renders through its own child HWNDs (tooltips, `<select>` popups) is not covered by the host window's `SetWindowDisplayAffinity`.
+
+The first revision of this PR tried to close that gap by walking `EnumChildWindows` and flagging every descendant. **Windows rejects that call.** The API documentation says the handle must be "a handle to the top-level window" that "must belong to the current process", and that the function "returns FALSE when ... made on a non top-level window". The Windows CI runner confirmed it on plain same-process `WS_CHILD` windows: `applied=1 attempted=4` (run 33971305104). WebView2's children are additionally owned by `msedgewebview2.exe`, so they fail the process check too. The walk was removed; case E of `tests/screen_capture_exclusion.rs` pins the rejection.
+
+**Log signal:** the maximum achievable is the parent flag:
 
 ```
-display-affinity applied to picker tree  applied=4 attempted=4 parent=...
-display-affinity set (descendant)  class=Chrome_WidgetWin_1 ...
-display-affinity set (descendant)  class=Intermediate D3D Window ...
+display-affinity applied  class="Tauri Window" affinity=17 hwnd=...
 ```
 
-If `applied >= 2` and the descendant classes look WebView2-ish, this branch of the bug is mitigated.
+If that line is present and the *audience* still sees the picker, the remaining suspects are §7.3 (Zoom bypassing affinity) or WebView2's own popup surfaces (#4544). If the *local user* sees a blank/black picker while that line is present, it is the compositor behaviour Chromium describes in §8 Pattern B (also [tauri #14189](https://github.com/tauri-apps/tauri/issues/14189)), not a missing child flag — `WDA_MONITOR` instead of `WDA_EXCLUDEFROMCAPTURE` is the lever to try.
 
 ### §7.2 — Win11 `ChangeWindowTreeProtection` kernel bug (this PR cannot fix)
 
@@ -250,7 +252,7 @@ Every project below applies the flag to one HWND and walks no children:
 | [AleqsSilagadze/Amnesia-Chat](https://github.com/AleqsSilagadze/Amnesia-Chat) | Rust | `WDA_EXCLUDEFROMCAPTURE` | `src/main.rs` |
 | [raycast/extensions](https://github.com/raycast/extensions) color-picker | Rust | `WDA_EXCLUDEFROMCAPTURE` | `extensions/color-picker/rust/color-picker/src/color_picker.rs` |
 
-**Implication:** the recursive descendant walk in this PR is **not** the industry-standard approach — it's a more defensive variant that addresses [WebView2Feedback #4544](https://github.com/MicrosoftEdge/WebView2Feedback/issues/4544) (Microsoft-confirmed: child HWNDs don't inherit the flag). The bug those projects ship — picker invisible to user during full-screen Zoom share on Win11 24H2 — is open and unfixed in Tauri itself ([tauri #14189](https://github.com/tauri-apps/tauri/issues/14189), filed Sep 2025, no engineering analysis, no PR).
+**Implication:** top-level-only is not just the industry default — it is all the OS permits. This PR's first revision added a recursive descendant walk as a more defensive variant for [WebView2Feedback #4544](https://github.com/MicrosoftEdge/WebView2Feedback/issues/4544); the Windows CI runner rejected `SetWindowDisplayAffinity` on every `WS_CHILD` window (`applied=1 attempted=4`), matching the documented top-level-only contract, so the walk was removed (see §7.1). The bug those projects ship — picker blank to the local user during full-screen share on Win11 24H2 — is open and unfixed in Tauri itself ([tauri #14189](https://github.com/tauri-apps/tauri/issues/14189), filed Sep 2025, no engineering analysis, no PR).
 
 ### Pattern B — Chromium's choice: `WDA_MONITOR` over `WDA_EXCLUDEFROMCAPTURE`
 
@@ -260,11 +262,11 @@ Every project below applies the flag to one HWND and walks no children:
 
 Chromium accepts "black rectangle visible in the capture" as a trade-off for "renders correctly on the local screen." This is the same trade-off [Electron #45990](https://github.com/electron/electron/issues/45990) wrestled with in March 2026 (regression that re-introduced the black rectangle). Electron fixed it via [PR #47020](https://github.com/electron/electron/pull/47020) by overriding Chromium's `ElectronDesktopWindowTreeHostWin` methods — but Tauri's wry has no equivalent abstraction.
 
-**This PR's auto-fallback to `WDA_MONITOR`** (in `capture.rs::apply_affinity_recursive`, only triggered when `WDA_EXCLUDEFROMCAPTURE` returns `ERROR_NOT_ENOUGH_MEMORY`) implements Chromium's strategy as the failure-mode escape hatch.
+**This PR's auto-fallback to `WDA_MONITOR`** (in `capture.rs::apply_display_affinity`, only triggered when `WDA_EXCLUDEFROMCAPTURE` returns `ERROR_NOT_ENOUGH_MEMORY`) implements Chromium's strategy as the failure-mode escape hatch. If §7.1's "local user sees a blank picker" symptom reproduces with the parent flag applied, making `WDA_MONITOR` the *default* (not just the fallback) is the next experiment — it trades "picker hidden from the share" for "picker shows as a black rectangle in the share", which is still acceptable for a demo.
 
-### Pattern C — Nobody walks child HWNDs
+### Pattern C — Nobody walks child HWNDs, and now we know why
 
-A targeted GitHub search (`EnumChildWindows SetWindowDisplayAffinity`) returns **zero matches** combining both calls. The recursive HWND walk in this PR is, as best I can determine, an original solution to the WebView2 child-inheritance bug.
+A targeted GitHub search (`EnumChildWindows SetWindowDisplayAffinity`) returns **zero matches** combining both calls. This PR's first revision tried exactly that; Windows rejects `SetWindowDisplayAffinity` on non-top-level windows (documented, and reproduced on the CI runner — §7.1), so there is nothing to walk. Case E in `tests/screen_capture_exclusion.rs` keeps that fact under test.
 
 ---
 

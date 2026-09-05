@@ -1,26 +1,26 @@
 //! Windows screen-capture exclusion helpers + foreground-target HWND classification.
 //!
 //! Two responsibilities, both small:
-//!   1. Apply `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` to a window
-//!      AND every descendant HWND in its tree. WebView2 hosts its GPU swap
-//!      chain in a descendant HWND; applying the flag to the parent alone
-//!      leaves the child swap chain visible-to-capture on some Win11 24H2
-//!      configurations, which is the failure mode that produced "picker is
-//!      invisible during Zoom share."
+//!   1. Apply `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` to the
+//!      picker's top-level HWND, with structured detection of the Win11
+//!      win32k `ERROR_NOT_ENOUGH_MEMORY` bug and a `WDA_MONITOR` fallback.
+//!      The API only accepts top-level windows of the calling process —
+//!      child HWNDs (WebView2's included) are rejected, see
+//!      `apply_display_affinity` — so there is deliberately no descendant walk.
 //!   2. Classify a foreground HWND so the picker's focus-snapshot can skip
 //!      Zoom-share helper windows (which become transiently foreground during
-//!      a share session) and our own windows (picker, tray helper) when
-//!      picking the real target app to restore focus to.
+//!      a share session) and our own tray-menu helper window when picking the
+//!      real target app to restore focus to.
 //!
 //! `platform::windows` is cfg-gated off non-Windows builds (see
 //! `platform/mod.rs`), so this module's helpers compile only on Windows.
 
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowDisplayAffinity,
-    GetWindowTextW, IsIconic, IsWindowVisible, SetWindowDisplayAffinity, GW_HWNDNEXT,
-    WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR, WINDOW_DISPLAY_AFFINITY,
+    GetClassNameW, GetForegroundWindow, GetWindow, GetWindowDisplayAffinity, GetWindowTextW,
+    IsIconic, IsWindowVisible, SetWindowDisplayAffinity, GW_HWNDNEXT, WDA_EXCLUDEFROMCAPTURE,
+    WDA_MONITOR, WINDOW_DISPLAY_AFFINITY,
 };
 
 // --------------------------------------------------------------------------
@@ -99,171 +99,101 @@ fn is_cloaked(hwnd: HWND) -> bool {
     res.is_ok() && cloaked != 0
 }
 
-/// Collect every descendant HWND under `parent`. `EnumChildWindows` walks the
-/// full tree (children, grandchildren, …) per MSDN, so a single call is enough.
-pub fn enumerate_descendants(parent: HWND) -> Vec<HWND> {
-    if parent.0.is_null() {
-        return Vec::new();
-    }
-    let mut collected: Vec<HWND> = Vec::new();
-    // SAFETY: `lparam` is a pointer to a `Vec<HWND>` owned by this stack frame.
-    // `EnumChildWindows` is synchronous — the callback only runs while we're
-    // blocked on this call below, so the pointer is live for the duration.
-    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let v = &mut *(lparam.0 as *mut Vec<HWND>);
-        v.push(hwnd);
-        BOOL(1)
-    }
-    let lparam = LPARAM(&mut collected as *mut Vec<HWND> as isize);
-    let _ = unsafe { EnumChildWindows(parent, Some(cb), lparam) };
-    collected
-}
-
 /// Apply `affinity` (typically `WDA_EXCLUDEFROMCAPTURE` or `WDA_NONE`) to
-/// `parent` and every descendant in its HWND tree. Per-HWND failures are
-/// logged as warnings and don't abort the walk; the parent is set first so
-/// even partial success preserves the prior single-HWND behavior.
+/// the top-level window `hwnd`. Returns the affinity actually in effect
+/// afterwards — it differs from the request only when the win32k fallback
+/// below engaged.
 ///
-/// Returns `(applied, attempted)` on success. Errs only when `parent` is null.
+/// **Why top-level only.** `SetWindowDisplayAffinity` is documented as taking
+/// "a handle to the top-level window" that "must belong to the current
+/// process", and as returning FALSE for non-top-level windows. An earlier
+/// revision of this helper also walked every `EnumChildWindows` descendant to
+/// reach WebView2's GPU swap-chain HWND; on a real Windows runner the OS
+/// rejected all three same-process `WS_CHILD` test windows
+/// (`applied=1 attempted=4`), and WebView2's children are additionally owned
+/// by `msedgewebview2.exe`. `tests/screen_capture_exclusion.rs` pins that
+/// rejection so the walk is not reintroduced. WebView2Feedback #4544 (child
+/// content not covered by the parent's affinity) therefore has no host-side
+/// workaround here.
 ///
-/// **Two known failure modes are surfaced via logging:**
-///
-/// 1. WebView2 hosts its GPU swap chain in a descendant HWND; the parent's
-///    display-affinity flag does not propagate to that child on some
-///    Win11 builds. Microsoft tracks this as WebView2Feedback #4544
-///    (AB#50877897). Recursive application here is the workaround.
-///
-/// 2. On Windows 11, the kernel function `win32kfull.sys::ChangeWindowTreeProtection`
-///    has a bug that makes `SetWindowDisplayAffinity` return
-///    `ERROR_NOT_ENOUGH_MEMORY` (HRESULT `0x80070008`) for "non-traditional
-///    Win32" apps including Chromium / WebView2 / Electron. Microsoft's
-///    official workaround is the `LegacyDisplayAffinity` Application
-///    Compatibility shim (see https://aka.ms/AppCompat). This function
-///    cannot fix that — it can only detect and log it.
-///
-/// **Caveat on descendants.** The `SetWindowDisplayAffinity` documentation
-/// states the handle must be *a top-level window belonging to the current
-/// process* and that the call fails for non-top-level windows. Every HWND
-/// returned by `EnumChildWindows` is non-top-level (and WebView2's are owned
-/// by the `msedgewebview2.exe` process), so descendant rejections are the
-/// documented outcome, not an anomaly: they are logged at `debug` and show
-/// up as `applied < attempted` in the summary line. The parent HWND is the
-/// one that must succeed.
-pub fn apply_affinity_recursive(
-    parent: HWND,
+/// **Known failure mode, surfaced via logging.** On Windows 11 the kernel
+/// function `win32kfull.sys::ChangeWindowTreeProtection` has a bug that makes
+/// `SetWindowDisplayAffinity` return `ERROR_NOT_ENOUGH_MEMORY` (HRESULT
+/// `0x80070008`) for "non-traditional Win32" apps including Chromium /
+/// WebView2 / Electron. Microsoft's official workaround is the
+/// `LegacyDisplayAffinity` Application Compatibility shim (see
+/// https://aka.ms/AppCompat). This function detects it, emits a structured
+/// error, and falls back to `WDA_MONITOR` — Chromium's own choice in
+/// `desktop_window_tree_host_win.cc` — which blanks the window in captures
+/// instead of hiding it: strictly better than leaving the picker visible in
+/// the share.
+pub fn apply_display_affinity(
+    hwnd: HWND,
     affinity: WINDOW_DISPLAY_AFFINITY,
-) -> Result<(usize, usize), String> {
-    if parent.0.is_null() {
-        return Err("apply_affinity_recursive: null parent HWND".into());
+) -> Result<WINDOW_DISPLAY_AFFINITY, String> {
+    if hwnd.0.is_null() {
+        return Err("apply_display_affinity: null HWND".into());
     }
-    let mut attempted = 0usize;
-    let mut applied = 0usize;
-    // Affinity to propagate to descendants: matches what the parent actually
-    // ended up with, so a WDA_MONITOR fallback isn't paired with children
-    // still being asked for WDA_EXCLUDEFROMCAPTURE.
-    let mut effective = affinity;
-
-    attempted += 1;
-    match unsafe { SetWindowDisplayAffinity(parent, affinity) } {
+    let class = class_name_of(hwnd);
+    let err = match unsafe { SetWindowDisplayAffinity(hwnd, affinity) } {
         Ok(()) => {
-            applied += 1;
-            tracing::debug!(
-                hwnd = parent.0 as usize,
-                class = %class_name_of(parent),
+            tracing::info!(
+                target: "prompt_player::capture",
+                hwnd = hwnd.0 as usize,
+                class = %class,
                 affinity = affinity.0,
-                "display-affinity set (parent)"
+                "display-affinity applied"
             );
+            return Ok(affinity);
         }
-        Err(e) => {
-            // HRESULT 0x80070008 = Win32 ERROR_NOT_ENOUGH_MEMORY. On Windows
-            // 11, this specific failure is the `ChangeWindowTreeProtection`
-            // kernel bug — not an actual memory exhaustion. Surface it as
-            // its own structured event so log-greppers can distinguish "the
-            // OS rejected us" from "the HWND was destroyed mid-call".
-            let hr = e.code().0 as u32;
-            if hr == 0x8007_0008 {
-                tracing::error!(
-                    target: "prompt_player::capture",
-                    hwnd = parent.0 as usize,
-                    class = %class_name_of(parent),
-                    hresult = format!("0x{hr:08X}"),
-                    "win11_legacy_display_affinity_bug: SetWindowDisplayAffinity returned ERROR_NOT_ENOUGH_MEMORY (win32k bug). Capture-exclusion will NOT work until the LegacyDisplayAffinity Application Compatibility shim is applied. See https://learn.microsoft.com/en-us/answers/questions/700122/setwindowdisplayaffinity-on-windows-11"
-                );
-                // Defense-in-depth: try WDA_MONITOR as a fallback. Chromium's
-                // own desktop_window_tree_host_win.cc uses WDA_MONITOR
-                // instead of WDA_EXCLUDEFROMCAPTURE for similar reasons —
-                // the win32k bug class often spares WDA_MONITOR even when
-                // it rejects WDA_EXCLUDEFROMCAPTURE. Picker becomes a
-                // black rectangle to the audience instead of being fully
-                // excluded, which is a strictly-better failure mode than
-                // "picker fully visible in the share."
-                if affinity == WDA_EXCLUDEFROMCAPTURE {
-                    if let Ok(()) = unsafe { SetWindowDisplayAffinity(parent, WDA_MONITOR) } {
-                        applied += 1;
-                        effective = WDA_MONITOR;
-                        tracing::warn!(
-                            target: "prompt_player::capture",
-                            hwnd = parent.0 as usize,
-                            class = %class_name_of(parent),
-                            "fell back to WDA_MONITOR after WDA_EXCLUDEFROMCAPTURE rejected by win32k bug; audience sees a black rectangle instead of see-through"
-                        );
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    target: "prompt_player::capture",
-                    hwnd = parent.0 as usize,
-                    class = %class_name_of(parent),
-                    hresult = format!("0x{hr:08X}"),
-                    "SetWindowDisplayAffinity on parent failed: {e}"
-                );
-            }
-        }
-    }
+        Err(e) => e,
+    };
 
-    for child in enumerate_descendants(parent) {
-        attempted += 1;
-        match unsafe { SetWindowDisplayAffinity(child, effective) } {
-            Ok(()) => {
-                applied += 1;
-                tracing::debug!(
-                    target: "prompt_player::capture",
-                    hwnd = child.0 as usize,
-                    class = %class_name_of(child),
-                    affinity = effective.0,
-                    "display-affinity set (descendant)"
-                );
-            }
-            Err(e) => {
-                // Expected for non-top-level / foreign-process HWNDs (see the
-                // doc comment) — keep it out of the default `info` log so a
-                // picker show doesn't emit one warning per WebView2 child.
-                tracing::debug!(
-                    target: "prompt_player::capture",
-                    hwnd = child.0 as usize,
-                    class = %class_name_of(child),
-                    hresult = format!("0x{:08X}", e.code().0 as u32),
-                    "SetWindowDisplayAffinity on descendant rejected: {e}"
-                );
-            }
-        }
+    // HRESULT 0x80070008 = Win32 ERROR_NOT_ENOUGH_MEMORY. On Windows 11 this
+    // specific failure is the `ChangeWindowTreeProtection` kernel bug — not
+    // an actual memory exhaustion. Surface it as its own structured event so
+    // log-greppers can distinguish "the OS rejected us" from "the HWND was
+    // destroyed mid-call".
+    let hr = err.code().0 as u32;
+    if hr != 0x8007_0008 {
+        tracing::warn!(
+            target: "prompt_player::capture",
+            hwnd = hwnd.0 as usize,
+            class = %class,
+            hresult = format!("0x{hr:08X}"),
+            "SetWindowDisplayAffinity failed: {err}"
+        );
+        return Err(format!("SetWindowDisplayAffinity: {err}"));
     }
-
-    tracing::info!(
+    tracing::error!(
         target: "prompt_player::capture",
-        parent = parent.0 as usize,
-        applied,
-        attempted,
-        affinity = effective.0,
-        "display-affinity applied to picker tree"
+        hwnd = hwnd.0 as usize,
+        class = %class,
+        hresult = format!("0x{hr:08X}"),
+        "win11_legacy_display_affinity_bug: SetWindowDisplayAffinity returned ERROR_NOT_ENOUGH_MEMORY (win32k bug). Capture-exclusion will NOT work until the LegacyDisplayAffinity Application Compatibility shim is applied. See https://learn.microsoft.com/en-us/answers/questions/700122/setwindowdisplayaffinity-on-windows-11"
     );
-
-    Ok((applied, attempted))
+    if affinity != WDA_EXCLUDEFROMCAPTURE {
+        return Err(format!("SetWindowDisplayAffinity: {err}"));
+    }
+    match unsafe { SetWindowDisplayAffinity(hwnd, WDA_MONITOR) } {
+        Ok(()) => {
+            tracing::warn!(
+                target: "prompt_player::capture",
+                hwnd = hwnd.0 as usize,
+                class = %class,
+                "fell back to WDA_MONITOR after WDA_EXCLUDEFROMCAPTURE rejected by win32k bug; audience sees a black rectangle instead of see-through"
+            );
+            Ok(WDA_MONITOR)
+        }
+        Err(e2) => Err(format!(
+            "SetWindowDisplayAffinity: {err}; WDA_MONITOR fallback also failed: {e2}"
+        )),
+    }
 }
 
 /// Read the current display-affinity flag for a window. Returns `None` on
-/// failure. Used by the T2 integration test to assert recursive-apply hit
-/// every descendant.
+/// failure — which, per the Win32 docs and the integration tests, includes
+/// every non-top-level window. Used by `tests/screen_capture_exclusion.rs`.
 pub fn current_display_affinity(hwnd: HWND) -> Option<WINDOW_DISPLAY_AFFINITY> {
     // `GetWindowDisplayAffinity` is bound with a raw `*mut u32` out-param
     // (the newtype is only used on the `Set` side), so read into a `u32`.
