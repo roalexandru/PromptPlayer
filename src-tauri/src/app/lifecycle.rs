@@ -12,7 +12,9 @@ use std::sync::Arc;
 // and this handler is mac-only.
 
 pub fn install(app: &tauri::App) {
-    for label in ["library", "picker", "tray-popup", "about"] {
+    // Diagnostics is close-to-hide like the rest: destroying it makes the
+    // tray's "Diagnostics…" item a one-shot for the rest of the run.
+    for label in ["library", "picker", "tray-popup", "about", "diagnostics"] {
         if let Some(w) = app.get_webview_window(label) {
             install_window_handlers(app.handle().clone(), label, w);
         }

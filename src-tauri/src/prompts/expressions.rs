@@ -78,20 +78,98 @@ fn parse_git_args(raw: &str) -> Result<Vec<String>, String> {
     {
         return Err(format!("git() argument {bad:?} contains a shell character"));
     }
-    // `-c key=value` can change git's behaviour arbitrarily (including
-    // `core.pager`, which runs a command), and `--upload-pack`/`--exec` style
-    // flags run helpers. Neither belongs in a read-only helper.
-    // Prefix matches, not equality: git accepts both `--config-env x` and
-    // `--config-env=x`, and an exact-match check let the latter straight
-    // through (which is how the test for this caught my own allowlist).
-    const DENIED_FLAG_PREFIXES: &[&str] =
-        &["--exec", "--upload-pack", "--receive-pack", "--config-env"];
-    if let Some(bad) = args.iter().find(|a| {
-        *a == "-c" || a.starts_with("-c=") || DENIED_FLAG_PREFIXES.iter().any(|p| a.starts_with(p))
-    }) {
+    // Flags are allowlisted, not denylisted. A denylist here was wrong twice:
+    // `-c key=value` reaches `core.pager` (which runs a command), and
+    // `git diff --output=FILE` / `git show --output=FILE` write an arbitrary
+    // file — an arbitrary-write primitive inside a helper whose whole contract
+    // is "read-only". Enumerating every such flag across seven subcommands is
+    // not a game worth playing, so anything that isn't known-safe is refused.
+    if let Some(bad) = args.iter().skip(1).find(|a| !is_allowed_git_flag(a)) {
         return Err(format!("git() argument {bad:?} is not allowed"));
     }
     Ok(args)
+}
+
+/// Read-only flags `git()` accepts. Anything else beginning with `-` is
+/// refused; non-flag operands (revisions, paths, formats) pass through.
+const GIT_ALLOWED_FLAGS: &[&str] = &[
+    "--short",
+    "--abbrev-ref",
+    "--show-toplevel",
+    "--git-dir",
+    "--is-inside-work-tree",
+    "--verify",
+    "--quiet",
+    "--oneline",
+    "--stat",
+    "--shortstat",
+    "--numstat",
+    "--name-only",
+    "--name-status",
+    "--cached",
+    "--staged",
+    "--porcelain",
+    "--branch",
+    "--show-current",
+    "--all",
+    "--tags",
+    "--no-color",
+    "--no-patch",
+    "--no-pager",
+    "--date",
+    "--pretty",
+    "--format",
+    "--max-count",
+    "--skip",
+    "--since",
+    "--until",
+    "--author",
+    "--grep",
+    "--reverse",
+    "--first-parent",
+    "--decorate",
+    "--contains",
+    "--merged",
+    "--no-merged",
+    "--sort",
+    "--list",
+    "--verbose",
+    "-v",
+    "-n",
+    "-s",
+    "--tags-only",
+    "--dirty",
+    "--always",
+];
+
+/// True for a plain operand, or for an allowlisted flag in either `--flag` or
+/// `--flag=value` form. `-n5`-style bundled short flags are allowed only for
+/// the short flags in the list.
+fn is_allowed_git_flag(arg: &str) -> bool {
+    if !arg.starts_with('-') {
+        // An operand. It cannot start a new flag, so it can't smuggle one in.
+        return true;
+    }
+    let name = arg.split('=').next().unwrap_or(arg);
+    if GIT_ALLOWED_FLAGS.contains(&name) {
+        return true;
+    }
+    if let Some(rest) = arg.strip_prefix('-') {
+        // `git log -1` — a bare commit-count limiter, read-only by nature.
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+        // `-n5`, `-v2` — allowed only when the short flag itself is allowlisted.
+        if !rest.starts_with('-') && rest.len() > 1 {
+            let short = format!("-{}", &rest[..1]);
+            if GIT_ALLOWED_FLAGS.contains(&short.as_str())
+                && rest[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Run an allowlisted `git` command in `repo_root` and return its stdout.
@@ -113,11 +191,32 @@ fn run_git(repo_root: &str, raw: &str) -> Result<String, String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let start = Instant::now();
-    let out = cmd.output().map_err(|e| format!("git: {e}"))?;
-    if start.elapsed() > Duration::from_secs(GIT_TIMEOUT_SECS) {
-        return Err("git took too long".into());
+    // `output()` waits forever, so the old post-hoc elapsed check reported a
+    // timeout that had already blocked the fire path for as long as git took.
+    // Spawn, poll, and kill: a repo on a spun-down or network volume can hang
+    // for minutes, and this runs before a single character is typed.
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(GIT_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("git took too long".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("git: {e}"));
+            }
+        }
     }
+    let out = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("git {}: {}", args.join(" "), err.trim()));
@@ -551,6 +650,80 @@ mod tests {
         let out = expand_expressions(r#"${{ git("push --force") }}"#, &ctx);
         assert!(out.contains("git error"), "{out}");
         assert!(out.contains("read-only"), "{out}");
+    }
+
+    #[test]
+    fn git_refuses_flags_that_write_a_file() {
+        // `git diff --output=FILE` and `git show --output=FILE` write wherever
+        // they're pointed — an arbitrary-write primitive inside a helper
+        // documented as read-only. Verified against real git: exit 0, file
+        // created. The flag allowlist is what closes it.
+        for call in [
+            "diff --output=/tmp/pp-should-not-exist",
+            "diff --output /tmp/pp-should-not-exist",
+            "show --output=/tmp/pp-should-not-exist",
+            "log -o/tmp/pp-should-not-exist",
+        ] {
+            let err = parse_git_args(call).unwrap_err();
+            assert!(
+                err.contains("not allowed"),
+                "{call:?} must be refused, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_refuses_flags_that_run_a_helper() {
+        for call in [
+            "log -c core.pager=sh",
+            "log -c=core.pager=sh",
+            "diff --ext-diff",
+            "log --config-env=x",
+            "show --textconv",
+            "status --exec=sh",
+        ] {
+            assert!(parse_git_args(call).is_err(), "{call:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn git_still_accepts_the_read_only_calls_it_is_for() {
+        for call in [
+            "rev-parse --abbrev-ref HEAD",
+            "rev-parse --short HEAD",
+            "log --oneline -n 5",
+            "log --oneline -n5",
+            "status --porcelain",
+            "describe --tags --always",
+            "branch --show-current",
+            "diff --stat HEAD~1",
+            "remote get-url origin",
+        ] {
+            assert!(
+                parse_git_args(call).is_ok(),
+                "{call:?} must still work: {:?}",
+                parse_git_args(call)
+            );
+        }
+    }
+
+    #[test]
+    fn git_timeout_kills_the_child_instead_of_reporting_after_the_fact() {
+        // The old code called `output()` (waits forever) and then compared
+        // elapsed time, so a hung git blocked the fire path for its full
+        // duration and only *reported* a timeout afterwards.
+        const SRC: &str = include_str!("expressions.rs");
+        let start = SRC.find("fn run_git").expect("run_git");
+        let body = &SRC[start..];
+        let body = &body[..body.find("\n}").expect("fn end")];
+        assert!(
+            !body.contains("cmd.output()"),
+            "run_git must not block on `output()` — it cannot be interrupted"
+        );
+        assert!(
+            body.contains("child.kill()"),
+            "the timeout must actually kill the child"
+        );
     }
 
     #[test]
