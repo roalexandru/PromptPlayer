@@ -108,6 +108,59 @@ fn no_unbounded_poller_emits_telemetry() {
     );
 }
 
+/// The Windows installer kills the process inside `download_and_install`, so a
+/// queued event is lost. The flush must come first, textually.
+#[test]
+fn update_install_flushes_before_the_installer_handoff() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/commands/updater.rs"
+    ))
+    .expect("read updater.rs");
+    let flush = src
+        .find("send_and_flush(&app, TelemetryEvent::UpdateInstallStarted)")
+        .expect("UpdateInstallStarted must be sent AND flushed");
+    // `.` prefixed so prose mentioning the function doesn't count as the call.
+    let handoff = src.find(".download_and_install(").expect("install call");
+    assert!(
+        flush < handoff,
+        "the flush must precede download_and_install — on Windows nothing after it runs"
+    );
+}
+
+/// Every picker entry point has to report. `show_picker_window` is private so
+/// only a `summon_*` wrapper can reach it; this pins that it stays private.
+#[test]
+fn picker_window_is_only_reachable_through_a_reporting_wrapper() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/commands/picker.rs"
+    ))
+    .expect("read picker.rs");
+    assert!(
+        src.contains("\nfn show_picker_window("),
+        "show_picker_window must stay private, or a new entry point can skip \
+         PickerOpened — which is how the palette funnel read as zero opens"
+    );
+    assert!(
+        !src.contains("pub fn show_picker_window("),
+        "show_picker_window was made public again"
+    );
+
+    // And nothing outside the module may reference it.
+    let outside: Vec<String> = rust_files()
+        .into_iter()
+        .filter(|f| !f.ends_with("commands/picker.rs"))
+        .filter(|f| {
+            std::fs::read_to_string(f)
+                .map(|s| s.contains("show_picker_window"))
+                .unwrap_or(false)
+        })
+        .map(|f| f.display().to_string())
+        .collect();
+    assert!(outside.is_empty(), "external callers found: {outside:?}");
+}
+
 #[test]
 fn no_event_field_restates_an_aptabase_column() {
     // Aptabase already sends os/locale/app_version as columns on every row.

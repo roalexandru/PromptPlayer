@@ -121,9 +121,21 @@ fn report_search_chars(app: &AppHandle, ctx: &AppContext) {
     }
 }
 
-/// Bring the picker window forward. Shared by every entry point so behavior
-/// doesn't depend on how it was summoned.
-pub fn show_picker_window(app: &AppHandle) {
+/// Show the picker when there's no `AppContext` to summon it with — only the
+/// single-instance fallback, which runs before setup registers state.
+pub fn summon_picker_without_context(app: &AppHandle) {
+    show_picker_window(app);
+    telemetry::send(
+        app,
+        TelemetryEvent::PickerOpened {
+            source: PickerSource::Relaunch,
+        },
+    );
+}
+
+/// Bring the picker window forward. Private on purpose: every caller must go
+/// through a `summon_*` wrapper, so a new entry point cannot skip reporting.
+fn show_picker_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("picker") {
         #[cfg(target_os = "macos")]
         crate::platform::macos::activate_app();

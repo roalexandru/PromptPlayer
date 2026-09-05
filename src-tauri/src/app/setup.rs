@@ -302,7 +302,7 @@ pub fn run() {
                     );
                 });
             } else {
-                crate::commands::picker::show_picker_window(app);
+                crate::commands::picker::summon_picker_without_context(app);
             }
         }))
         .plugin(tauri_plugin_autostart::init(

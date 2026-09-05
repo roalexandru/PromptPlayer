@@ -282,6 +282,31 @@ fn matches_time_of_day(spec: &str, minute: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// The Windows arm is raw FFI, so it can't be exercised from a mac test
+    /// runner. Pin the contract textually instead of leaving it unguarded.
+    #[test]
+    fn foreground_identity_reports_a_process_not_a_window() {
+        const SRC: &str = include_str!("scopes.rs");
+        let start = SRC
+            .find("pub fn foreground_identity()")
+            .expect("foreground_identity");
+        let body = &SRC[start..];
+        let body = &body[..body.find("\n}").expect("fn end")];
+
+        // Match the call, not the `use` line — that import names the same
+        // symbol and made an earlier version of this assertion vacuous.
+        assert!(
+            body.contains("GetWindowThreadProcessId(hwnd"),
+            "the Windows arm must resolve the HWND to its owning process — \
+             returning the raw handle aborts playback whenever the target app \
+             opens a tooltip or autocomplete list"
+        );
+        assert!(
+            !body.contains("hwnd.0 as "),
+            "the raw HWND is a window id, not an application id"
+        );
+    }
+
     #[test]
     fn empty_scope_matches_everything() {
         let s = ScopeFilter::default();
