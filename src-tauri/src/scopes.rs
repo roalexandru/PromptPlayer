@@ -75,8 +75,15 @@ fn capture_macos() -> ForegroundContext {
     ForegroundContext {
         bundle_id: snap.bundle_id,
         executable: snap.executable_path,
-        window_title: None, // requires AXUIElement — Phase 13
-        url: None,          // browser URL via AppleScript — Phase 8 territory
+        // NSWorkspace exposes no window titles, so this was permanently
+        // `None` — and `ScopeFilter::matches` rejects any prompt with a
+        // `window-title-regex:` when the title is empty. Every title-scoped
+        // prompt therefore silently never fired on macOS, including the ones
+        // the library window offers to create. The AX API is the only source
+        // for this; it degrades to `None` without an Accessibility grant,
+        // which is the same permission the keyboard hook already needs.
+        window_title: crate::accessibility::focused_window_title(),
+        url: None, // browser URL via AppleScript — Phase 8 territory
     }
 }
 

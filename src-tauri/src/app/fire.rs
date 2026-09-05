@@ -2,27 +2,34 @@
 //! the hook, the picker, the tray and per-prompt hotkeys.
 //!
 //! Numbered stage comments below follow: capture foreground → pick candidate →
-//! expressions → placeholders → filters → case → RDP → schedule → play → undo.
+//! focused-element guard → gather referenced context → expressions →
+//! placeholders → filters → case → RDP → newline mode → schedule → play →
+//! undo and usage.
 
+use crate::accessibility;
 use crate::app::context::AppContext;
 use crate::filters;
 use crate::inject::{paste_via_clipboard, EnigoInjector};
 use crate::matcher;
 use crate::prompts::expressions::ExprContext;
 use crate::prompts::placeholders::{expand, PlaceholderContext};
+use crate::prompts::steps::{self, Step};
 use crate::prompts::Prompt;
 use crate::rdp::RdpMode;
+use crate::repo;
 use crate::scopes;
 use crate::telemetry::{
     self, CancelReason, CharBucket, DurationBucket, InjectionStage, PromptMode, TargetAppKind,
     TelemetryEvent,
 };
-use crate::typer::{play_guarded, schedule, Injector, Key, ScheduleOptions};
+use crate::typer::{play_controlled, schedule, Injector, Key, PlaybackControl, ScheduleOptions};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 use tauri::AppHandle;
 
 /// Pickup mode used when firing from the picker (Spec §5.3 modifier-on-Enter).
@@ -31,6 +38,10 @@ pub enum PickMode {
     Human,
     Fast,
     Paste,
+    /// §5.3 Cmd+Enter — type the body, then submit it. The one mode the spec
+    /// listed and the picker never had; it is also what makes this useful
+    /// against a coding agent, where "typed but not sent" is half a turn.
+    Run,
 }
 
 impl PickMode {
@@ -38,6 +49,7 @@ impl PickMode {
         match s {
             "fast" => Self::Fast,
             "paste" => Self::Paste,
+            "run" => Self::Run,
             _ => Self::Human,
         }
     }
@@ -45,6 +57,19 @@ impl PickMode {
     pub fn is_paste(&self) -> bool {
         matches!(self, Self::Paste)
     }
+}
+
+/// Everything one fire needs beyond shared app state. Bundled so the pipeline
+/// takes four arguments instead of a dozen positional ones.
+struct FireRequest {
+    prompt: Prompt,
+    typed_form: Option<String>,
+    telem_mode: PromptMode,
+    foreground: scopes::ForegroundContext,
+    pick_mode: Option<PickMode>,
+    /// Pre-resolved tab-stop / choice answers from the picker (§6.4: the
+    /// picker resolves choices before it dismisses, never a modal mid-typing).
+    stop_answers: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -107,13 +132,14 @@ impl FireService {
                     tracing::warn!("picked prompt {} not found", picked_id);
                     return;
                 };
-                svc.run_resolved(
+                svc.run_resolved(FireRequest {
                     prompt,
-                    Some(typed_form),
-                    PromptMode::Stealth,
+                    typed_form: Some(typed_form),
+                    telem_mode: PromptMode::Stealth,
                     foreground,
-                    None,
-                );
+                    pick_mode: None,
+                    stop_answers: HashMap::new(),
+                });
             })
             .expect("spawn fire dispatch thread");
     }
@@ -121,16 +147,32 @@ impl FireService {
     /// Fire from the picker. `mode` is the modifier-on-Enter behavior; the
     /// pipeline (scope, expressions, filters) is otherwise identical.
     pub fn fire_from_picker(&self, prompt_id: &str, mode: PickMode) {
-        self.fire_selected(prompt_id, mode, PromptMode::Picker);
+        self.fire_selected(prompt_id, mode, PromptMode::Picker, HashMap::new());
+    }
+
+    /// Picker fire carrying pre-resolved tab-stop / choice answers.
+    pub fn fire_from_picker_with(
+        &self,
+        prompt_id: &str,
+        mode: PickMode,
+        stop_answers: HashMap<String, String>,
+    ) {
+        self.fire_selected(prompt_id, mode, PromptMode::Picker, stop_answers);
     }
 
     /// Fire a pinned prompt clicked in the tray. Same pipeline as the picker;
     /// only the reported mode differs, so tray use is finally distinguishable.
     pub fn fire_from_tray(&self, prompt_id: &str, mode: PickMode) {
-        self.fire_selected(prompt_id, mode, PromptMode::Tray);
+        self.fire_selected(prompt_id, mode, PromptMode::Tray, HashMap::new());
     }
 
-    fn fire_selected(&self, prompt_id: &str, mode: PickMode, telem_mode: PromptMode) {
+    fn fire_selected(
+        &self,
+        prompt_id: &str,
+        mode: PickMode,
+        telem_mode: PromptMode,
+        stop_answers: HashMap<String, String>,
+    ) {
         let svc = self.clone();
         let prompt_id = prompt_id.to_string();
         thread::Builder::new()
@@ -147,7 +189,14 @@ impl FireService {
                 // Picker runs after focus restore — capture foreground anew so
                 // scope/expr context reflects the target app, not Prompt Player.
                 let foreground = scopes::capture_foreground_context();
-                svc.run_resolved(prompt, None, telem_mode, foreground, Some(mode));
+                svc.run_resolved(FireRequest {
+                    prompt,
+                    typed_form: None,
+                    telem_mode,
+                    foreground,
+                    pick_mode: Some(mode),
+                    stop_answers,
+                });
             })
             .expect("spawn picker fire thread");
     }
@@ -167,37 +216,26 @@ impl FireService {
                 }
                 let foreground = scopes::capture_foreground_context();
                 telemetry::send(&svc.app, TelemetryEvent::HotkeyFired);
-                svc.run_resolved(prompt, None, PromptMode::Hotkey, foreground, None);
+                svc.run_resolved(FireRequest {
+                    prompt,
+                    typed_form: None,
+                    telem_mode: PromptMode::Hotkey,
+                    foreground,
+                    pick_mode: None,
+                    stop_answers: HashMap::new(),
+                });
             })
             .expect("spawn hotkey fire thread");
     }
 
     /// Run a resolved fire on the dispatch thread. Bails if a playback is
     /// already typing, so two fires can't interleave into one window.
-    fn run_resolved(
-        &self,
-        prompt: Prompt,
-        typed_form: Option<String>,
-        telem_mode: PromptMode,
-        foreground: scopes::ForegroundContext,
-        pick_mode: Option<PickMode>,
-    ) {
-        let Some(cancel) = self.ctx.state.begin_playback() else {
+    fn run_resolved(&self, req: FireRequest) {
+        let Some(control) = self.ctx.state.begin_playback() else {
             tracing::info!("fire ignored — a playback is already in progress");
             return;
         };
-        run_fire_pipeline(
-            self.app.clone(),
-            prompt,
-            typed_form,
-            telem_mode,
-            foreground,
-            pick_mode,
-            cancel,
-            self.ctx.state.clone(),
-            self.ctx.undo.clone(),
-            self.ctx.rdp.clone(),
-        );
+        run_fire_pipeline(self.app.clone(), self.ctx.clone(), req, control);
     }
 
     /// Backspace-undo. Only the body is erased — the trigger was never removed
@@ -213,7 +251,7 @@ impl FireService {
                 let Some(entry) = undo.take_recent(std::time::Instant::now()) else {
                     return;
                 };
-                let Some(cancel) = app_state.begin_playback() else {
+                let Some(control) = app_state.begin_playback() else {
                     // A playback is already running — don't stomp it.
                     return;
                 };
@@ -232,7 +270,7 @@ impl FireService {
                     }
                 };
                 for _ in 0..entry.body_chars_typed {
-                    if cancel.load(Ordering::Relaxed) {
+                    if control.is_cancelled() {
                         inj.release_all_modifiers();
                         app_state.end_playback();
                         return;
@@ -253,28 +291,78 @@ impl FireService {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_fire_pipeline(
-    app: AppHandle,
-    prompt: Prompt,
-    typed_form: Option<String>,
-    telem_mode: PromptMode,
-    foreground: scopes::ForegroundContext,
-    pick_mode: Option<PickMode>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-    app_state: Arc<crate::state::AppState>,
-    undo: Arc<crate::undo::UndoLog>,
-    rdp_registry: Arc<crate::rdp::RdpRegistry>,
-) {
+fn run_fire_pipeline(app: AppHandle, ctx: AppContext, req: FireRequest, control: PlaybackControl) {
+    let FireRequest {
+        prompt,
+        typed_form,
+        telem_mode,
+        foreground,
+        pick_mode,
+        stop_answers,
+    } = req;
+    let app_state = ctx.state.clone();
     let _playback_guard = PlaybackEndGuard::new(app_state.clone());
-    // 1+2 done by the caller. Read the clipboard only when referenced — no
-    // reason to touch the user's clipboard on every fire.
-    let clipboard = if prompt.body.contains("CLIPBOARD") || prompt.body.contains("clipboard") {
+    let config = ctx.config.get();
+
+    // 3 — §11 focused-element pre-flight. The one check that stops a prompt
+    // landing in a password box, a Finder window, or a file dialog. Only the
+    // two confident negatives block; "unknown" proceeds (see
+    // `accessibility::FieldKind`), because a guard that blocked Electron and
+    // terminal surfaces would break the app's primary targets.
+    if config.text_field_guard {
+        let field = accessibility::focused_field();
+        if !field.kind.allows_typing() {
+            tracing::warn!(
+                target: "prompt_player::fire",
+                role = field.role.as_deref().unwrap_or("<unknown>"),
+                verdict = field.kind.reason(),
+                "refusing to type: focused element cannot accept text"
+            );
+            telemetry::send(
+                &app,
+                TelemetryEvent::TypingBlocked {
+                    reason: field.kind.reason(),
+                },
+            );
+            // On the trigger path the hook has already swallowed the commit
+            // char and popped the trigger from the ring. Put both back, the
+            // same way the no-scope-match path does — otherwise a refusal
+            // leaves the user with a silently missing `>` and a matcher whose
+            // shadow of the screen is wrong for the next attempt.
+            if let Some(form) = typed_form.as_deref() {
+                restore_suppressed_commit(&ctx, form, prompt.commit_char);
+            }
+            return;
+        }
+    }
+
+    // 4 — gather only the context this body references. Each of these costs
+    // something real (a clipboard read, an Accessibility round-trip, a
+    // filesystem walk), so an unrelated prompt must not pay for it.
+    let body_src = prompt.body.as_str();
+    let clipboard = if body_src.contains("CLIPBOARD") || body_src.contains("clipboard") {
         crate::inject::read_clipboard_text()
     } else {
         None
     };
-    // 3 — TS expressions.
+    // §6.1 `$SELECTION` — declared in the spec, never populated until now, so
+    // every prompt referencing it (including the shipped refactor example)
+    // expanded to an empty string.
+    let selection = if body_src.contains("SELECTION") || body_src.contains("selection") {
+        accessibility::selected_text()
+    } else {
+        None
+    };
+    let wants_repo = ["GIT_BRANCH", "REPO_NAME", "REPO_ROOT", "CWD", "repo."]
+        .iter()
+        .any(|needle| body_src.contains(needle));
+    let repo_ctx = if wants_repo {
+        repo::resolve(foreground.window_title.as_deref(), &config.repo_hints)
+    } else {
+        repo::RepoContext::default()
+    };
+
+    // 5 — TS expressions.
     let app_name = foreground
         .executable
         .as_deref()
@@ -285,7 +373,13 @@ fn run_fire_pipeline(
         app_name,
         window_title: foreground.window_title.clone(),
         clipboard: clipboard.clone(),
-        ..Default::default()
+        selection: selection.clone(),
+        git_branch: repo_ctx.branch.clone(),
+        repo_name: repo_ctx.name.clone(),
+        repo_root: repo_ctx.root.clone(),
+        // A remote repository does not get to run commands on this machine,
+        // whatever the config says.
+        allow_git: config.allow_git_expressions && !prompt.origin.is_remote(),
     };
     let expansion =
         crate::prompts::expressions::expand_expressions_reporting(&prompt.body, &expr_ctx);
@@ -295,15 +389,30 @@ fn run_fire_pipeline(
     }
     let body_after_expr = expansion.text;
 
-    // 4 — placeholders.
+    // 6 — placeholders.
     let ph_ctx = PlaceholderContext {
         app_bundle: foreground.bundle_id.clone(),
         app_name: expr_ctx.app_name.clone(),
         window_title: foreground.window_title.clone(),
         clipboard,
+        selection,
+        git_branch: repo_ctx.branch.clone(),
+        repo_name: repo_ctx.name.clone(),
+        repo_root: repo_ctx.root.clone(),
+        stop_answers,
         ..Default::default()
     };
     let expanded = expand(&body_after_expr, &ph_ctx);
+    if !expanded.unfilled_stops.is_empty() {
+        // Not fatal: an unanswered stop renders as its default (or empty) and
+        // the user fills it in live, which is the §6.4 "scaffold + live detail"
+        // pattern. Worth a log line so a silently-empty body has an explanation.
+        tracing::info!(
+            target: "prompt_player::fire",
+            stops = ?expanded.unfilled_stops,
+            "firing with unresolved tab stops"
+        );
+    }
 
     // 5 — filter chain.
     let filtered = filters::apply_chain(&expanded.text, &prompt.filters);
@@ -315,7 +424,7 @@ fn run_fire_pipeline(
     };
 
     // 7 — RDP detection.
-    let rdp_mode = rdp_registry.detect(&foreground);
+    let rdp_mode = ctx.rdp.detect(&foreground);
     if rdp_mode == RdpMode::HostSide {
         tracing::info!(
             "rdp host-side mode active for {:?}",
@@ -329,11 +438,16 @@ fn run_fire_pipeline(
 
     // Picker pick_mode customization.
     let mut profile = prompt.effective_profile();
+    // 9 — how a newline is delivered depends on the target surface, and
+    // getting it wrong submits the prompt at its first blank line. Per-prompt
+    // `newline-mode:` wins over the library default.
+    let newline_mode = prompt.newline_mode.unwrap_or(config.newline_mode);
     let mut opts = ScheduleOptions {
         rdp_mode: rdp_mode == RdpMode::HostSide,
         // Only meaningful after a suppressed `>`; picker selections type into
         // an already-restored app.
         include_pre_typing_pause: typed_form.is_some(),
+        newline_mode,
     };
     let mut paste_mode = false;
     if let Some(mode) = pick_mode {
@@ -351,6 +465,13 @@ fn run_fire_pipeline(
                 profile.burst_enabled = false;
             }
             PickMode::Paste => paste_mode = true,
+            PickMode::Run => {
+                // Type at human cadence, then submit. The pre-submit pause is
+                // §3.1's "single most realism-defining touch" and matters most
+                // here, because this is the mode where an Enter follows.
+                profile.send_final_enter = true;
+                profile.pre_submit_pause_enabled = true;
+            }
             _ => {}
         }
     }
@@ -358,6 +479,14 @@ fn run_fire_pipeline(
     // wrong side, so paste falls back to typing.
     if paste_mode && rdp_mode == RdpMode::HostSide {
         tracing::info!("paste demoted to typed flow under RDP host-side mode");
+        paste_mode = false;
+    }
+    // A multi-step sequence is several messages with waits between them; one
+    // clipboard blob cannot be that, so paste is demoted here too.
+    let sequence: Vec<Step> = steps::split_steps(&body);
+    let multi_step = sequence.len() > 1;
+    if paste_mode && multi_step {
+        tracing::info!("paste demoted to typed flow for a multi-step prompt");
         paste_mode = false;
     }
 
@@ -417,7 +546,7 @@ fn run_fire_pipeline(
     let completed = if paste_mode {
         // save → set → Ctrl/Cmd+V → wait → restore. The caller already
         // confirmed focus, and once V is in flight the paste is atomic.
-        if cancel.load(Ordering::Relaxed) {
+        if control.is_cancelled() {
             false
         } else {
             match paste_via_clipboard(&body) {
@@ -443,10 +572,10 @@ fn run_fire_pipeline(
                     match EnigoInjector::new() {
                         Ok(mut inj) => {
                             let _timer = crate::typer::TimerResolutionGuard::acquire();
-                            let outcome = play_guarded(
+                            let outcome = play_controlled(
                                 &fallback_schedule,
                                 &mut inj,
-                                cancel.clone(),
+                                &control,
                                 Some(&focus_lost),
                             );
                             completed_chars = outcome.visible_chars;
@@ -491,7 +620,18 @@ fn run_fire_pipeline(
         // Hold 1ms timer resolution across the whole typed run so per-key
         // sleeps don't quantize to the OS timer period (Windows-only effect).
         let _timer = crate::typer::TimerResolutionGuard::acquire();
-        let outcome = play_guarded(&scheduled, &mut inj, cancel.clone(), Some(&focus_lost));
+        let outcome = if multi_step {
+            play_sequence(
+                &sequence,
+                &profile,
+                &opts,
+                &mut inj,
+                &control,
+                Some(&focus_lost),
+            )
+        } else {
+            play_controlled(&scheduled, &mut inj, &control, Some(&focus_lost))
+        };
         completed_chars = outcome.visible_chars;
         focus_changed = outcome.focus_changed;
         drop(inj);
@@ -499,14 +639,21 @@ fn run_fire_pipeline(
     };
 
     if completed {
+        // §5.2 recents tier — a *completed* fire is a use; a cancelled one is
+        // not, so this sits inside the success branch.
+        ctx.usage.record(&prompt.id);
         let mut undo_offered = false;
         if let Some(form) = typed_form.as_deref() {
-            if profile.send_final_enter {
+            if multi_step {
+                // Every step but the last was submitted, so backspacing would
+                // delete from whatever field has focus now, not un-send them.
+                tracing::debug!("not recording undo: multi-step sequence was submitted");
+            } else if profile.send_final_enter {
                 // Backspace-undo can't un-send a submitted message, and the
                 // backspaces would hit whatever field has focus now.
                 tracing::debug!("not recording undo: prompt was submitted via final Enter");
             } else {
-                undo.record(form.to_string(), body_chars);
+                ctx.undo.record(form.to_string(), body_chars);
                 undo_offered = true;
             }
         }
@@ -544,6 +691,117 @@ fn run_fire_pipeline(
                 completed_chars_pct: pct,
             },
         );
+    }
+}
+
+/// Undo the hook's commit-char suppression when a fire doesn't happen.
+///
+/// The hook suppresses the commit char and pops the trigger from its ring the
+/// moment a trigger matches — before anything knows whether the fire will
+/// actually proceed. Every early return on the trigger path therefore has to
+/// put the character back on screen and re-observe the trigger, or the user
+/// loses a keystroke and the matcher's shadow of the screen goes stale.
+fn restore_suppressed_commit(ctx: &AppContext, typed_form: &str, commit: char) {
+    if let Ok(mut inj) = EnigoInjector::new() {
+        inj.type_char(commit);
+    }
+    let now = std::time::Instant::now();
+    for ch in typed_form.chars() {
+        ctx.matcher.observe_char(ch, now);
+    }
+    ctx.matcher.observe_char(commit, now);
+}
+
+/// Play a multi-step sequence: type each step, submit it, wait, type the next.
+///
+/// Each step gets its own freshly-sampled schedule, so the cadence model isn't
+/// reused across a two-minute gap. The wait is polled in short slices rather
+/// than slept through in one go, because the kill-switch and the pause control
+/// have to stay responsive while the sequence is parked — the whole point is
+/// that the user is watching an agent work and may want to intervene.
+fn play_sequence(
+    sequence: &[Step],
+    profile: &crate::typer::Profile,
+    base_opts: &ScheduleOptions,
+    injector: &mut dyn Injector,
+    control: &PlaybackControl,
+    focus_lost: Option<&dyn Fn() -> bool>,
+) -> crate::typer::PlayOutcome {
+    use crate::typer::PlayOutcome;
+    /// Poll slice while parked between steps.
+    const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut visible_chars = 0usize;
+    for (i, step) in sequence.iter().enumerate() {
+        let mut step_profile = *profile;
+        // A step with a follow-up must be sent, or the wait is meaningless.
+        if step.submit() {
+            step_profile.send_final_enter = true;
+        }
+        let mut opts = *base_opts;
+        // The "I'm thinking" beat belongs before the first keystroke only; a
+        // follow-up already had a wait of its own.
+        opts.include_pre_typing_pause = base_opts.include_pre_typing_pause && i == 0;
+
+        let mut rng = ChaCha8Rng::from_entropy();
+        let scheduled = schedule(&step.body, &step_profile, &opts, &mut rng);
+        let outcome = play_controlled(&scheduled, injector, control, focus_lost);
+        visible_chars += outcome.visible_chars;
+        if !outcome.completed {
+            return PlayOutcome {
+                completed: false,
+                visible_chars,
+                focus_changed: outcome.focus_changed,
+            };
+        }
+
+        let Some(wait) = step.wait_after else {
+            continue;
+        };
+        tracing::info!(
+            target: "prompt_player::fire",
+            step = i + 1,
+            of = sequence.len(),
+            wait_ms = wait.as_millis() as u64,
+            "step sent; waiting before the follow-up"
+        );
+        let mut deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            if control.is_cancelled() {
+                injector.release_all_modifiers();
+                return PlayOutcome {
+                    completed: false,
+                    visible_chars,
+                    focus_changed: false,
+                };
+            }
+            if let Some(check) = focus_lost {
+                if check() {
+                    // The user moved to another app mid-wait. Typing the
+                    // follow-up there would be exactly the accident the
+                    // focus guard exists to prevent.
+                    injector.release_all_modifiers();
+                    return PlayOutcome {
+                        completed: false,
+                        visible_chars,
+                        focus_changed: true,
+                    };
+                }
+            }
+            // Pausing means "hold everything", so a pause pushes the deadline
+            // out instead of quietly consuming the wait the author asked for.
+            if control.is_paused() {
+                std::thread::sleep(WAIT_SLICE);
+                deadline += WAIT_SLICE;
+                continue;
+            }
+            std::thread::sleep(WAIT_SLICE.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+    PlayOutcome {
+        completed: true,
+        visible_chars,
+        focus_changed: false,
     }
 }
 
@@ -705,5 +963,150 @@ mod tests {
     fn exe_match_is_exact_not_substring() {
         // `notchrome.exe` must not pass just because it ends in chrome.exe.
         assert_eq!(kind("", "C:\\tools\\notchrome.exe"), TargetAppKind::Native);
+    }
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+    use crate::typer::{Profile, RecordingInjector};
+    use std::sync::atomic::Ordering;
+
+    /// A profile fast enough to keep the sequence tests near-instant, with the
+    /// realism dials that would otherwise add seconds turned off.
+    fn quick_profile() -> Profile {
+        Profile {
+            iki_scale: 0.0,
+            iki_min_ms: 0.0,
+            pause_scale: 0.0,
+            pause_variance_scale: 0.0,
+            typos_enabled: false,
+            burst_enabled: false,
+            rephrase_enabled: false,
+            pre_submit_pause_enabled: false,
+            ..Profile::FAST_PRESENTER
+        }
+    }
+
+    fn no_pause_opts() -> ScheduleOptions {
+        ScheduleOptions {
+            rdp_mode: false,
+            include_pre_typing_pause: false,
+            newline_mode: Default::default(),
+        }
+    }
+
+    /// Reconstruct the typed text from a recording injector.
+    fn typed(inj: &RecordingInjector) -> String {
+        inj.events
+            .iter()
+            .filter_map(|k| match k {
+                Key::Char(c) => Some(*c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sequence_types_every_step_and_submits_all_but_the_last() {
+        let sequence = steps::split_steps("first\n<!-- pp:wait 10ms -->\nsecond");
+        assert_eq!(sequence.len(), 2);
+        let mut inj = RecordingInjector::default();
+        let control = PlaybackControl::new();
+        let outcome = play_sequence(
+            &sequence,
+            &quick_profile(),
+            &no_pause_opts(),
+            &mut inj,
+            &control,
+            None,
+        );
+        assert!(outcome.completed);
+        assert_eq!(typed(&inj), "firstsecond");
+        // Exactly one submitting Enter: after step one, not after step two.
+        let enters = inj
+            .events
+            .iter()
+            .filter(|k| matches!(k, Key::Enter))
+            .count();
+        assert_eq!(enters, 1, "events: {:?}", inj.events);
+    }
+
+    #[test]
+    fn cancelling_during_the_wait_stops_before_the_follow_up() {
+        // The kill-switch has to reach a sequence that is parked between
+        // steps, or a cancelled demo would still type its follow-up.
+        let sequence = steps::split_steps("first\n<!-- pp:wait 30s -->\nsecond");
+        let mut inj = RecordingInjector::default();
+        let control = PlaybackControl::new();
+        let canceller = control.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            canceller.cancel();
+        });
+        let started = Instant::now();
+        let outcome = play_sequence(
+            &sequence,
+            &quick_profile(),
+            &no_pause_opts(),
+            &mut inj,
+            &control,
+            None,
+        );
+        assert!(!outcome.completed);
+        assert_eq!(typed(&inj), "first", "the follow-up must not be typed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancel should not wait out the full 30s: {:?}",
+            started.elapsed()
+        );
+        assert!(inj.modifier_releases > 0, "modifiers released on abort");
+    }
+
+    #[test]
+    fn losing_focus_during_the_wait_abandons_the_follow_up() {
+        let sequence = steps::split_steps("first\n<!-- pp:wait 30s -->\nsecond");
+        let mut inj = RecordingInjector::default();
+        let control = PlaybackControl::new();
+        // Focus is reported lost only once the first step is on screen, so the
+        // abort happens during the wait rather than before any typing.
+        let moved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = moved.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let lost = || moved.load(Ordering::Relaxed);
+        let outcome = play_sequence(
+            &sequence,
+            &quick_profile(),
+            &no_pause_opts(),
+            &mut inj,
+            &control,
+            Some(&lost),
+        );
+        assert!(!outcome.completed);
+        assert!(outcome.focus_changed, "the reason must be reported");
+        assert_eq!(typed(&inj), "first");
+    }
+
+    #[test]
+    fn a_single_step_sequence_is_not_force_submitted() {
+        let sequence = steps::split_steps("just one");
+        let mut inj = RecordingInjector::default();
+        let outcome = play_sequence(
+            &sequence,
+            &quick_profile(),
+            &no_pause_opts(),
+            &mut inj,
+            &PlaybackControl::new(),
+            None,
+        );
+        assert!(outcome.completed);
+        assert_eq!(typed(&inj), "just one");
+        assert!(
+            !inj.events.iter().any(|k| matches!(k, Key::Enter)),
+            "a lone step follows the picker mode, so no implicit Enter"
+        );
     }
 }

@@ -28,6 +28,9 @@ const ID_QUIT: u32 = 104;
 const ID_KEEP_AWAKE: u32 = 105;
 const ID_DIAGNOSTICS: u32 = 106;
 const ID_HOOK_WARNING: u32 = 107;
+const ID_NEXT_CUE: u32 = 108;
+const ID_PAUSE_PLAYBACK: u32 = 109;
+const ID_RESET_SETLIST: u32 = 110;
 const ID_PINNED_BASE: u32 = 1000;
 
 /// Cached helper HWND as an isize: `HWND` isn't `Send`, the raw pointer is,
@@ -116,6 +119,9 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
     };
     let armed = ctx.state.is_armed();
     let keep_awake = ctx.power.is_enabled();
+    let playing = ctx.state.is_playing();
+    let paused = ctx.state.playback_control().is_paused();
+    let setlist_len = ctx.config.get().setlist.len();
     let prompts = ctx.prompts.snapshot();
     let pinned: Vec<&crate::prompts::Prompt> = prompts.iter().filter(|p| p.pinned).collect();
 
@@ -150,7 +156,48 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
         PCWSTR(toggle_label.as_ptr()),
     );
 
-    // 2. Pinned prompts (if any).
+    // 2. Transport: pause the run in flight, and fire the next setlist cue.
+    // Both are only meaningful in context, so neither is shown otherwise —
+    // a permanently-greyed row is noise in a menu this small.
+    if playing || setlist_len > 0 {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    }
+    if playing {
+        let label = wstr(if paused {
+            "Resume Typing\tCtrl+Shift+,"
+        } else {
+            "Pause Typing\tCtrl+Shift+,"
+        });
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            ID_PAUSE_PLAYBACK as usize,
+            PCWSTR(label.as_ptr()),
+        );
+    }
+    if setlist_len > 0 {
+        let cursor = ctx.state.setlist_cursor() % setlist_len;
+        let label = wstr(&format!(
+            "Next Cue ({} of {})\tCtrl+Shift+.",
+            cursor + 1,
+            setlist_len
+        ));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            ID_NEXT_CUE as usize,
+            PCWSTR(label.as_ptr()),
+        );
+        let reset = wstr("Rewind Setlist");
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            ID_RESET_SETLIST as usize,
+            PCWSTR(reset.as_ptr()),
+        );
+    }
+
+    // 3. Pinned prompts (if any).
     let mut pinned_ids: Vec<String> = Vec::with_capacity(pinned.len());
     if !pinned.is_empty() {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -164,7 +211,7 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
         }
     }
 
-    // 3. App actions.
+    // 4. App actions.
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let lib = wstr("Prompt Library");
     let _ = AppendMenuW(
@@ -191,7 +238,7 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
     };
     let _ = AppendMenuW(menu, ka_flags, ID_KEEP_AWAKE as usize, PCWSTR(ka.as_ptr()));
 
-    // 4. Diagnostics + About + Quit.
+    // 5. Diagnostics + About + Quit.
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let diag = wstr("Diagnostics…");
     let _ = AppendMenuW(
@@ -300,6 +347,45 @@ fn dispatch(app: &AppHandle, cmd_id: u32, pinned_ids: &[String]) {
                         duration_mins: if enabled { mins } else { 0 },
                     },
                 );
+            }
+        }
+        ID_PAUSE_PLAYBACK => {
+            if let Some(ctx) = app.try_state::<AppContext>() {
+                match ctx.state.toggle_pause() {
+                    Some(true) => tracing::info!("playback PAUSED from tray"),
+                    Some(false) => tracing::info!("playback RESUMED from tray"),
+                    None => {}
+                }
+            }
+        }
+        ID_NEXT_CUE => {
+            if let Some(ctx) = app.try_state::<AppContext>() {
+                // Same focus caveat as the pinned-prompt path: the hidden
+                // helper window holds the foreground after TrackPopupMenuEx,
+                // so restore the app captured in `run_menu` before typing.
+                let ctx_owned = ctx.inner().clone();
+                let app_owned = app.clone();
+                std::thread::Builder::new()
+                    .name("prompt-player-tray-cue".into())
+                    .spawn(move || {
+                        if !ctx_owned
+                            .focus
+                            .restore_and_wait(crate::picker::RESTORATION_TIMEOUT)
+                        {
+                            std::thread::sleep(crate::picker::RESTORATION_DELAY);
+                        }
+                        match crate::commands::config::fire_next_cue_inner(&app_owned, &ctx_owned) {
+                            Ok(Some(id)) => tracing::info!("tray fired setlist cue → {}", id),
+                            Ok(None) => tracing::info!("tray next-cue: setlist is empty"),
+                            Err(e) => tracing::warn!("tray next-cue failed: {}", e),
+                        }
+                    })
+                    .expect("spawn tray-cue thread");
+            }
+        }
+        ID_RESET_SETLIST => {
+            if let Some(ctx) = app.try_state::<AppContext>() {
+                ctx.state.set_setlist_cursor(0);
             }
         }
         id if id >= ID_PINNED_BASE => {

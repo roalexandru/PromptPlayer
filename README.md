@@ -11,6 +11,33 @@ See [`prompt-player-spec.md`](./prompt-player-spec.md) for the full v0.3 specifi
 
 Active build, following the 14-phase plan in `prompt-player-spec.md` §16.
 
+Beyond the stealth-trigger core it now works as a **coding-agent companion**:
+
+- **Import what you already wrote.** Pull in `.claude/commands`, Claude Code
+  skills, Cursor rules, and Continue/Copilot prompt files from any project.
+- **Type & send.** `Cmd/Ctrl+Enter` in the palette types the prompt and submits
+  it. Line breaks adapt to the target, because terminals treat Shift+Enter as a
+  plain Enter and would submit an agent prompt at its first blank line.
+- **Repo context.** `$GIT_BRANCH`, `$REPO_NAME` and `$CWD` resolve from the
+  checkout you are demoing from, with no `git` subprocess.
+- **Setlist.** An ordered list of cues and one hotkey that fires the next one,
+  for when recall fails on stage.
+- **Pause, resume, re-speed** a playback mid-prompt without losing the rest.
+- **Shared sources.** Point at a public GitHub repo of `.pp.md` files; they
+  load read-only and stay disabled until you enable them.
+- **Recents.** The palette's default order is frecency, not filesystem order.
+- **Multi-step turns.** Put `<!-- pp:wait 25s -->` in a prompt and it becomes a
+  sequence: the first message is typed and sent, then the follow-up goes in
+  after the pause. The kill-switch reaches it while it waits.
+- **Safety.** Refuses to type into password and non-text fields, flashes the
+  tray icon red when the kill-switch fires, and can auto-disable itself after a
+  configurable idle period.
+- **Rebindable.** Every global hotkey can be changed in `promptplayer.yaml` and
+  takes effect without a restart.
+
+Cross-cutting settings live in `promptplayer.yaml` next to your prompts
+(`§7.2`); the library window's **Companion** tab edits that same file.
+
 ## Quick start (dev)
 
 ```bash

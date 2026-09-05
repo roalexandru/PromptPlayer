@@ -1,5 +1,6 @@
 //! §10.1 — global app state: armed/disarmed, current playback, panic-stroke ring.
 
+use crate::typer::PlaybackControl;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,9 +17,10 @@ pub struct AppState {
     armed: AtomicBool,
     /// True while a playback (typer thread) is active.
     playing: AtomicBool,
-    /// Cancel flag for the current playback (§2.6, §2.7). Minted fresh each
-    /// `begin_playback`, so a stale press can't bleed into the next one.
-    cancel_flag: Mutex<Arc<AtomicBool>>,
+    /// Controls for the current playback: cancel (§2.6, §2.7) plus pause and
+    /// speed (§3.5). Minted fresh each `begin_playback`, so a stale press —
+    /// or a latched pause — can't bleed into the next one.
+    playback: Mutex<PlaybackControl>,
     /// Last `PANIC_KEY_COUNT` keystroke times during playback. All slots full
     /// within `PANIC_WINDOW` means the user panic-aborted (§2.6).
     cancel_strokes: Mutex<[Option<Instant>; PANIC_KEY_COUNT]>,
@@ -27,6 +29,11 @@ pub struct AppState {
     cancel_reason: Mutex<Option<crate::telemetry::CancelReason>>,
     /// Configurable global commit char (default `>`, §2.3).
     commit_char: Mutex<char>,
+    /// When the app was last armed. Drives the §11 auto-disarm timer; `None`
+    /// whenever disarmed.
+    armed_since: Mutex<Option<Instant>>,
+    /// Cursor into the configured setlist — index of the *next* cue to fire.
+    setlist_cursor: Mutex<usize>,
     /// The hook is installed and dispatching. False when the macOS tap fails;
     /// the tray surfaces that and a poller respawns once permission lands.
     hook_alive: AtomicBool,
@@ -51,10 +58,12 @@ impl AppState {
         Self {
             armed: AtomicBool::new(armed),
             playing: AtomicBool::new(false),
-            cancel_flag: Mutex::new(Arc::new(AtomicBool::new(false))),
+            playback: Mutex::new(PlaybackControl::new()),
             cancel_strokes: Mutex::new([None; PANIC_KEY_COUNT]),
             cancel_reason: Mutex::new(None),
             commit_char: Mutex::new('>'),
+            armed_since: Mutex::new(None),
+            setlist_cursor: Mutex::new(0),
             hook_alive: AtomicBool::new(false),
         }
     }
@@ -81,6 +90,35 @@ impl AppState {
 
     pub fn set_armed(&self, armed: bool) {
         self.armed.store(armed, Ordering::Relaxed);
+        // Restart the auto-disarm clock on every transition into armed, and
+        // clear it on the way out so a disarmed app is never "overdue".
+        *self.armed_since.lock() = armed.then(Instant::now);
+    }
+
+    /// How long the app has been armed, or `None` when disarmed.
+    pub fn armed_for(&self) -> Option<Duration> {
+        self.armed_since.lock().map(|t| t.elapsed())
+    }
+
+    /// Index of the next setlist cue to fire.
+    pub fn setlist_cursor(&self) -> usize {
+        *self.setlist_cursor.lock()
+    }
+
+    pub fn set_setlist_cursor(&self, index: usize) {
+        *self.setlist_cursor.lock() = index;
+    }
+
+    /// Advance the setlist cursor, wrapping at `len`. Returns the index that
+    /// should fire now (i.e. the pre-advance value). `None` for an empty list.
+    pub fn take_next_cue(&self, len: usize) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let mut cur = self.setlist_cursor.lock();
+        let index = *cur % len;
+        *cur = (index + 1) % len;
+        Some(index)
     }
 
     pub fn toggle_armed(&self) -> bool {
@@ -93,9 +131,9 @@ impl AppState {
         self.playing.load(Ordering::Relaxed)
     }
 
-    /// Start a playback and return its cancel flag, or `None` if one is already
+    /// Start a playback and return its controls, or `None` if one is already
     /// running. On `None` the caller must NOT call `end_playback`.
-    pub fn begin_playback(&self) -> Option<Arc<AtomicBool>> {
+    pub fn begin_playback(&self) -> Option<PlaybackControl> {
         if self
             .playing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -103,19 +141,50 @@ impl AppState {
         {
             return None;
         }
-        let flag = Arc::new(AtomicBool::new(false));
-        *self.cancel_flag.lock() = flag.clone();
+        // A fresh control (not a reset of the old one): pause state and speed
+        // must not carry over from the previous prompt either.
+        let control = PlaybackControl::new();
+        *self.playback.lock() = control.clone();
         *self.cancel_strokes.lock() = [None; PANIC_KEY_COUNT];
         *self.cancel_reason.lock() = None;
-        Some(flag)
+        Some(control)
+    }
+
+    /// Handle for the playback in flight. Hotkey handlers use this to pause or
+    /// re-speed the run without going through the fire pipeline.
+    pub fn playback_control(&self) -> PlaybackControl {
+        self.playback.lock().clone()
+    }
+
+    /// §3.5 — pause / resume the running playback. Returns the new paused
+    /// state, or `None` when nothing is playing.
+    pub fn toggle_pause(&self) -> Option<bool> {
+        if !self.is_playing() {
+            return None;
+        }
+        Some(self.playback.lock().toggle_paused())
+    }
+
+    /// Multiply the running playback's speed. Returns the new multiplier, or
+    /// `None` when nothing is playing.
+    pub fn nudge_speed(&self, factor: f64) -> Option<f64> {
+        if !self.is_playing() {
+            return None;
+        }
+        Some(self.playback.lock().nudge_speed(factor))
     }
 
     pub fn end_playback(&self) {
         self.playing.store(false, Ordering::Release);
         *self.cancel_strokes.lock() = [None; PANIC_KEY_COUNT];
+        // Leave no pause latched: the next fire must start moving immediately.
+        self.playback.lock().reset();
     }
 
     /// §2.7 kill-switch: trip the cancel flag, recording why.
+    ///
+    /// Clears any pause first: a paused typer is parked in a poll loop, so it
+    /// has to be let go before it can observe the cancel.
     pub fn cancel_playback_with(&self, reason: crate::telemetry::CancelReason) {
         // First reason wins — the panic ring can trip while we're already
         // tearing down from an Esc, and the initiating cause is the useful one.
@@ -124,7 +193,9 @@ impl AppState {
             *slot = Some(reason);
         }
         drop(slot);
-        self.cancel_flag.lock().store(true, Ordering::Relaxed);
+        let control = self.playback.lock().clone();
+        control.set_paused(false);
+        control.cancel();
     }
 
     /// §2.7 kill-switch with the default "user typed over it" attribution.
@@ -186,7 +257,7 @@ mod tests {
         assert!(!s.is_playing());
         let cancel = s.begin_playback().expect("first playback starts");
         assert!(s.is_playing());
-        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(!cancel.is_cancelled());
         s.end_playback();
         assert!(!s.is_playing());
     }
@@ -207,12 +278,12 @@ mod tests {
         let s = AppState::new();
         let cancel = s.begin_playback().expect("playback starts");
         s.cancel_playback();
-        assert!(cancel.load(Ordering::Relaxed));
+        assert!(cancel.is_cancelled());
         s.end_playback();
         // The next playback gets a FRESH flag (not the cancelled one), so a
         // stale kill-switch press can't bleed into the new session.
         let next = s.begin_playback().expect("playback restarts");
-        assert!(!next.load(Ordering::Relaxed));
+        assert!(!next.is_cancelled());
     }
 
     #[test]
@@ -249,6 +320,118 @@ mod tests {
         let _c2 = s.begin_playback().expect("playback restarts");
         // Ring is fresh after the new begin; first key should not trigger.
         assert!(!s.record_cancel_keystroke(t0 + Duration::from_millis(60)));
+    }
+
+    #[test]
+    fn armed_for_tracks_the_arm_transition() {
+        let s = AppState::new();
+        assert!(s.armed_for().is_none(), "disarmed has no clock");
+        s.set_armed(true);
+        assert!(s.armed_for().is_some());
+        s.set_armed(false);
+        assert!(
+            s.armed_for().is_none(),
+            "disarming must clear the clock, or auto-disarm would fire instantly on re-arm"
+        );
+    }
+
+    #[test]
+    fn re_arming_restarts_the_auto_disarm_clock() {
+        let s = AppState::new();
+        s.set_armed(true);
+        std::thread::sleep(Duration::from_millis(20));
+        let first = s.armed_for().unwrap();
+        s.set_armed(false);
+        s.set_armed(true);
+        let second = s.armed_for().unwrap();
+        assert!(
+            second < first,
+            "{second:?} should be fresher than {first:?}"
+        );
+    }
+
+    #[test]
+    fn take_next_cue_advances_and_wraps() {
+        let s = AppState::new();
+        assert_eq!(s.take_next_cue(3), Some(0));
+        assert_eq!(s.take_next_cue(3), Some(1));
+        assert_eq!(s.take_next_cue(3), Some(2));
+        assert_eq!(s.take_next_cue(3), Some(0), "wraps back to the top");
+    }
+
+    #[test]
+    fn take_next_cue_on_an_empty_setlist_is_none() {
+        let s = AppState::new();
+        assert_eq!(s.take_next_cue(0), None);
+    }
+
+    #[test]
+    fn take_next_cue_handles_a_shrunken_setlist() {
+        // The cursor persists across edits; a list that got shorter must not
+        // index out of bounds.
+        let s = AppState::new();
+        s.set_setlist_cursor(7);
+        assert_eq!(s.take_next_cue(2), Some(1), "7 % 2");
+        assert_eq!(s.setlist_cursor(), 0);
+    }
+
+    #[test]
+    fn pause_and_speed_are_no_ops_when_nothing_is_playing() {
+        let s = AppState::new();
+        assert!(s.toggle_pause().is_none());
+        assert!(s.nudge_speed(2.0).is_none());
+    }
+
+    #[test]
+    fn pause_toggles_the_live_playback() {
+        let s = AppState::new();
+        let control = s.begin_playback().unwrap();
+        assert!(!control.is_paused());
+        assert_eq!(s.toggle_pause(), Some(true));
+        assert!(control.is_paused(), "the typer thread sees the flag");
+        assert_eq!(s.toggle_pause(), Some(false));
+        assert!(!control.is_paused());
+    }
+
+    #[test]
+    fn speed_nudges_are_clamped() {
+        let s = AppState::new();
+        let _c = s.begin_playback().unwrap();
+        for _ in 0..20 {
+            s.nudge_speed(2.0);
+        }
+        assert_eq!(s.nudge_speed(1.0), Some(4.0), "clamped at the top");
+        for _ in 0..40 {
+            s.nudge_speed(0.5);
+        }
+        assert_eq!(s.nudge_speed(1.0), Some(0.25), "clamped at the bottom");
+    }
+
+    #[test]
+    fn cancel_clears_a_pause_so_the_parked_typer_can_observe_it() {
+        // A paused typer sits in a poll loop; if cancel left the pause latched
+        // the kill switch would never take effect.
+        let s = AppState::new();
+        let control = s.begin_playback().unwrap();
+        s.toggle_pause();
+        assert!(control.is_paused());
+        s.cancel_playback();
+        assert!(!control.is_paused());
+        assert!(control.is_cancelled());
+    }
+
+    #[test]
+    fn end_playback_leaves_no_pause_or_speed_latched() {
+        let s = AppState::new();
+        let first = s.begin_playback().unwrap();
+        s.toggle_pause();
+        s.nudge_speed(2.0);
+        s.end_playback();
+        let next = s.begin_playback().unwrap();
+        assert!(!next.is_paused(), "a fresh fire must start moving");
+        assert_eq!(next.speed(), 1.0);
+        // And the old handle is genuinely a different one.
+        assert!(!first.is_paused());
     }
 
     #[test]

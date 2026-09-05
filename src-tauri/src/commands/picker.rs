@@ -2,9 +2,12 @@
 
 use crate::app::context::AppContext;
 use crate::app::fire::{FireService, PickMode};
-use crate::error::IpcResult;
+use crate::error::{into_ipc, AppError, IpcResult};
 use crate::picker::{SearchHit, RESTORATION_DELAY, RESTORATION_TIMEOUT};
+use crate::prompts::placeholders::{scan_stops, PromptStop};
 use crate::telemetry::{self, PickerSource, TelemetryEvent};
+use crate::usage::RECENTS_LIMIT;
+use std::collections::HashMap;
 use tauri::{AppHandle, Manager};
 
 #[tauri::command]
@@ -41,10 +44,9 @@ pub fn summon_picker(
     ctx.search
         .lock()
         .rebuild_if_stale(ctx.prompts.generation(), &ctx.prompts.read());
-    #[cfg(target_os = "macos")]
-    crate::platform::macos::position_picker_on_cursor_screen(app);
-    #[cfg(target_os = "windows")]
-    crate::platform::windows::position_picker_on_cursor_screen(app);
+    // Placement honours `picker-display:` — on an extended desktop the default
+    // keeps the picker off the projector (see `picker::window::position_picker`).
+    crate::picker::window::position_picker(app, ctx.config.get().picker_display);
     show_picker_window(app);
     telemetry::send(app, TelemetryEvent::PickerOpened { source });
 }
@@ -59,9 +61,35 @@ pub fn picker_search(
     let limit = limit.unwrap_or(50) as usize;
     // Length only, never content — reported once the search ends.
     ctx.picker_search.note(q.chars().count());
-    let mut idx = ctx.search.lock();
-    idx.rebuild_if_stale(ctx.prompts.generation(), &ctx.prompts.read());
-    idx.query(&q, limit)
+    let mut hits = {
+        let mut idx = ctx.search.lock();
+        idx.rebuild_if_stale(ctx.prompts.generation(), &ctx.prompts.read());
+        idx.query(&q, limit)
+    };
+    // With no query there is no relevance signal, so fall back to frecency
+    // (§5.2's recents tier). A typed query already ranks by match score and
+    // must not be re-sorted underneath the user.
+    if q.trim().is_empty() {
+        crate::picker::search::promote_recents(&mut hits, &ctx.usage.top(RECENTS_LIMIT));
+    }
+    hits
+}
+
+/// Tab stops and choices in a prompt body, for the picker's inline resolver.
+///
+/// §6.4 rules out a modal popup mid-expansion and says choices resolve "via
+/// the picker UI itself before the picker dismisses". This is what the picker
+/// asks for to render that; an empty result means "nothing to ask, fire it".
+#[tauri::command]
+#[specta::specta]
+pub fn prompt_stops(
+    prompt_id: String,
+    ctx: tauri::State<'_, AppContext>,
+) -> IpcResult<Vec<PromptStop>> {
+    match ctx.prompts.find(&prompt_id) {
+        Some(p) => into_ipc(Ok(scan_stops(&p.body))),
+        None => into_ipc(Err(AppError::PromptNotFound(prompt_id))),
+    }
 }
 
 #[tauri::command]
@@ -70,6 +98,8 @@ pub fn picker_select(
     app: AppHandle,
     prompt_id: String,
     mode: String,
+    // Answers for the prompt's tab stops / choices, keyed by stop index.
+    answers: Option<HashMap<String, String>>,
     ctx: tauri::State<'_, AppContext>,
 ) -> IpcResult<()> {
     if let Some(w) = app.get_webview_window("picker") {
@@ -94,7 +124,7 @@ pub fn picker_select(
                 std::thread::sleep(RESTORATION_DELAY);
             }
             let fire = FireService::new(ctx_owned, app_owned);
-            fire.fire_from_picker(&prompt_id, mode);
+            fire.fire_from_picker_with(&prompt_id, mode, answers.unwrap_or_default());
         })
         .expect("spawn picker-select thread");
     Ok(())
@@ -139,9 +169,12 @@ fn show_picker_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("picker") {
         #[cfg(target_os = "macos")]
         crate::platform::macos::activate_app();
-        // Re-assert capture exclusion on every show. One idempotent syscall,
-        // run before `show()` so the first frame is already excluded.
-        #[cfg(target_os = "windows")]
+        // Re-assert capture exclusion on every show, on BOTH platforms.
+        // `prepare_picker` lost its only caller in the 1d33436 refactor, which
+        // left §5.4's default-on stealth guarantee unimplemented everywhere;
+        // the Windows path was restored first and macOS
+        // (`NSWindow.sharingType = .none`) was still dormant. One idempotent
+        // syscall, run before `show()` so the first frame is already excluded.
         if let Err(e) = crate::picker::window::apply_screen_capture_exclusion(&w, true) {
             tracing::warn!("picker capture-exclusion failed: {e}");
         }

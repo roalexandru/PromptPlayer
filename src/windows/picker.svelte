@@ -2,7 +2,15 @@
   import { onMount, onDestroy, tick } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { ipc, fmtErr, type Prompt, type SearchHit } from "$lib/ipc";
+  import {
+    ipc,
+    fmtErr,
+    isRemote,
+    type Prompt,
+    type SearchHit,
+    type PromptStop,
+    type PickMode,
+  } from "$lib/ipc";
   import { IS_MAC } from "$lib/platform";
 
   let q = $state("");
@@ -14,6 +22,17 @@
   // One-line delivery failure surfaced near the footer; the palette stays
   // open so the user can retry or pick a different prompt.
   let pickError = $state<string | null>(null);
+
+  // §6.4 — choices resolve here, in the palette, before it dismisses. A modal
+  // popup mid-expansion is a flow-killer, so when the selected prompt has tab
+  // stops we swap the list for a compact inline form instead of firing with
+  // the first option silently chosen.
+  let stopPrompt = $state<Prompt | null>(null);
+  let stops = $state<PromptStop[]>([]);
+  let answers = $state<Record<string, string>>({});
+  let stopMode = $state<PickMode>("paste");
+  let stopIndex = $state(0);
+  const resolving = $derived(stopPrompt !== null);
 
   async function loadPrompts() {
     const all = await ipc.listPrompts();
@@ -32,17 +51,74 @@
     pickError = null;
   }
 
-  async function pick(mode: "human" | "fast" | "paste") {
+  async function pick(mode: PickMode) {
     const hit = hits[selected];
     if (!hit) return;
     pickError = null;
+    const prompt = prompts.get(hit.prompt_id);
     try {
-      await ipc.pickerSelect(hit.prompt_id, mode);
+      // Ask about tab stops / choices first, if the body has any.
+      const found = await ipc.promptStops(hit.prompt_id);
+      if (found.length > 0 && prompt) {
+        stopPrompt = prompt;
+        stops = found;
+        stopMode = mode;
+        stopIndex = 0;
+        answers = Object.fromEntries(
+          found.map((s) => [s.key, s.options[0] ?? s.default ?? ""]),
+        );
+        return;
+      }
     } catch (e) {
-      // Keep the palette open — silent unhandled rejection mid-demo is the
+      // A stop-scan failure must not block delivery — fall through and fire
+      // with no answers, which is the pre-resolver behaviour.
+      console.warn("stop scan failed", e);
+    }
+    await deliver(hit.prompt_id, mode);
+  }
+
+  async function deliver(
+    promptId: string,
+    mode: PickMode,
+    withAnswers?: Record<string, string>,
+  ) {
+    try {
+      await ipc.pickerSelect(promptId, mode, withAnswers);
+      cancelResolve();
+    } catch (e) {
+      // Keep the palette open — a silent unhandled rejection mid-demo is the
       // worst outcome. The user can retry or Esc out.
       pickError = `Couldn't deliver — ${fmtErr(e)}`;
     }
+  }
+
+  function cancelResolve() {
+    stopPrompt = null;
+    stops = [];
+    answers = {};
+    stopIndex = 0;
+  }
+
+  async function confirmStops() {
+    if (!stopPrompt) return;
+    await deliver(stopPrompt.id, stopMode, answers);
+  }
+
+  /** Cycle a choice stop's selection by `delta` (arrow keys in the resolver). */
+  function cycleChoice(stop: PromptStop, delta: number) {
+    if (stop.options.length === 0) return;
+    const current = stop.options.indexOf(answers[stop.key] ?? "");
+    const next =
+      (current + delta + stop.options.length) % stop.options.length;
+    answers = { ...answers, [stop.key]: stop.options[next] };
+  }
+
+  /** Human label for a delivery mode, used by the resolver's confirm button. */
+  function modeLabel(m: PickMode): string {
+    if (m === "fast") return "Type fast";
+    if (m === "human") return "Type";
+    if (m === "run") return "Type & send";
+    return "Paste";
   }
 
   async function dismiss() {
@@ -125,6 +201,12 @@
       e.preventDefault();
       // Two-step Esc: first press clears the search if non-empty, second
       // press closes the palette. Mirrors Spotlight / Raycast behavior.
+      if (resolving) {
+        // Back to the list, not out of the palette — the user is mid-choice.
+        cancelResolve();
+        focusInput();
+        return;
+      }
       if (q.length > 0) {
         q = "";
         selected = 0;
@@ -137,6 +219,10 @@
     }
     if (e.key === "ArrowDown") {
       e.preventDefault();
+      if (resolving) {
+        stopIndex = Math.min(stopIndex + 1, Math.max(0, stops.length - 1));
+        return;
+      }
       // Clamp both ends — on an empty list `min(…, length - 1)` is -1.
       selected = Math.max(0, Math.min(selected + 1, hits.length - 1));
       ensureSelectedVisible();
@@ -144,8 +230,20 @@
     }
     if (e.key === "ArrowUp") {
       e.preventDefault();
+      if (resolving) {
+        stopIndex = Math.max(0, stopIndex - 1);
+        return;
+      }
       selected = Math.max(0, Math.min(selected - 1, hits.length - 1));
       ensureSelectedVisible();
+      return;
+    }
+    if (resolving && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+      const stop = stops[stopIndex];
+      if (stop && stop.options.length > 0) {
+        e.preventDefault();
+        cycleChoice(stop, e.key === "ArrowRight" ? 1 : -1);
+      }
       return;
     }
     if (e.key === "Enter") {
@@ -153,7 +251,17 @@
       // Stop propagation so nothing else — including Win32's form-submit
       // Enter — can race our modifier read and override the mode.
       e.stopPropagation();
-      if (e.shiftKey) pick("fast");
+      if (resolving) {
+        confirmStops();
+        return;
+      }
+      // §5.3: the primary modifier means "type it and submit" — the mode the
+      // spec listed and the picker never had. It is also what makes this
+      // useful against a coding agent, where "typed but not sent" is half a
+      // turn.
+      const primary = IS_MAC ? e.metaKey : e.ctrlKey;
+      if (primary) pick("run");
+      else if (e.shiftKey) pick("fast");
       else if (e.altKey) pick("human");
       else pick("paste");
       return;
@@ -262,6 +370,52 @@
     {/if}
   </div>
 
+  {#if resolving && stopPrompt}
+    <div class="resolver">
+      <div class="resolver-head">
+        <span class="resolver-title">{stopPrompt.name}</span>
+        <span class="resolver-hint">
+          {stops.length === 1 ? "1 value" : `${stops.length} values`} to fill
+        </span>
+      </div>
+      {#each stops as stop, i (stop.key)}
+        <div class="stop" class:current={i === stopIndex}>
+          <span class="stop-key">${stop.key}</span>
+          {#if stop.options.length > 0}
+            <div class="stop-options" role="radiogroup" aria-label={`Choice ${stop.key}`}>
+              {#each stop.options as opt (opt)}
+                <button
+                  type="button"
+                  class="chip"
+                  class:sel={answers[stop.key] === opt}
+                  aria-pressed={answers[stop.key] === opt}
+                  onclick={() => { answers = { ...answers, [stop.key]: opt }; stopIndex = i; }}
+                >{opt}</button>
+              {/each}
+            </div>
+          {:else}
+            <input
+              class="stop-input"
+              value={answers[stop.key] ?? ""}
+              placeholder={stop.default ?? "value"}
+              oninput={(e) => {
+                answers = { ...answers, [stop.key]: e.currentTarget.value };
+                stopIndex = i;
+              }}
+            />
+          {/if}
+        </div>
+      {/each}
+      <div class="resolver-actions">
+        <button type="button" class="confirm" onclick={confirmStops}>
+          {modeLabel(stopMode)}
+        </button>
+        <button type="button" class="cancel" onclick={() => { cancelResolve(); focusInput(); }}>
+          Back
+        </button>
+      </div>
+    </div>
+  {:else}
   <ul class="list" bind:this={listEl}>
     {#each hits as h, i (h.prompt_id)}
       {@const p = prompts.get(h.prompt_id)}
@@ -285,6 +439,7 @@
             </span>
             <span class="row-right">
               {#if !p.enabled}<span class="badge off">off</span>{/if}
+              {#if isRemote(p)}<span class="badge remote" title="From a remote source — read-only">shared</span>{/if}
               <span class="badge profile">{profileShort(p.typing_profile ?? "sales-engineer")}</span>
               <span class="badge time">~{estimateSeconds(p)}s</span>
               {#if p.triggers.length}
@@ -301,23 +456,34 @@
       </li>
     {/if}
   </ul>
+  {/if}
 
   {#if pickError}
     <div class="pick-error" role="alert">{pickError}</div>
   {/if}
 
   <footer>
-    <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
-    <span><kbd>↵</kbd> paste</span>
-    {#if IS_MAC}
-      <span><kbd>⇧↵</kbd> fast</span>
-      <span><kbd>⌥↵</kbd> type</span>
+    {#if resolving}
+      <span><kbd>↑</kbd><kbd>↓</kbd> field</span>
+      <span><kbd>←</kbd><kbd>→</kbd> choice</span>
+      <span><kbd>↵</kbd> {modeLabel(stopMode).toLowerCase()}</span>
+      <span class="grow"></span>
+      <span><kbd>esc</kbd> back</span>
     {:else}
-      <span><kbd>Shift+↵</kbd> fast</span>
-      <span><kbd>Alt+↵</kbd> type</span>
+      <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+      <span><kbd>↵</kbd> paste</span>
+      {#if IS_MAC}
+        <span><kbd>⇧↵</kbd> fast</span>
+        <span><kbd>⌥↵</kbd> type</span>
+        <span><kbd>⌘↵</kbd> send</span>
+      {:else}
+        <span><kbd>Shift+↵</kbd> fast</span>
+        <span><kbd>Alt+↵</kbd> type</span>
+        <span><kbd>Ctrl+↵</kbd> send</span>
+      {/if}
+      <span class="grow"></span>
+      <span><kbd>esc</kbd></span>
     {/if}
-    <span class="grow"></span>
-    <span><kbd>esc</kbd></span>
   </footer>
 </div>
 
@@ -545,5 +711,98 @@
     line-height: 1.5;
     color: rgba(255, 255, 255, 0.78);
     margin-right: 3px;
+  }
+
+  /* Inline stop resolver (§6.4) — deliberately compact so it reads as part of
+     the palette rather than a dialog on top of it. */
+  .resolver {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px 12px;
+    overflow-y: auto;
+    flex: 1;
+  }
+  .resolver-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .resolver-title {
+    font-weight: 600;
+  }
+  .resolver-hint {
+    font-size: 11px;
+    opacity: 0.6;
+  }
+  .stop {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+  }
+  .stop.current {
+    border-color: rgba(255, 255, 255, 0.22);
+    background: rgba(255, 255, 255, 0.06);
+  }
+  .stop-key {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    opacity: 0.7;
+    min-width: 22px;
+  }
+  .stop-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .chip {
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: transparent;
+    color: inherit;
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .chip.sel {
+    background: rgba(255, 255, 255, 0.9);
+    color: #16161a;
+    border-color: transparent;
+  }
+  .stop-input {
+    flex: 1;
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 6px;
+    color: inherit;
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+  .resolver-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 2px;
+  }
+  .resolver-actions button {
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: transparent;
+    color: inherit;
+  }
+  .resolver-actions .confirm {
+    background: rgba(255, 255, 255, 0.9);
+    color: #16161a;
+    border-color: transparent;
+    font-weight: 600;
+  }
+  .badge.remote {
+    background: rgba(120, 170, 255, 0.22);
   }
 </style>

@@ -4,6 +4,8 @@
 //! `Clone` is cheap — all fields are `Arc` — so handlers take an owned context
 //! instead of juggling individual parameters.
 
+use crate::app::shortcuts::{GlobalHotkeys, Globals};
+use crate::config::ConfigStore;
 use crate::matcher::MatcherState;
 use crate::picker::{FocusStore, SearchIndex, SearchSession};
 use crate::power::PowerManager;
@@ -13,6 +15,7 @@ use crate::settings::SettingsStore;
 use crate::state::AppState;
 use crate::store::PromptStore;
 use crate::undo::UndoLog;
+use crate::usage::UsageStore;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +36,15 @@ pub struct AppContext {
     pub hotkeys: PromptHotkeyMap,
     /// "Keep Awake" controller — inhibits display/screensaver/idle-sleep.
     pub power: Arc<PowerManager>,
+    /// Hand-editable `promptplayer.yaml` (§7.2) — hotkeys, newline mode,
+    /// sources, setlist. Distinct from `settings` below, which is app
+    /// bookkeeping the user never edits by hand.
+    pub config: ConfigStore,
+    /// Frecency history backing the picker's recents tier.
+    pub usage: UsageStore,
+    /// The global chords currently registered. Read by the shortcut handler on
+    /// every press, so a rebind applies without a relaunch.
+    pub globals: GlobalHotkeys,
     /// Persisted preferences (armed restore, keep-awake duration, update nags).
     pub settings: Arc<SettingsStore>,
     /// Aggregated macOS Secure-Input activity, flushed on a timer.
@@ -67,6 +79,9 @@ impl AppContext {
             rdp: Arc::new(RdpRegistry::new()),
             hotkeys: Arc::new(RwLock::new(HashMap::new())),
             power: PowerManager::shared(),
+            config: ConfigStore::new(),
+            usage: UsageStore::new(),
+            globals: Arc::new(RwLock::new(Globals::default())),
             settings,
             secure_input: SecureInputTracker::shared(),
             picker_search: Arc::new(SearchSession::default()),

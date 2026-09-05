@@ -2,12 +2,14 @@
 //! `generate_handler!` aggregation lives in `app::setup`.
 
 pub mod armed;
+pub mod config;
 pub mod diagnostics;
 pub mod library;
 pub mod picker;
 pub mod power;
 pub mod prompts;
 pub mod shell;
+pub mod sources;
 pub mod tray;
 pub mod updater;
 
@@ -56,6 +58,27 @@ pub const COMMAND_NAMES: &[&str] = &[
     "import_prompt",
     "export_prompt",
     "open_external",
+    "get_config",
+    "save_config",
+    "get_setlist",
+    "set_setlist",
+    "fire_next_cue",
+    "reset_setlist",
+    "playback_status",
+    "toggle_playback_pause",
+    "nudge_playback_speed",
+    "prompt_stops",
+    "list_sources",
+    "add_source",
+    "remove_source",
+    "refresh_sources",
+    "set_remote_prompt_enabled",
+    "fork_prompt",
+    "import_agent_prompts",
+    "agent_import_candidates",
+    "capture_last_typed",
+    "source_pending_changes",
+    "apply_source_updates",
 ];
 
 #[cfg(test)]

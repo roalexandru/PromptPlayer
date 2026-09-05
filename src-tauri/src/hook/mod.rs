@@ -483,7 +483,7 @@ mod tests {
         for _ in 0..3 {
             h.send(&modifier);
         }
-        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(!cancel.is_cancelled());
     }
 
     // ---- Esc as an explicit abort -------------------------------------
@@ -496,7 +496,7 @@ mod tests {
             matches!(h.send(&esc()), HookDecision::Suppress),
             "Esc must not also reach the target app"
         );
-        assert!(cancel.load(Ordering::Relaxed), "one Esc is enough");
+        assert!(cancel.is_cancelled(), "one Esc is enough");
         assert_eq!(h.app_state.take_cancel_reason(), Some(CancelReason::Esc));
     }
 
@@ -521,7 +521,7 @@ mod tests {
         for ch in ['a', 's', 'd'] {
             h.send(&ke(ch));
         }
-        assert!(cancel.load(Ordering::Relaxed));
+        assert!(cancel.is_cancelled());
         assert_eq!(
             h.app_state.take_cancel_reason(),
             Some(CancelReason::UserKeystrokes)

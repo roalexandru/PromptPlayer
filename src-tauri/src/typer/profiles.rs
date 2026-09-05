@@ -26,6 +26,13 @@ pub struct Profile {
     pub typos_enabled: bool,
     pub pre_submit_pause_enabled: bool,
     pub send_final_enter: bool,
+    /// Self-edits: type part of a word, hesitate, delete it, retype. Modelled
+    /// separately from typos because it is a *thinking* artifact, not a motor
+    /// error — which is why the CEO profile has the most and Fast Presenter
+    /// has none.
+    pub rephrase_enabled: bool,
+    /// Probability of a false start at any given word boundary.
+    pub rephrase_rate: f64,
 }
 
 impl Default for Profile {
@@ -48,6 +55,8 @@ impl Profile {
         typos_enabled: true,
         pre_submit_pause_enabled: true,
         send_final_enter: false,
+        rephrase_enabled: true,
+        rephrase_rate: 0.012,
     };
 
     /// Fast Presenter — confident demo cadence, ~180 WPM. The lower
@@ -63,6 +72,9 @@ impl Profile {
         typos_enabled: true,
         pre_submit_pause_enabled: true,
         send_final_enter: false,
+        // A confident, time-pressed presenter does not visibly rethink.
+        rephrase_enabled: false,
+        rephrase_rate: 0.0,
     };
 
     /// Thoughtful CEO — deliberate cadence with longer reflection at sentence
@@ -78,6 +90,10 @@ impl Profile {
         typos_enabled: true,
         pre_submit_pause_enabled: true,
         send_final_enter: false,
+        // §3.3 lists this profile's pause variance as "high (more re-reads)";
+        // false starts are what "re-reads" actually look like on screen.
+        rephrase_enabled: true,
+        rephrase_rate: 0.03,
     };
 
     pub fn from_kind(kind: ProfileKind) -> Self {
@@ -114,9 +130,17 @@ impl Profile {
         if let Some(e) = overrides.send_final_enter {
             self.send_final_enter = e;
         }
+        if let Some(rate) = overrides.rephrase_rate {
+            self.rephrase_rate = rate;
+            self.rephrase_enabled = rate > 0.0;
+        }
+        if let Some(e) = overrides.rephrase_enabled {
+            self.rephrase_enabled = e;
+        }
         if overrides.iki_median_ms.is_some()
             || overrides.typo_rate.is_some()
             || overrides.pause_variance_scale.is_some()
+            || overrides.rephrase_rate.is_some()
         {
             self.kind = ProfileKind::Custom;
         }
@@ -135,6 +159,8 @@ pub struct TypingOverrides {
     pub typos_enabled: Option<bool>,
     pub pre_submit_pause_enabled: Option<bool>,
     pub send_final_enter: Option<bool>,
+    pub rephrase_enabled: Option<bool>,
+    pub rephrase_rate: Option<f64>,
 }
 
 impl TypingOverrides {
@@ -150,6 +176,11 @@ impl TypingOverrides {
             typos_enabled: self.typos_enabled,
             pre_submit_pause_enabled: self.pre_submit_pause_enabled,
             send_final_enter: self.send_final_enter,
+            rephrase_enabled: self.rephrase_enabled,
+            rephrase_rate: self
+                .rephrase_rate
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(0.0, 1.0)),
         }
     }
 }

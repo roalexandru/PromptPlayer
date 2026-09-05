@@ -387,6 +387,25 @@ impl MatcherState {
         self.buffer.read().iter().last().map(|e| e.ch)
     }
 
+    /// The most recent keystrokes as text, oldest first.
+    ///
+    /// Backs "save what I just typed" — the fastest way to turn a prompt you
+    /// improvised into a stored one, which is the whole point of a prompt
+    /// library for agent work. Entries older than `max_age` are dropped so a
+    /// capture doesn't glue this morning's residue onto what you just wrote;
+    /// the ring already only holds `RING_CAPACITY` chars.
+    pub fn recent_text(&self, max_chars: usize, max_age: Duration) -> String {
+        let buf = self.buffer.read();
+        let now = Instant::now();
+        let fresh: Vec<char> = buf
+            .iter()
+            .filter(|e| now.duration_since(e.at) <= max_age)
+            .map(|e| e.ch)
+            .collect();
+        let start = fresh.len().saturating_sub(max_chars);
+        fresh[start..].iter().collect()
+    }
+
     /// Try to match given the just-typed commit char.
     pub fn try_match(&self, commit_char: char, now: Instant) -> Option<Match> {
         let idx = self.index.read();
@@ -592,6 +611,38 @@ mod tests {
         assert_eq!(propagate_case("BUILD", "me a thing"), "ME A THING");
         assert_eq!(propagate_case("build", "me a thing"), "me a thing");
         assert_eq!(propagate_case("buIld", "me a thing"), "me a thing");
+    }
+
+    #[test]
+    fn recent_text_returns_fresh_tail_oldest_first() {
+        let st = MatcherState::default();
+        let now = Instant::now();
+        for (i, c) in "hello world".chars().enumerate() {
+            st.observe_char(c, now + Duration::from_millis(i as u64));
+        }
+        assert_eq!(st.recent_text(100, Duration::from_secs(60)), "hello world");
+        // Tail-limited, not head-limited: the newest chars are what matter.
+        assert_eq!(st.recent_text(5, Duration::from_secs(60)), "world");
+    }
+
+    #[test]
+    fn recent_text_drops_stale_keystrokes() {
+        let st = MatcherState::default();
+        // Anything older than the window is residue from a previous context.
+        let stale = Instant::now() - Duration::from_secs(120);
+        for c in "old".chars() {
+            st.observe_char(c, stale);
+        }
+        for c in "new".chars() {
+            st.observe_char(c, Instant::now());
+        }
+        assert_eq!(st.recent_text(100, Duration::from_secs(30)), "new");
+    }
+
+    #[test]
+    fn recent_text_is_empty_on_a_fresh_matcher() {
+        let st = MatcherState::default();
+        assert!(st.recent_text(100, Duration::from_secs(30)).is_empty());
     }
 
     #[test]

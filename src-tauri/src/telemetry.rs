@@ -177,6 +177,26 @@ pub enum TelemetryEvent {
         passed: bool,
         stage: SelfTestStage,
     },
+    /// A fire was refused because the focused element was a password field or
+    /// could not accept text (§11). Structural only — no window titles, no
+    /// app identity, just which of the two guards fired.
+    TypingBlocked {
+        reason: &'static str,
+    },
+    /// A remote prompt source was refreshed. `changed` distinguishes "new
+    /// commit pulled" from "already current"; the count is a plain integer,
+    /// and the repo name is deliberately absent.
+    SourceRefreshed {
+        changed: bool,
+        prompt_count: u16,
+    },
+    /// Prompts imported from an agent tool's own prompt directory
+    /// (`.claude/commands`, Cursor rules, …). `kind` is the fixed format
+    /// label, never a path.
+    AgentPromptsImported {
+        kind: &'static str,
+        count: u16,
+    },
 }
 
 /// How often [`TelemetryEvent::Heartbeat`] is emitted.
@@ -479,6 +499,9 @@ impl TelemetryEvent {
             Self::DiagnosticsOpened => "diagnostics_opened",
             Self::AccessibilityReset => "accessibility_reset",
             Self::SelfTestCompleted { .. } => "self_test_completed",
+            Self::TypingBlocked { .. } => "typing_blocked",
+            Self::SourceRefreshed { .. } => "source_refreshed",
+            Self::AgentPromptsImported { .. } => "agent_prompts_imported",
         }
     }
 
@@ -599,6 +622,17 @@ mod tests {
                 passed: true,
                 stage: SelfTestStage::Roundtrip,
             },
+            TelemetryEvent::TypingBlocked {
+                reason: "secure-field",
+            },
+            TelemetryEvent::SourceRefreshed {
+                changed: true,
+                prompt_count: 12,
+            },
+            TelemetryEvent::AgentPromptsImported {
+                kind: "claude-command",
+                count: 7,
+            },
         ]
     }
 
@@ -641,7 +675,10 @@ mod tests {
                 | TelemetryEvent::InjectionFailed { .. }
                 | TelemetryEvent::DiagnosticsOpened
                 | TelemetryEvent::AccessibilityReset
-                | TelemetryEvent::SelfTestCompleted { .. } => 1,
+                | TelemetryEvent::SelfTestCompleted { .. }
+                | TelemetryEvent::TypingBlocked { .. }
+                | TelemetryEvent::SourceRefreshed { .. }
+                | TelemetryEvent::AgentPromptsImported { .. } => 1,
             };
             assert_eq!(counted, 1);
         }

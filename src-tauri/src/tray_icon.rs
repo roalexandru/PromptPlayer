@@ -43,7 +43,7 @@ impl Attention {
 }
 
 /// Base icon bytes for the current platform and OS theme.
-fn base_bytes() -> &'static [u8] {
+pub fn base_bytes() -> &'static [u8] {
     #[cfg(target_os = "windows")]
     {
         crate::platform::windows::pick_tray_icon_bytes()

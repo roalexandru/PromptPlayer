@@ -1,11 +1,20 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ipc, fmtErr, type Prompt, type ProfileKind } from "$lib/ipc";
+  import {
+    ipc,
+    fmtErr,
+    isRemote,
+    setEnabled,
+    type Prompt,
+    type ProfileKind,
+    type NewlineMode,
+  } from "$lib/ipc";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openFileDialog, save as saveFileDialog, confirm } from "@tauri-apps/plugin-dialog";
   import { IS_MAC } from "$lib/platform";
   import CadencePreview from "$lib/components/CadencePreview.svelte";
   import HotkeyRecorder from "$lib/components/HotkeyRecorder.svelte";
+  import CompanionPanel from "$lib/components/CompanionPanel.svelte";
 
   const NEW_HINT = IS_MAC ? "⌘N" : "Ctrl+N";
 
@@ -14,9 +23,15 @@
   let armed = $state(false);
   let error = $state<string | null>(null);
   let tab: "edit" | "preview" = $state("edit");
+  // Companion settings (sources, setlist, imports) live in their own view so
+  // the prompt editor stays uncluttered.
+  let view: "prompts" | "companion" = $state("prompts");
 
   // Local working copy of the selected prompt (the one we're editing).
   let draft = $state<Prompt | null>(null);
+  // A prompt from a remote source is read-only: its cache is replaced on every
+  // refresh, so an edit would silently vanish. The UI offers a fork instead.
+  const draftIsRemote = $derived(draft !== null && isRemote(draft));
   let dirty = $state(false);
   let saveStatus = $state<"" | "saving" | "saved" | "error">("");
   // Validity surfaced by the HotkeyRecorder (conflict / unparseable combo).
@@ -182,7 +197,7 @@
     prompts = prompts.map((x) => (x.id === p.id ? { ...x, enabled: next } : x));
     if (draft && draft.id === p.id) draft = { ...draft, enabled: next };
     try {
-      await ipc.setPromptEnabled(p.id, next);
+      await setEnabled(p, next);
     } catch (err) {
       error = fmtErr(err);
       // Roll back.
@@ -214,6 +229,20 @@
   async function toggleDraftPinned() {
     if (!draft) return;
     await togglePromptPinned(draft, new Event("synth"));
+  }
+
+  async function forkCurrent() {
+    if (!draft) return;
+    try {
+      const forked = await ipc.forkPrompt(draft.id);
+      await refresh();
+      selectedId = forked.id;
+      draft = { ...forked };
+      dirty = false;
+      flashNotice(`Forked into your library as “${forked.name}” (disabled until you review it)`);
+    } catch (e) {
+      error = fmtErr(e);
+    }
   }
 
   async function deleteCurrent() {
@@ -493,6 +522,14 @@
       <span class="brand-name">Prompt Player</span>
     </div>
     <div class="topbar-actions">
+      <button
+        class="ghost"
+        class:active={view === "companion"}
+        onclick={() => (view = view === "companion" ? "prompts" : "companion")}
+        title="Sources, setlist, agent imports and behaviour"
+      >
+        Companion
+      </button>
       <button class="ghost" onclick={createNew} title={`New prompt (${NEW_HINT})`}>
         + New
       </button>
@@ -614,14 +651,31 @@
     </aside>
 
     <main class="content">
-      {#if draft}
+      {#if view === "companion"}
+        <section class="pane glass companion-pane">
+          <CompanionPanel
+            {prompts}
+            onLibraryChanged={refresh}
+            onNotice={flashNotice}
+            onError={(m) => (error = m)}
+          />
+        </section>
+      {:else if draft}
         <header class="prompt-head">
+          {#if draftIsRemote}
+            <div class="remote-note">
+              From a shared source — read-only, because refreshing the source
+              replaces its files. <button class="link" onclick={forkCurrent}>Fork
+              into my library</button> to edit it.
+            </div>
+          {/if}
           <div class="head-row">
             <input
               class="title-input"
               bind:value={draft.name}
               oninput={markDirty}
               placeholder="Prompt name"
+              readonly={draftIsRemote}
             />
             <div class="actions">
               <span class="status" class:dirty class:saved={saveStatus === "saved"}>
@@ -725,6 +779,29 @@
                   maxlength="3"
                   placeholder=">"
                 />
+              </div>
+
+              <div class="field">
+                <label for="newline">Line breaks</label>
+                <select
+                  id="newline"
+                  value={draft.newline_mode ?? ""}
+                  onchange={(e) => {
+                    if (!draft) return;
+                    const v = (e.currentTarget as HTMLSelectElement).value;
+                    draft.newline_mode = v === "" ? null : (v as NewlineMode);
+                    markDirty();
+                  }}
+                >
+                  <option value="">Library default</option>
+                  <option value="shift-enter">Shift+Enter (chat apps)</option>
+                  <option value="backslash-enter">Backslash + Enter (terminal agents)</option>
+                  <option value="plain">Plain Enter</option>
+                </select>
+                <small>
+                  Terminals usually send Shift+Enter as a plain Enter, which
+                  submits a prompt at its first blank line.
+                </small>
               </div>
 
               <div class="field">
@@ -1892,5 +1969,36 @@
   .banner.ok button {
     background: none; border: none; color: inherit;
     font-size: 18px; cursor: pointer;
+  }
+
+  /* Read-only notice on a prompt owned by a remote source. */
+  .remote-note {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: baseline;
+    margin: 0 0 8px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--text-primary);
+  }
+  .remote-note .link {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .companion-pane {
+    padding: 16px 18px;
+    overflow-y: auto;
+  }
+  .topbar-actions .ghost.active {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--text-primary);
   }
 </style>

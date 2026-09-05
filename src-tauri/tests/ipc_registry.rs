@@ -154,6 +154,8 @@ fn mock_app_with_state(prompts_dir: &std::path::Path) -> tauri::App<tauri::test:
             tags: Vec::new(),
             enabled: true,
             pinned: false,
+            newline_mode: None,
+            origin: Default::default(),
             body: "smoke".into(),
             source_path: None,
         }]);

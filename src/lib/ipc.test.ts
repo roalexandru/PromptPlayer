@@ -67,6 +67,28 @@ describe("ipc façade", () => {
       "importPrompt",
       "exportPrompt",
       "openExternal",
+      // Companion surface: config, setlist, transport, sources, imports.
+      "getConfig",
+      "saveConfig",
+      "getSetlist",
+      "setSetlist",
+      "fireNextCue",
+      "resetSetlist",
+      "playbackStatus",
+      "togglePlaybackPause",
+      "nudgePlaybackSpeed",
+      "listSources",
+      "addSource",
+      "removeSource",
+      "refreshSources",
+      "setRemotePromptEnabled",
+      "forkPrompt",
+      "promptStops",
+      "importAgentPrompts",
+      "agentImportCandidates",
+      "captureLastTyped",
+      "sourcePendingChanges",
+      "applySourceUpdates",
     ];
     for (const key of expected) {
       expect(typeof (ipc as Record<string, unknown>)[key]).toBe("function");
@@ -74,5 +96,61 @@ describe("ipc façade", () => {
     // Both directions: a new command added to the façade without being listed
     // here is drift too, and the one-way check let `getKeepAwake` go unnoticed.
     expect(Object.keys(ipc).sort()).toEqual([...expected].sort());
+  });
+});
+
+describe("prompt origin helpers", () => {
+  it("identifies remote prompts and their source", async () => {
+    vi.resetModules();
+    vi.doMock("./ipc.gen", () => ({ commands: {} }));
+    const { isRemote, sourceIdOf } = await import("./ipc");
+
+    const remote = { origin: { kind: "remote", source_id: "org-repo@main" } };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(isRemote(remote as any)).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(sourceIdOf(remote as any)).toBe("org-repo@main");
+  });
+
+  it("treats a local prompt, and a payload with no origin at all, as local", async () => {
+    vi.resetModules();
+    vi.doMock("./ipc.gen", () => ({ commands: {} }));
+    const { isRemote, sourceIdOf } = await import("./ipc");
+
+    // `origin` is `#[serde(default)]` in Rust, so an older payload can omit
+    // it; absent must mean local rather than throwing.
+    for (const p of [{ origin: { kind: "local" } }, {}]) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(isRemote(p as any)).toBe(false);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(sourceIdOf(p as any)).toBeNull();
+    }
+  });
+
+  it("routes enable/disable to the command that matches the origin", async () => {
+    vi.resetModules();
+    const calls: string[] = [];
+    const ok = () => Promise.resolve({ status: "ok" as const, data: null });
+    vi.doMock("./ipc.gen", () => ({
+      commands: {
+        setPromptEnabled: (id: string, on: boolean) => {
+          calls.push(`local:${id}:${on}`);
+          return ok();
+        },
+        setRemotePromptEnabled: (id: string, on: boolean) => {
+          calls.push(`remote:${id}:${on}`);
+          return ok();
+        },
+      },
+    }));
+    const { setEnabled } = await import("./ipc");
+
+    // A remote prompt's enablement lives in promptplayer.yaml, because its
+    // cache directory is replaced wholesale on every refresh.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await setEnabled({ id: "src/p", origin: { kind: "remote", source_id: "src" } } as any, true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await setEnabled({ id: "mine", origin: { kind: "local" } } as any, false);
+    expect(calls).toEqual(["remote:src/p:true", "local:mine:false"]);
   });
 });

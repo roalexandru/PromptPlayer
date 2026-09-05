@@ -141,6 +141,42 @@ mod tests {
     }
 
     #[test]
+    fn the_bundled_examples_all_parse() {
+        // These are copied into the user's library on first run, so a broken
+        // one is a broken first-run experience with no obvious cause.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("prompts-examples");
+        let (prompts, errors) = load_all(&dir);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(prompts.len() >= 6, "found {}", prompts.len());
+        for p in &prompts {
+            assert!(!p.name.trim().is_empty(), "{} has no name", p.id);
+            assert!(!p.triggers.is_empty(), "{} has no trigger", p.id);
+            assert!(!p.body.trim().is_empty(), "{} has no body", p.id);
+        }
+    }
+
+    #[test]
+    fn the_multi_step_example_actually_splits() {
+        // Guards the shipped demo of the feature, not just the parser.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("prompts-examples");
+        let (prompts, _) = load_all(&dir);
+        let seq = prompts
+            .iter()
+            .find(|p| p.id.contains("agent-followup"))
+            .expect("the multi-step example is present");
+        let steps = crate::prompts::steps::split_steps(&seq.body);
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        assert!(steps[0].submit(), "the first message has to be sent");
+        assert!(steps[0].wait_after.is_some());
+    }
+
+    #[test]
     fn load_all_collects_errors_for_bad_files() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("bad.pp.md");

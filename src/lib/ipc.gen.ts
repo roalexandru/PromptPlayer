@@ -164,9 +164,9 @@ async pickerOpen() : Promise<Result<null, IpcError>> {
 async pickerSearch(q: string, limit: number | null) : Promise<SearchHit[]> {
     return await TAURI_INVOKE("picker_search", { q, limit });
 },
-async pickerSelect(promptId: string, mode: string) : Promise<Result<null, IpcError>> {
+async pickerSelect(promptId: string, mode: string, answers: { [key in string]: string } | null) : Promise<Result<null, IpcError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("picker_select", { promptId, mode }) };
+    return { status: "ok", data: await TAURI_INVOKE("picker_select", { promptId, mode, answers }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -289,6 +289,217 @@ async openExternal(url: string) : Promise<Result<null, IpcError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async getConfig() : Promise<AppConfig> {
+    return await TAURI_INVOKE("get_config");
+},
+/**
+ * Persist a full config object and adopt it in memory.
+ * 
+ * Everything except the global hotkeys takes effect immediately, because the
+ * fire pipeline and picker read the store per use. Hotkeys are registered
+ * with the OS once at startup, so a changed chord needs a relaunch; the
+ * returned flag lets the UI say so instead of leaving the user guessing.
+ */
+async saveConfig(config: AppConfig) : Promise<Result<SaveConfigOutcome, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_config", { config }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getSetlist() : Promise<SetlistEntry[]> {
+    return await TAURI_INVOKE("get_setlist");
+},
+/**
+ * Replace the setlist and reset the cue cursor to the top.
+ */
+async setSetlist(ids: string[]) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_setlist", { ids }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Fire the next cue and advance the cursor. Returns the prompt id that fired.
+ * 
+ * This is the gesture the picker can't replace: under stage pressure you stop
+ * recalling trigger words, and a fuzzy search is one more thing to get right
+ * in front of an audience. One key, next thing.
+ */
+async fireNextCue() : Promise<Result<string | null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fire_next_cue") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Move the cue cursor back to the first entry — "start the demo again".
+ */
+async resetSetlist() : Promise<void> {
+    await TAURI_INVOKE("reset_setlist");
+},
+async playbackStatus() : Promise<PlaybackStatus> {
+    return await TAURI_INVOKE("playback_status");
+},
+/**
+ * §3.5 — pause or resume the running playback. `None` when nothing is
+ * playing, so the caller can leave the UI alone.
+ */
+async togglePlaybackPause() : Promise<boolean | null> {
+    return await TAURI_INVOKE("toggle_playback_pause");
+},
+/**
+ * Speed the running playback up or down one step. Returns the new multiplier.
+ */
+async nudgePlaybackSpeed(faster: boolean) : Promise<number | null> {
+    return await TAURI_INVOKE("nudge_playback_speed", { faster });
+},
+/**
+ * Tab stops and choices in a prompt body, for the picker's inline resolver.
+ * 
+ * §6.4 rules out a modal popup mid-expansion and says choices resolve "via
+ * the picker UI itself before the picker dismisses". This is what the picker
+ * asks for to render that; an empty result means "nothing to ask, fire it".
+ */
+async promptStops(promptId: string) : Promise<Result<PromptStop[], IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("prompt_stops", { promptId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listSources() : Promise<SourceStatus[]> {
+    return await TAURI_INVOKE("list_sources");
+},
+/**
+ * Register a source and fetch it immediately.
+ * 
+ * Fetching here rather than on the next launch is deliberate: the user just
+ * typed a repo name and is looking at the dialog, so this is the only moment
+ * where a 404 or a rate-limit message can be acted on.
+ */
+async addSource(repo: string, gitRef: string | null, subdir: string | null) : Promise<Result<SourceStatus, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_source", { repo, gitRef, subdir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Forget a source, delete its cache, and drop its prompts' enablement.
+ */
+async removeSource(sourceId: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_source", { sourceId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Re-fetch every enabled source. Returns their post-refresh status.
+ */
+async refreshSources() : Promise<Result<SourceStatus[], IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("refresh_sources") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Enable or disable one remote prompt.
+ * 
+ * Remote enablement lives in `promptplayer.yaml`, not in the prompt file:
+ * the cache directory is replaced wholesale on every refresh, so a flag
+ * written there would be lost the next time the repo moved.
+ */
+async setRemotePromptEnabled(promptId: string, enabled: boolean) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_remote_prompt_enabled", { promptId, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Copy a remote prompt into the local library so it can be edited.
+ */
+async forkPrompt(promptId: string) : Promise<Result<Prompt, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fork_prompt", { promptId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Import every agent prompt file under `dir` (`.claude/commands`, Claude Code
+ * skills, Cursor rules, Continue/Copilot prompt files).
+ * 
+ * This is the shortest path from "I already have thirty slash commands" to
+ * "I can fire any of them into any editor", and the reason the `.pp.md`
+ * format was chosen to look like theirs in the first place (§7.3).
+ */
+async importAgentPrompts(dir: string) : Promise<Result<AgentImportSummary, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("import_agent_prompts", { dir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Directories worth offering as import candidates: the user's home and, when
+ * one can be resolved, the repo they are demoing from.
+ */
+async agentImportCandidates() : Promise<string[]> {
+    return await TAURI_INVOKE("agent_import_candidates");
+},
+/**
+ * Turn the last thing the user typed into a stored prompt.
+ * 
+ * The keyboard hook already keeps a ring of recent keystrokes for trigger
+ * matching, so the text is in memory — the fastest possible path from "that
+ * prompt worked" to "that prompt is saved". Only ever reads keystrokes the
+ * hook already observed; nothing new is captured.
+ */
+async captureLastTyped(name: string | null, maxChars: number | null) : Promise<Result<Prompt, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("capture_last_typed", { name, maxChars }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Prompts whose cached copy differs from what the app has loaded.
+ * 
+ * The startup refresh updates each source's cache but does not reload the
+ * library, so this is what lets the UI surface "3 prompts changed" and offer
+ * to apply, rather than a third party's edits appearing mid-demo unannounced.
+ */
+async sourcePendingChanges() : Promise<PendingChange[]> {
+    return await TAURI_INVOKE("source_pending_changes");
+},
+/**
+ * Adopt the cached source updates: reload the library and reindex.
+ */
+async applySourceUpdates() : Promise<Result<number, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("apply_source_updates") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -302,6 +513,98 @@ async openExternal(url: string) : Promise<Result<null, IpcError>> {
 
 /** user-defined types **/
 
+/**
+ * Result of scanning a directory for agent prompt files.
+ */
+export type AgentImportSummary = { 
+/**
+ * Prompts written into the library.
+ */
+imported: Prompt[]; 
+/**
+ * Files recognised but skipped because an identical trigger already
+ * existed and the body matched — re-importing the same project is a
+ * no-op rather than a pile of `-2` duplicates.
+ */
+skipped: number; 
+/**
+ * Per-file problems. Never fatal; one bad file must not abort an import.
+ */
+errors: string[] }
+/**
+ * The parsed `promptplayer.yaml`. Every field is optional in the file.
+ */
+export type AppConfig = { 
+/**
+ * Typing profile used by prompts that don't name one.
+ */
+"profile-default": ProfileKind; 
+/**
+ * Global commit char. A prompt's own `commit-char:` still wins.
+ */
+"commit-char-default": string; "hotkey-arm": string | null; "hotkey-picker": string | null; "hotkey-kill": string | null; "hotkey-panic": string | null; 
+/**
+ * Fire the next setlist cue.
+ */
+"hotkey-next-cue": string | null; 
+/**
+ * Pause / resume the running playback.
+ */
+"hotkey-pause": string | null; 
+/**
+ * Speed the running playback up / slow it down.
+ */
+"hotkey-faster": string | null; "hotkey-slower": string | null; 
+/**
+ * Disarm automatically after this many minutes of being armed. 0 = never.
+ * §11 lists this as a mitigation for "fires during a private message".
+ */
+"auto-disarm-minutes": number; 
+/**
+ * How embedded newlines are typed. Per-prompt `newline-mode:` overrides.
+ */
+"newline-mode": NewlineMode; 
+/**
+ * Refuse to type when the focused element is a password field or not
+ * editable at all (§11 password-field heuristic).
+ */
+"text-field-guard": boolean; 
+/**
+ * Allow `${{ git("rev-parse --short HEAD") }}` in prompt bodies (§6.3).
+ * Off by default; read-only subcommands only; never applied to prompts
+ * from a remote source. `shell()` is not implemented — see
+ * `prompts::expressions`.
+ */
+"allow-git-expressions": boolean; 
+/**
+ * Which screen the picker opens on.
+ */
+"picker-display": PickerDisplay; 
+/**
+ * Extra RDP client identifiers, merged with the built-in list (§9.3).
+ */
+"rdp-clients": string[]; 
+/**
+ * Ordered prompt ids fired by the "next cue" hotkey.
+ */
+setlist: string[]; 
+/**
+ * Remote prompt sources.
+ */
+sources: SourceSpec[]; 
+/**
+ * Namespaced ids of remote prompts the user has reviewed and enabled.
+ * 
+ * This lives in config rather than in the prompt file because a source's
+ * cache directory is replaced wholesale on every refresh — a flag written
+ * there would silently reset the next time the repo moved.
+ */
+"enabled-remote": string[]; 
+/**
+ * Directories scanned for repo context (`$GIT_BRANCH`, `$REPO_NAME`).
+ * Usually one entry: the repo you demo from.
+ */
+"repo-hints": string[] }
 /**
  * Everything the diagnostics window shows. One round trip, so the UI can't
  * render a half-stale picture of a machine that is mid-repair.
@@ -358,6 +661,80 @@ choices: number[];
  * Whether keep-awake is restored at launch.
  */
 restore: boolean }
+/**
+ * How an embedded `\n` in a prompt body is delivered.
+ * 
+ * The default (`ShiftEnter`) is right for chat surfaces — ChatGPT, Claude,
+ * Slack — where a bare Enter submits. It is *wrong* for agent TUIs running in
+ * a terminal: most terminals send Shift+Enter as a plain CR, so a
+ * multi-paragraph prompt submits at the first blank line. `BackslashEnter`
+ * types `\` before the newline, which Claude Code and other readline-style
+ * prompts interpret as a soft line break.
+ */
+export type NewlineMode = 
+/**
+ * Shift+Enter — chat apps. Default.
+ */
+"shift-enter" | 
+/**
+ * `\` then Enter — Claude Code and other terminal agent prompts.
+ */
+"backslash-enter" | 
+/**
+ * A bare Enter. Only safe where Enter does not submit (plain editors).
+ */
+"plain"
+/**
+ * A repository's own description of the prompt pack it publishes.
+ * 
+ * Entirely optional — a repo of loose `.pp.md` files works with no manifest
+ * at all. Its job is to let a pack name itself, point at its own
+ * subdirectory, and refuse to load into an app that is too old to understand
+ * it (a pack using a feature this build lacks would otherwise fail in a
+ * confusing, per-prompt way).
+ */
+export type PackManifest = { name: string | null; description: string | null; 
+/**
+ * Subdirectory holding the prompts. Used when the source entry doesn't
+ * name one of its own.
+ */
+subdir: string | null; 
+/**
+ * Minimum Prompt Player version this pack needs.
+ */
+"min-app-version": string | null }
+/**
+ * One prompt-level difference between a source's cache on disk and the
+ * prompts the app currently has loaded.
+ */
+export type PendingChange = { promptId: string; 
+/**
+ * Prompt name, from whichever side has it.
+ */
+name: string; kind: PendingKind }
+export type PendingKind = "added" | "removed" | "changed"
+/**
+ * Which display the picker opens on.
+ */
+export type PickerDisplay = 
+/**
+ * Cursor's screen when mirrored, built-in screen when extended. The
+ * picker is excluded from *capture*, but a projector in extended mode is
+ * a second physical screen — nothing hides it there but placement.
+ */
+"auto" | 
+/**
+ * Always the built-in / primary display.
+ */
+"builtin" | 
+/**
+ * Always the screen containing the cursor (pre-Auto behavior).
+ */
+"cursor"
+/**
+ * Live playback state, for the tray's pause row.
+ */
+export type PlaybackStatus = { playing: boolean; paused: boolean; speed: number }
 export type ProfileKind = "sales-engineer" | "fast-presenter" | "thoughtful-ceo" | "custom"
 /**
  * One stored prompt loaded from a `.pp.md` file.
@@ -374,9 +751,70 @@ enabled?: boolean;
  */
 pinned?: boolean; 
 /**
+ * Per-prompt override for how embedded newlines are typed. `None` follows
+ * the library-level `newline-mode:` from `promptplayer.yaml`. Set this to
+ * `backslash-enter` for prompts aimed at a terminal agent (Claude Code),
+ * where Shift+Enter submits instead of inserting a line break.
+ */
+newline_mode?: NewlineMode | null; 
+/**
+ * Where the prompt was loaded from. Derived, never stored in the file;
+ * the store re-derives it on save so a client cannot claim to be local.
+ */
+origin?: PromptOrigin; 
+/**
  * Body of the prompt — Markdown source after frontmatter.
  */
 body: string }
+/**
+ * Where a prompt came from, and therefore whether the app may write to it.
+ * 
+ * Not part of the `.pp.md` format — it is derived at load time (see
+ * `sources::load_cached`) and carried to the frontend so the library can
+ * badge remote prompts and hide their editing affordances.
+ */
+export type PromptOrigin = 
+/**
+ * A file in the user's own library root. Writable.
+ */
+{ kind: "local" } | 
+/**
+ * Extracted from a remote source's cache. Read-only; refetching would
+ * discard any local edit, and the cache is not the user's to own.
+ */
+{ kind: "remote"; source_id: string }
+/**
+ * One user-answerable slot in a prompt body.
+ * 
+ * §6.4 is emphatic that a modal popup mid-expansion is a flow-killer, and
+ * that choices should "resolve via the picker UI itself before the picker
+ * dismisses". The expander already reported *which* stops were unfilled, but
+ * not what they offer — so the picker had nothing to render and every choice
+ * silently typed its first option. This is the missing half.
+ */
+export type PromptStop = { 
+/**
+ * Tab-stop index as authored (`"1"`, `"2"`, …).
+ */
+key: string; 
+/**
+ * Options for a choice stop `${1|a,b,c|}`. Empty for a free-text stop.
+ */
+options: string[]; 
+/**
+ * Default text for `${1:default}`. `None` for a bare `$1`.
+ */
+default: string | null }
+export type SaveConfigOutcome = { path: string; 
+/**
+ * True when the global chords were re-registered as part of this save.
+ */
+hotkeysRebound: boolean; 
+/**
+ * Chords the OS refused (already claimed by another app). Non-fatal:
+ * every other binding still took effect.
+ */
+hotkeyWarnings: string[] }
 /**
  * One scope filter from §4.2: app(s), window-title regex, url regex, time-of-day.
  */
@@ -400,9 +838,80 @@ probe: string }
  */
 export type SelfTestStep = { name: string; passed: boolean; detail: string }
 /**
+ * One row of the setlist editor.
+ */
+export type SetlistEntry = { promptId: string; 
+/**
+ * Prompt name, or the raw id when the prompt no longer exists.
+ */
+name: string; 
+/**
+ * True when the id no longer resolves — a deleted or renamed prompt still
+ * listed in `promptplayer.yaml`. Surfaced rather than silently dropped so
+ * the user can see why a cue does nothing.
+ */
+missing: boolean; 
+/**
+ * Index of the cue that fires next.
+ */
+isNext: boolean }
+/**
+ * Manifest written into each source's cache directory. Records exactly what
+ * was fetched so a refresh can skip an unchanged commit, and so the UI can
+ * show the user which commit they are demoing from.
+ */
+export type SourceManifest = { repo: string; gitRef: string | null; subdir: string | null; 
+/**
+ * Resolved commit id the cache was built from.
+ */
+sha: string; 
+/**
+ * RFC 3339 timestamp of the fetch. A string rather than an epoch integer
+ * so the manifest stays readable by hand and the type crosses IPC without
+ * a 64-bit integer (which specta refuses to export).
+ */
+fetchedAt: string; promptCount: number }
+/**
+ * One remote prompt source. Only public GitHub repos are supported; the
+ * fetch is anonymous (60 requests/hour) and read-only.
+ */
+export type SourceSpec = { 
+/**
+ * `owner/repo`.
+ */
+repo: string; 
+/**
+ * Branch, tag, or commit. Defaults to the repo's default branch.
+ */
+"git-ref"?: string | null; 
+/**
+ * Only load `.pp.md` under this subdirectory of the repo.
+ */
+subdir?: string | null; 
+/**
+ * Skip this source without deleting the entry.
+ */
+enabled?: boolean }
+/**
+ * One row in the library window's Sources list.
+ */
+export type SourceStatus = { id: string; repo: string; gitRef: string | null; subdir: string | null; enabled: boolean; 
+/**
+ * Present once the source has been fetched at least once.
+ */
+manifest: SourceManifest | null; 
+/**
+ * The repo's own `promptplayer-pack.yaml`, if it publishes one.
+ */
+pack: PackManifest | null; 
+/**
+ * Web URL for the "open on GitHub" affordance.
+ */
+htmlUrl: string }
+/**
  * §7.1 `typing-overrides:` mapping.
  */
-export type TypingOverrides = { "iki-median-ms": number | null; "typo-rate": number | null; "pause-variance-scale": number | null; "burst-enabled": boolean | null; "typos-enabled": boolean | null; "pre-submit-pause-enabled": boolean | null; "send-final-enter": boolean | null }
+export type TypingOverrides = { "iki-median-ms": number | null; "typo-rate": number | null; "pause-variance-scale": number | null; "burst-enabled": boolean | null; "typos-enabled": boolean | null; "pre-submit-pause-enabled": boolean | null; "send-final-enter": boolean | null; "rephrase-enabled": boolean | null; "rephrase-rate": number | null }
 /**
  * The editable subset the UI sees.
  */

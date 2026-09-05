@@ -5,6 +5,7 @@ pub mod fire;
 pub mod lifecycle;
 pub mod setup;
 pub mod shortcuts;
+pub mod tray_flash;
 
 pub use context::AppContext;
 pub use fire::FireService;

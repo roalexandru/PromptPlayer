@@ -14,8 +14,10 @@ pub mod inject;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod hook;
 
+pub mod accessibility;
 pub mod app;
 pub mod commands;
+pub mod config;
 pub mod error;
 pub mod filters;
 pub mod hotkey;
@@ -24,13 +26,16 @@ pub mod platform;
 pub mod power;
 pub mod prompts;
 pub mod rdp;
+pub mod repo;
 pub mod scopes;
 pub mod settings;
+pub mod sources;
 pub mod state;
 pub mod store;
 pub mod telemetry;
 pub mod tray_icon;
 pub mod undo;
+pub mod usage;
 
 // Not cfg-gated: both carry `cfg(not(macos))` stubs for cross-platform callers,
 // and gating the modules made those stubs unreachable.
