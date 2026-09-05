@@ -35,12 +35,9 @@ mod plat {
 
 #[cfg(target_os = "windows")]
 mod plat {
-    //! Windows applies `WDA_EXCLUDEFROMCAPTURE` to the picker's top-level
-    //! HWND. `SetWindowDisplayAffinity` only accepts top-level windows of the
-    //! calling process — child HWNDs, WebView2's included, are rejected (see
-    //! `platform/windows/capture.rs::apply_display_affinity`) — so there is
-    //! no descendant walk. The helper also detects the Win11 win32k
-    //! `ERROR_NOT_ENOUGH_MEMORY` bug and falls back to `WDA_MONITOR`.
+    //! `WDA_EXCLUDEFROMCAPTURE` on the picker's top-level HWND.
+    //! `SetWindowDisplayAffinity` rejects child windows, WebView2's included,
+    //! so there is no descendant walk — see `windows::capture`.
     use crate::platform::windows::capture::apply_display_affinity;
     use tauri::WebviewWindow;
     use windows::Win32::Foundation::HWND;

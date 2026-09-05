@@ -139,13 +139,8 @@ fn show_picker_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("picker") {
         #[cfg(target_os = "macos")]
         crate::platform::macos::activate_app();
-        // Windows-only: (re-)assert the picker's screen-capture exclusion on
-        // every show. `picker::window::prepare_picker` has had no caller since
-        // the 1d33436 refactor, so this is what keeps the picker out of Zoom /
-        // Teams / OBS captures on Windows. Idempotent and one syscall, so it
-        // runs synchronously before `show()` — the window is excluded before
-        // its first frame is ever composed. Failures are logged by the helper
-        // (including the Win11 win32k bug + WDA_MONITOR fallback).
+        // Re-assert capture exclusion on every show. One idempotent syscall,
+        // run before `show()` so the first frame is already excluded.
         #[cfg(target_os = "windows")]
         if let Err(e) = crate::picker::window::apply_screen_capture_exclusion(&w, true) {
             tracing::warn!("picker capture-exclusion failed: {e}");

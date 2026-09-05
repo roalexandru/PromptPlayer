@@ -214,6 +214,29 @@ checks at startup +15s then every 6h and emits an `update-available`
   and release also checks the tag equals `package.json` version. **Bump all three
   together.**
 
+## Writing style — this repository is public
+
+`roalexandru/PromptPlayer` is public. Commit messages, PR bodies, code comments
+and log lines are all read by strangers. Write for a competent engineer who has
+no context on the conversation that produced the change.
+
+**Comments** — 1–2 lines. Explain *why*; the code already says *what*. Module
+headers (`//!`) may run to two short paragraphs. Delete a comment rather than
+let it drift out of date. A comment restating the next line is noise.
+
+**Commit messages** — imperative subject under 72 chars, no trailing period, no
+type prefix required. Wrap the body at 72 and use it to explain the problem and
+why this is the fix. Describe behaviour, not process: "Windows never sent
+`UpdateApplied`", not "fixed the bug found earlier".
+
+**PR bodies** — problem and evidence first, then the change, then how it was
+verified *and what was not*. Prefer tables and short sections to prose walls. A
+reviewer who has to discover a testing gap on their own has been misled.
+
+**Never in a public artifact** — session narration or chat transcripts, "I
+noticed / let me / as requested", apologies, decorative emoji, invented
+metrics, customer names, secrets, or absolute paths under `/Users/<name>`.
+
 ## Conventions & gotchas checklist
 
 - Adding an IPC command → update `COMMAND_NAMES` + both macros in `setup.rs`

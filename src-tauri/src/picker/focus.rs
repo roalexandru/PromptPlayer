@@ -99,17 +99,14 @@ fn capture_foreground() -> ForegroundSnapshot {
     }
     let fg_class = class_name_of(fg);
 
-    // Walk z-order from the foreground HWND collecting candidate metadata,
-    // then let the pure `select_target` policy pick the first one that's a
-    // plausible focus-restore target (skipping Zoom share helpers, our own
-    // windows, cloaked / minimized / hidden windows).
+    // Collect z-order candidates, then let the pure `select_target` policy
+    // pick the first plausible focus-restore target.
     let candidates = collect_z_order_candidates(fg, 10);
     let (handle_raw, window_title) = match select_target(&candidates) {
         Some(c) => (c.hwnd_raw, c.title.clone()),
         None => {
-            // Nothing in the z-order window passed the filter — fall back to
-            // the raw foreground HWND. Better to type at the wrong window
-            // than silently drop the snapshot.
+            // Nothing passed the filter — fall back to the raw foreground
+            // HWND rather than silently dropping the snapshot.
             tracing::warn!(
                 target: "prompt_player::capture",
                 fg_hwnd = fg.0 as usize,
