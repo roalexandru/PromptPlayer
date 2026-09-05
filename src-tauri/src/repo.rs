@@ -95,36 +95,99 @@ pub fn context_for(path: &Path) -> RepoContext {
     }
 }
 
-/// Pull filesystem-path-looking tokens out of a window title.
+/// True when `s` starts with something that can only be an absolute path:
+/// a POSIX root, a Windows drive letter, or a UNC prefix.
+fn absolute_path_start(s: &str) -> bool {
+    let b = s.as_bytes();
+    match b.first() {
+        Some(b'/') => s.len() > 1,
+        Some(b'\\') => s.starts_with("\\\\"), // UNC \\server\share
+        Some(c) if c.is_ascii_alphabetic() => {
+            // `C:\…` or `C:/…`
+            matches!(b.get(1), Some(b':')) && matches!(b.get(2), Some(b'\\') | Some(b'/'))
+        }
+        _ => false,
+    }
+}
+
+/// Pull filesystem-path-looking candidates out of a window title.
 ///
 /// Terminal emulators put the working directory in the title, but the format
-/// varies wildly (`~/src/app`, `app — user@host`, `nvim ~/src/app/x.rs`), so
-/// we take only tokens that unambiguously look like paths and let the caller
-/// verify they exist. `~` is expanded because titles almost always abbreviate
-/// the home directory.
+/// varies wildly (`~/src/app`, `app — user@host`, `nvim ~/src/app/x.rs`,
+/// `C:\src\app`), so this is deliberately generous and the caller verifies
+/// which candidates exist.
+///
+/// Two wrinkles the obvious "split on whitespace" version gets wrong:
+///
+/// - **Windows paths.** A drive letter or UNC prefix has to count as a root,
+///   or title detection silently never fires on Windows — which is exactly
+///   what the CI run for this change caught.
+/// - **Spaces in paths.** `C:\Program Files\app` and `/Users/me/My Project`
+///   are ordinary. So from each start marker we emit the whole remainder of
+///   the title first, then progressively shorter prefixes (dropping one
+///   trailing word at a time). The caller takes the first that exists, which
+///   is the longest real path — and a title like `nvim /src/app — idle` still
+///   resolves, because `/src/app` is reached on a later shrink.
 pub fn paths_in_title(title: &str, home: Option<&Path>) -> Vec<PathBuf> {
+    /// Bound on candidates per marker, so a pathological title stays cheap.
+    const MAX_SHRINKS: usize = 12;
+    let trim = |s: &str| {
+        s.trim()
+            .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '"' | '\''))
+            .to_string()
+    };
     let mut out = Vec::new();
-    for token in title.split(|c: char| c.is_whitespace() || c == '|') {
-        let token = token.trim_matches(|c: char| {
-            matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | ':' | '"' | '\'')
-        });
-        if token.is_empty() {
-            continue;
-        }
-        if let Some(rest) = token.strip_prefix("~/") {
-            if let Some(h) = home {
-                out.push(h.join(rest));
+    // Word start offsets, so each marker is examined once.
+    let starts = std::iter::once(0).chain(
+        title
+            .char_indices()
+            .filter(|(_, c)| c.is_whitespace() || *c == '|')
+            .map(|(i, c)| i + c.len_utf8()),
+    );
+    for start in starts {
+        let rest = &title[start..];
+        let rest_trimmed = rest.trim_start_matches(|c: char| matches!(c, '(' | '[' | '"' | '\''));
+        let (prefix, expanded_home): (&str, Option<PathBuf>) =
+            if let Some(after) = rest_trimmed.strip_prefix("~/") {
+                match home {
+                    Some(h) => (after, Some(h.to_path_buf())),
+                    None => continue,
+                }
+            } else if rest_trimmed == "~" || rest_trimmed.starts_with("~ ") {
+                if let Some(h) = home {
+                    out.push(h.to_path_buf());
+                }
+                continue;
+            } else if absolute_path_start(rest_trimmed) {
+                (rest_trimmed, None)
+            } else {
+                continue;
+            };
+
+        // Cut at the first closing delimiter: a title that wraps the path in
+        // brackets or quotes (`agent (/srv/checkout) idle`) would otherwise
+        // carry the bracket and everything after it into the candidate.
+        let prefix = match prefix.find(|c: char| matches!(c, ')' | ']' | '"' | '\'' | '|')) {
+            Some(i) => &prefix[..i],
+            None => prefix,
+        };
+        // Longest first, then drop one trailing word at a time.
+        let mut candidate = trim(prefix);
+        for _ in 0..MAX_SHRINKS {
+            if candidate.is_empty() {
+                break;
             }
-            continue;
-        }
-        if token == "~" {
-            if let Some(h) = home {
-                out.push(h.to_path_buf());
+            let path = match &expanded_home {
+                Some(h) => h.join(&candidate),
+                None => PathBuf::from(&candidate),
+            };
+            if !out.contains(&path) {
+                out.push(path);
             }
-            continue;
-        }
-        if token.starts_with('/') && token.len() > 1 {
-            out.push(PathBuf::from(token));
+            match candidate.rfind(|c: char| c.is_whitespace() || c == '|') {
+                Some(i) => candidate = trim(&candidate[..i]),
+                None => break,
+            }
         }
     }
     out
@@ -271,9 +334,59 @@ mod tests {
     }
 
     #[test]
-    fn strips_punctuation_around_path_tokens() {
+    fn strips_punctuation_and_trailing_words_around_path_tokens() {
         let got = paths_in_title("agent (/srv/checkout) idle", None);
         assert_eq!(got, vec![PathBuf::from("/srv/checkout")]);
+    }
+
+    #[test]
+    fn recognises_windows_paths() {
+        // Without a drive-letter root, title detection silently never fired on
+        // Windows — which is what the CI run for this change caught.
+        let got = paths_in_title(r"agent C:\src\app", None);
+        assert!(got.contains(&PathBuf::from(r"C:\src\app")), "{got:?}");
+
+        let unc = paths_in_title(r"\\build\share\repo", None);
+        assert!(
+            unc.contains(&PathBuf::from(r"\\build\share\repo")),
+            "{unc:?}"
+        );
+    }
+
+    #[test]
+    fn offers_candidates_longest_first_so_paths_with_spaces_resolve() {
+        // `C:\Program Files\app` and `/Users/me/My Project` are ordinary, so
+        // the whitespace-split-only version could never match them.
+        let got = paths_in_title("/Users/me/My Project — idle", None);
+        assert_eq!(
+            got.first(),
+            Some(&PathBuf::from("/Users/me/My Project — idle")),
+            "longest candidate first: {got:?}"
+        );
+        assert!(
+            got.contains(&PathBuf::from("/Users/me/My Project")),
+            "and the real path is reachable by shrinking: {got:?}"
+        );
+    }
+
+    #[test]
+    fn relative_paths_are_not_candidates() {
+        // A bare word or a relative path can't be resolved and would only
+        // produce false positives.
+        for title in ["src/app", "app — idle", r"src\app", "C:", "just words"] {
+            let got = paths_in_title(title, None);
+            assert!(got.is_empty(), "{title:?} produced {got:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_picks_the_longest_existing_path_from_a_title_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fake_repo(dir.path(), "My Project", "ref: refs/heads/spaced\n");
+        let title = format!("nvim {} — idle", root.display());
+        let ctx = resolve(Some(&title), &[]);
+        assert_eq!(ctx.name.as_deref(), Some("My Project"));
+        assert_eq!(ctx.branch.as_deref(), Some("spaced"));
     }
 
     #[test]
