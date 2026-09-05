@@ -1,16 +1,6 @@
-//! Cursor-aware monitor positioning — Windows counterpart to
-//! `platform/macos/screen.rs`.
-//!
-//! Strategy:
-//! 1. `GetCursorPos` → cursor in physical screen coordinates.
-//! 2. `MonitorFromPoint(MONITOR_DEFAULTTONEAREST)` → handle of the monitor
-//!    the cursor is on (with auto-fallback to the closest monitor if the
-//!    cursor is somehow off-screen).
-//! 3. `GetMonitorInfoW` → `rcWork`, the monitor's work area (excludes the
-//!    taskbar). Use the work area, not the full bounds, so the picker isn't
-//!    shoved partially behind the taskbar.
-//! 4. Place the window centered horizontally, `top_padding_fraction` of the
-//!    work-area height down from the top.
+//! Cursor-aware monitor positioning, the Windows counterpart to
+//! `platform/macos/screen.rs`: find the cursor's monitor, take its *work* area
+//! so the picker isn't shoved behind the taskbar, and center within it.
 
 use tauri::{AppHandle, Manager, PhysicalPosition};
 use windows::Win32::Foundation::POINT;

@@ -12,20 +12,8 @@ pub enum ProfileKind {
     Custom,
 }
 
-/// Per-profile parameters. `iki_scale` multiplies sampled IKI to retarget median;
-/// `pause_variance_scale` multiplies the σ of all pause distributions.
-///
-/// `iki_min_ms` is the profile-aware floor applied AFTER scaling; without it,
-/// the global 60 ms floor in `distributions::IKI_MIN_MS` would silently swallow
-/// any `iki_scale < ~0.43` (since base median is ~140 ms). Fast Presenter and
-/// the picker's "Fast" override drop the floor so their scale actually takes
-/// effect; Sales Engineer / CEO keep the realistic 60 ms human-typing floor.
-///
-/// `pause_scale` multiplies the *mean* of all boundary pauses (word, sentence,
-/// paragraph). The old design only scaled σ via `pause_variance_scale`, so even
-/// at low `iki_scale` the chars flew past but every space stalled the same
-/// ~180 ms — visibly choppy. Cutting the mean too is what makes "fast" feel
-/// continuous instead of stuttery.
+/// Per-profile dials for the IKI median, pause mean and σ, plus a
+/// profile-aware floor — the global one swallowed any scale below ~0.43.
 #[derive(Debug, Clone, Copy)]
 pub struct Profile {
     pub kind: ProfileKind,
@@ -54,9 +42,8 @@ impl Default for Profile {
 }
 
 impl Profile {
-    /// Sales Engineer — calm, plausible-human cadence. Target ~75 WPM with
-    /// realistic word/sentence pauses. The 60 ms floor here is the realistic
-    /// lower bound for sustained human typing (faster than that = "presenter").
+    /// Sales Engineer — calm, plausible-human, ~75 WPM. The 60 ms floor is the
+    /// realistic lower bound for sustained human typing.
     pub const SALES_ENGINEER: Profile = Profile {
         kind: ProfileKind::SalesEngineer,
         iki_scale: 0.50, // median ~70 ms
@@ -72,9 +59,8 @@ impl Profile {
         rephrase_rate: 0.012,
     };
 
-    /// Fast Presenter — confident demo cadence. Target ~180 WPM. The lower
-    /// `iki_min_ms` is what unblocks the scale: previously `iki_scale=0.32`
-    /// was silently clamped to the global 60 ms floor on the bulk of chars.
+    /// Fast Presenter — confident demo cadence, ~180 WPM. The lower
+    /// `iki_min_ms` is what stops the global floor clamping the scale away.
     pub const FAST_PRESENTER: Profile = Profile {
         kind: ProfileKind::FastPresenter,
         iki_scale: 0.22, // median ~31 ms

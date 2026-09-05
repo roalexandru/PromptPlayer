@@ -1,29 +1,8 @@
-//! Hotkey string normalization.
-//!
-//! Accepts user-authored forms (e.g. `cmd+shift+1`, `Cmd+Shift+1`,
-//! `⌘⇧1`, `option+space`) and normalizes them to Tauri's canonical
-//! `Shortcut::from_str` parser form (e.g. `CmdOrCtrl+Shift+Digit1`).
+//! Normalize user-authored hotkeys (`cmd+shift+1`, `⌘⇧1`, `option+space`) into
+//! the canonical form `Shortcut::from_str` expects (`CmdOrCtrl+Shift+Digit1`).
 
-/// Normalize a user-authored hotkey string to Tauri's canonical form.
-///
-/// Recognized modifier aliases:
-/// - `cmd | command | ⌘ | meta | super | win | windows` → `CmdOrCtrl`
-/// - `ctrl | control | ⌃` → `Control`
-/// - `shift | ⇧` → `Shift`
-/// - `alt | option | opt | ⌥` → `Alt`
-///
-/// Recognized key aliases:
-/// - Single ASCII letters → `Key{LETTER}` (uppercased)
-/// - Single ASCII digits → `Digit{N}`
-/// - `esc | escape` → `Escape`
-/// - `enter | return` → `Enter`
-/// - `space | spacebar` → `Space`
-/// - `tab` → `Tab`
-/// - `backspace` → `Backspace`
-/// - `up | down | left | right` → `ArrowUp` etc.
-///
-/// Anything else is title-cased and passed through (so `Comma`, `Period`,
-/// `F1..F12` etc. work without explicit mapping).
+/// Normalize one hotkey string. Aliases are the match arms below; anything
+/// else is title-cased and passed through, so `Comma` and `F1..F12` just work.
 pub fn normalize(input: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     for raw in input.split(['+', '-']) {

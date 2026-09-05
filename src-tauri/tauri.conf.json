@@ -72,6 +72,25 @@
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "url": "about.html"
+      },
+      {
+        "label": "diagnostics",
+        "title": "Prompt Player Diagnostics",
+        "width": 520,
+        "height": 620,
+        "minWidth": 520,
+        "minHeight": 420,
+        "maxWidth": 520,
+        "maxHeight": 900,
+        "resizable": true,
+        "minimizable": false,
+        "maximizable": false,
+        "visible": false,
+        "center": true,
+        "skipTaskbar": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "url": "diagnostics.html"
       }
     ],
     "security": {
@@ -91,7 +110,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "app", "msi"],
+    "targets": [
+      "dmg",
+      "app",
+      "msi"
+    ],
     "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
@@ -114,7 +137,9 @@
     },
     "windows": {
       "wix": {
-        "language": ["en-US"]
+        "language": [
+          "en-US"
+        ]
       }
     }
   }

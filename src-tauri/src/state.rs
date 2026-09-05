@@ -8,9 +8,8 @@ use std::time::{Duration, Instant};
 
 /// §2.6 — number of fast keystrokes during playback that abort the expansion.
 const PANIC_KEY_COUNT: usize = 3;
-/// §2.6 — sliding window the `PANIC_KEY_COUNT` strokes must fit inside to count
-/// as "fast". 600 ms is comfortably below a normal typing burst yet well above
-/// an accidental two-finger graze.
+/// §2.6 — window the `PANIC_KEY_COUNT` strokes must fit in to count as "fast".
+/// Below a normal typing burst, above an accidental two-finger graze.
 const PANIC_WINDOW: Duration = Duration::from_millis(600);
 
 /// Global runtime state.
@@ -18,15 +17,16 @@ pub struct AppState {
     armed: AtomicBool,
     /// True while a playback (typer thread) is active.
     playing: AtomicBool,
-    /// Controls for the *current* playback (§2.6, §2.7, plus pause/speed). A
-    /// fresh handle is minted on each `begin_playback` so a stale kill-switch
-    /// press from a previous playback can't bleed into the next one, and so
-    /// `end_playback` of one session can never clear another's flag.
+    /// Controls for the current playback: cancel (§2.6, §2.7) plus pause and
+    /// speed (§3.5). Minted fresh each `begin_playback`, so a stale press —
+    /// or a latched pause — can't bleed into the next one.
     playback: Mutex<PlaybackControl>,
-    /// Ring of the last `PANIC_KEY_COUNT` keystroke timestamps observed during
-    /// playback. When all slots are filled and `newest - oldest <= PANIC_WINDOW`,
-    /// the user has panic-aborted (§2.6).
+    /// Last `PANIC_KEY_COUNT` keystroke times during playback. All slots full
+    /// within `PANIC_WINDOW` means the user panic-aborted (§2.6).
     cancel_strokes: Mutex<[Option<Instant>; PANIC_KEY_COUNT]>,
+    /// Why the current playback was cancelled; without it `Esc` and `Kill` were
+    /// unreachable reasons. Cleared on every `begin_playback`.
+    cancel_reason: Mutex<Option<crate::telemetry::CancelReason>>,
     /// Configurable global commit char (default `>`, §2.3).
     commit_char: Mutex<char>,
     /// When the app was last armed. Drives the §11 auto-disarm timer; `None`
@@ -34,11 +34,8 @@ pub struct AppState {
     armed_since: Mutex<Option<Instant>>,
     /// Cursor into the configured setlist — index of the *next* cue to fire.
     setlist_cursor: Mutex<usize>,
-    /// True while the platform keyboard hook is installed and dispatching events.
-    /// On macOS this flips false when `CGEventTapCreate` fails (Accessibility
-    /// missing) or the run loop exits. The frontend reads this to surface a
-    /// "grant Accessibility" row in the tray; an Accessibility-status poller
-    /// respawns the hook when permission is granted.
+    /// The hook is installed and dispatching. False when the macOS tap fails;
+    /// the tray surfaces that and a poller respawns once permission lands.
     hook_alive: AtomicBool,
 }
 
@@ -50,12 +47,20 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        // §10.1 — app starts disarmed every launch unless the user has opted
+        // into restoring it (see `new_armed`).
+        Self::new_armed(false)
+    }
+
+    /// Explicit initial armed state, for boot when `settings.restore_armed`
+    /// is on. Everything else uses [`Self::new`] and the §10.1 default.
+    pub fn new_armed(armed: bool) -> Self {
         Self {
-            // §10.1 — app starts disarmed every launch.
-            armed: AtomicBool::new(false),
+            armed: AtomicBool::new(armed),
             playing: AtomicBool::new(false),
             playback: Mutex::new(PlaybackControl::new()),
             cancel_strokes: Mutex::new([None; PANIC_KEY_COUNT]),
+            cancel_reason: Mutex::new(None),
             commit_char: Mutex::new('>'),
             armed_since: Mutex::new(None),
             setlist_cursor: Mutex::new(0),
@@ -73,6 +78,10 @@ impl AppState {
 
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::new())
+    }
+
+    pub fn shared_armed(armed: bool) -> Arc<Self> {
+        Arc::new(Self::new_armed(armed))
     }
 
     pub fn is_armed(&self) -> bool {
@@ -122,11 +131,8 @@ impl AppState {
         self.playing.load(Ordering::Relaxed)
     }
 
-    /// Try to start a playback. Returns the cancel flag the typer thread should
-    /// poll, or `None` if a playback is already in progress — playbacks are
-    /// mutually exclusive so two fires can't interleave keystrokes into the
-    /// same window. The caller MUST NOT call `end_playback` when this returns
-    /// `None` (it would flip `playing` false out from under the live session).
+    /// Start a playback and return its controls, or `None` if one is already
+    /// running. On `None` the caller must NOT call `end_playback`.
     pub fn begin_playback(&self) -> Option<PlaybackControl> {
         if self
             .playing
@@ -140,6 +146,7 @@ impl AppState {
         let control = PlaybackControl::new();
         *self.playback.lock() = control.clone();
         *self.cancel_strokes.lock() = [None; PANIC_KEY_COUNT];
+        *self.cancel_reason.lock() = None;
         Some(control)
     }
 
@@ -174,17 +181,35 @@ impl AppState {
         self.playback.lock().reset();
     }
 
-    /// §2.7 kill-switch: cancel the current playback. Clears any pause first —
-    /// a paused typer is parked in a poll loop and has to observe the cancel.
-    pub fn cancel_playback(&self) {
+    /// §2.7 kill-switch: trip the cancel flag, recording why.
+    ///
+    /// Clears any pause first: a paused typer is parked in a poll loop, so it
+    /// has to be let go before it can observe the cancel.
+    pub fn cancel_playback_with(&self, reason: crate::telemetry::CancelReason) {
+        // First reason wins — the panic ring can trip while we're already
+        // tearing down from an Esc, and the initiating cause is the useful one.
+        let mut slot = self.cancel_reason.lock();
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+        drop(slot);
         let control = self.playback.lock().clone();
         control.set_paused(false);
         control.cancel();
     }
 
-    /// §2.6 — record a keystroke at `now` in the panic ring. Returns `true` iff
-    /// the ring is full and all `PANIC_KEY_COUNT` strokes fit inside
-    /// `PANIC_WINDOW` (i.e. the user has panic-aborted).
+    /// §2.7 kill-switch with the default "user typed over it" attribution.
+    pub fn cancel_playback(&self) {
+        self.cancel_playback_with(crate::telemetry::CancelReason::UserKeystrokes);
+    }
+
+    /// Consume the recorded cancel reason, if any.
+    pub fn take_cancel_reason(&self) -> Option<crate::telemetry::CancelReason> {
+        self.cancel_reason.lock().take()
+    }
+
+    /// §2.6 — record a keystroke in the panic ring. True once the ring is full
+    /// and every stroke fits inside `PANIC_WINDOW`.
     pub fn record_cancel_keystroke(&self, now: Instant) -> bool {
         let mut ring = self.cancel_strokes.lock();
         // Shift left, append `now` to the last slot.
@@ -415,6 +440,59 @@ mod tests {
         assert_eq!(s.commit_char(), '>');
         s.set_commit_char('!');
         assert_eq!(s.commit_char(), '!');
+    }
+
+    #[test]
+    fn new_armed_restores_opt_in_state() {
+        // §10.1 stays the default; restore is explicit.
+        assert!(!AppState::new().is_armed());
+        assert!(AppState::new_armed(true).is_armed());
+        assert!(!AppState::new_armed(false).is_armed());
+    }
+
+    #[test]
+    fn cancel_reason_is_recorded_and_consumed() {
+        use crate::telemetry::CancelReason;
+        let s = AppState::new();
+        let _c = s.begin_playback().expect("playback starts");
+        assert!(s.take_cancel_reason().is_none(), "nothing cancelled yet");
+        s.cancel_playback_with(CancelReason::Esc);
+        assert_eq!(s.take_cancel_reason(), Some(CancelReason::Esc));
+        assert!(s.take_cancel_reason().is_none(), "take consumes");
+    }
+
+    #[test]
+    fn first_cancel_reason_wins() {
+        // Esc trips first, then the panic ring as the user keeps hammering.
+        use crate::telemetry::CancelReason;
+        let s = AppState::new();
+        let _c = s.begin_playback().expect("playback starts");
+        s.cancel_playback_with(CancelReason::Esc);
+        s.cancel_playback_with(CancelReason::UserKeystrokes);
+        assert_eq!(s.take_cancel_reason(), Some(CancelReason::Esc));
+    }
+
+    #[test]
+    fn cancel_reason_resets_between_playbacks() {
+        use crate::telemetry::CancelReason;
+        let s = AppState::new();
+        let _c = s.begin_playback().expect("playback starts");
+        s.cancel_playback_with(CancelReason::Kill);
+        s.end_playback();
+        let _c2 = s.begin_playback().expect("playback restarts");
+        assert!(
+            s.take_cancel_reason().is_none(),
+            "a stale reason must not bleed into the next playback"
+        );
+    }
+
+    #[test]
+    fn plain_cancel_defaults_to_user_keystrokes() {
+        use crate::telemetry::CancelReason;
+        let s = AppState::new();
+        let _c = s.begin_playback().expect("playback starts");
+        s.cancel_playback();
+        assert_eq!(s.take_cancel_reason(), Some(CancelReason::UserKeystrokes));
     }
 
     #[test]

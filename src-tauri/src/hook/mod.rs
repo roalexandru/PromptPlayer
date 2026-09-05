@@ -1,23 +1,8 @@
-//! §8.4 — keyboard listener with suppression.
+//! §8.4 — keyboard listener with suppression. Each platform's native hook
+//! filters our own injected keys, or playback trips the §2.6 panic ring.
 //!
-//! Each platform owns a native low-level hook so we can filter out our own
-//! injected events at the hook layer — without that, the typer's body chars
-//! would loop back through the listener and trip the §2.6 panic ring,
-//! self-cancelling playback after ~3 chars.
-//!
-//! - macOS: custom `CGEventTap` (see `macos.rs`) — also avoids rdev's
-//!   `string_from_code` which calls `TSMGetInputSourceProperty` from the
-//!   tap callback thread and SIGTRAPs on newer macOS. Filters by source PID
-//!   (`kCGEventSourceUnixProcessID`).
-//! - Windows: custom `SetWindowsHookExW(WH_KEYBOARD_LL)` (see `windows.rs`).
-//!   Filters by `LLKHF_INJECTED`. We previously used `rdev::grab` here, but
-//!   rdev's `Event` API hides the injection flag so we couldn't tell our
-//!   own keystrokes apart from the user's.
-//!
-//! Both platforms translate their native event into a `KeyEvent`, then the
-//! shared `process_event` function decides Pass / Suppress. This is the
-//! single source of truth for: armed gate, secure-input gate, undo,
-//! panic-ring, escape-hatch (`\>`), trigger match, ring-buffer maintenance.
+//! Both feed `KeyEvent` to `process_event`, the single source of truth for the
+//! gates, undo, panic ring, `\>` escape and matching.
 
 use crate::matcher::MatcherState;
 use crate::state::AppState;
@@ -40,14 +25,15 @@ pub struct KeyEvent {
     pub typed: Option<char>,
     /// Backspace pressed.
     pub is_backspace: bool,
-    /// True for events that are pure modifier keypresses (Shift/Ctrl/Alt/
-    /// Meta with no other key). Set by the platform layer; macOS' callback
-    /// already filters these out at the OS layer, Windows surfaces them.
+    /// A bare modifier press. macOS filters these at the OS layer; Windows
+    /// surfaces them, so the platform layer sets this.
     pub is_pure_modifier: bool,
-    /// True for keys that produce no character but still separate words —
-    /// Return and Tab. The matcher records a synthetic boundary so a trigger
-    /// typed right after Enter (the most common demo flow) still matches.
+    /// Return/Tab: no character, but still a word boundary, so a trigger typed
+    /// right after Enter still matches.
     pub is_separator: bool,
+    /// Escape pressed. During playback this is an explicit "stop now" and
+    /// gets its own `CancelReason` instead of counting toward the panic ring.
+    pub is_escape: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,36 +46,60 @@ pub struct HookHandle {
     _t: std::marker::PhantomData<()>,
 }
 
+/// Host callbacks the hook invokes. One struct so adding a callback doesn't
+/// mean editing five spawn signatures. Cheap to clone — all fields are `Arc`.
+#[derive(Clone)]
+pub struct HookCallbacks {
+    pub on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
+    pub on_undo: Arc<dyn Fn() + Send + Sync>,
+    pub on_literal_commit: Arc<dyn Fn(char) + Send + Sync>,
+    /// Every commit char typed while armed, matched or not.
+    /// `(matched, matcher_index_size)`.
+    pub on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
+    /// A commit char typed while Secure Input had the hook gated shut — i.e.
+    /// a trigger that silently did nothing.
+    pub on_blocked_commit: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl HookCallbacks {
+    /// All-no-op set. Used by tests and by the non-mac/win stub build.
+    pub fn noop() -> Self {
+        Self {
+            on_fire: Arc::new(|_, _| {}),
+            on_undo: Arc::new(|| {}),
+            on_literal_commit: Arc::new(|_| {}),
+            on_commit_observed: Arc::new(|_, _| {}),
+            on_blocked_commit: Arc::new(|| {}),
+        }
+    }
+}
+
 /// Bundle of references the shared `process_event` needs. Cheap to construct
 /// per-event because everything is already an `Arc`.
 pub struct HookDeps<'a> {
     pub matcher: &'a Arc<MatcherState>,
     pub undo: &'a Arc<UndoLog>,
     pub app_state: &'a Arc<AppState>,
-    pub on_fire: &'a Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
-    pub on_undo: &'a Arc<dyn Fn() + Send + Sync>,
-    pub on_literal_commit: &'a Arc<dyn Fn(char) + Send + Sync>,
-    /// Fires every time the user types the commit char while armed, regardless
-    /// of whether a trigger matched. Used to plumb the `commit_observed`
-    /// telemetry event without forcing the hook crate to know about the
-    /// telemetry pipeline. `(matched, matcher_index_size)`.
-    pub on_commit_observed: &'a Arc<dyn Fn(bool, usize) + Send + Sync>,
+    pub cb: &'a HookCallbacks,
+    /// macOS Secure Event Input state, sampled by the platform handler; always
+    /// false on Windows. An input (not an FFI call) so the gate is testable.
+    pub secure_input_active: bool,
 }
 
-/// Shared event-handling pipeline used by both macOS and Windows hooks.
-///
-/// Returns `Pass` when the host should let the event continue to the focused
-/// app, `Suppress` when it should swallow the event (commit-char that fired
-/// a trigger, or backspace that triggered an undo).
+/// Shared pipeline for both platform hooks. `Suppress` swallows the event —
+/// a commit char that fired, a backspace that undid, or Esc during playback.
 pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
     if !deps.app_state.is_armed() {
         return HookDecision::Pass;
     }
-    // Secure-Input gate is mac-only — Windows has no equivalent system API
-    // for detecting password-field focus. On Windows we just rely on the
-    // user not typing into a password field while armed.
-    #[cfg(target_os = "macos")]
-    if crate::secure_input::is_active() {
+    // Secure-Input gate (mac-only): pass everything through untouched, but
+    // still count a commit char so "the gate ate a trigger" is measurable.
+    if deps.secure_input_active {
+        if let Some(c) = evt.typed {
+            if c == deps.app_state.commit_char() || deps.matcher.is_commit_char(c) {
+                (deps.cb.on_blocked_commit)();
+            }
+        }
         return HookDecision::Pass;
     }
     tracing::trace!(
@@ -103,13 +113,10 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
     let now = Instant::now();
 
     if evt.is_backspace {
-        // Peek only — `run_undo` is the single consumer of the entry. (A
-        // consuming check here would pop the entry, leaving `run_undo` with
-        // nothing: the Backspace would be suppressed AND no undo performed.)
-        // During playback, Backspace counts toward the §2.6 panic ring
-        // instead of triggering undo.
+        // Peek only — `run_undo` is the sole consumer, and consuming here would
+        // suppress the Backspace with no undo. During playback it feeds §2.6.
         if !deps.app_state.is_playing() && deps.undo.has_recent(now) {
-            (deps.on_undo)();
+            (deps.cb.on_undo)();
             return HookDecision::Suppress;
         }
         deps.matcher.observe_backspace(now);
@@ -120,8 +127,17 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
     }
 
     if deps.app_state.is_playing() {
+        // Esc is the reflex abort: one press, and swallowed so the target app
+        // doesn't also close the dialog the user was typing into.
+        if evt.is_escape {
+            tracing::info!("Esc during playback — aborting");
+            deps.app_state
+                .cancel_playback_with(crate::telemetry::CancelReason::Esc);
+            return HookDecision::Suppress;
+        }
         if !evt.is_pure_modifier && deps.app_state.record_cancel_keystroke(now) {
-            deps.app_state.cancel_playback();
+            deps.app_state
+                .cancel_playback_with(crate::telemetry::CancelReason::UserKeystrokes);
         }
         if let Some(c) = evt.typed {
             deps.matcher.observe_char(c, now);
@@ -150,17 +166,12 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
         if deps.matcher.last_char() == Some('\\') {
             deps.matcher.pop_last_chars(1);
             deps.matcher.observe_char(c, now);
-            (deps.on_literal_commit)(c);
+            (deps.cb.on_literal_commit)(c);
             return HookDecision::Suppress;
         }
         let candidates = deps.matcher.try_match_all(c, now);
-        // Single high-signal diagnostic line on the commit-char path. Fires
-        // at most once per `>` typed by the user (rare, never spammy) and
-        // tells us in one log entry whether the matcher saw any candidates.
-        // If `candidates=0` here while the user *expected* a hit, the next
-        // place to look is the matcher index size (logged at startup) —
-        // a 0/0 means the prompt wasn't loaded; a 0/N means the trigger
-        // text doesn't match what's in the buffer.
+        // One line per user-typed `>`. `candidates=0` with a non-zero index
+        // means the trigger text didn't match; 0/0 means nothing was loaded.
         let buf_len = deps.matcher.buffer.read().len();
         let index_len = deps.matcher.index.read().len();
         let matched = !candidates.is_empty();
@@ -171,18 +182,13 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
             buf_len,
             index_len,
         );
-        // Notify the host (telemetry hook) that a commit was observed. This is
-        // separate from the on_fire callback because we need the no-match case
-        // too — `matched=false` is the most actionable signal for "user
-        // expected a fire that never happened".
-        (deps.on_commit_observed)(matched, index_len);
+        // Separate from `on_fire` because the no-match case matters most:
+        // `matched=false` is "the user expected a fire and got nothing".
+        (deps.cb.on_commit_observed)(matched, index_len);
         if matched {
             let typed_form = candidates[0].typed_form.clone();
-            // Pop everything from the trigger start to the buffer end —
-            // `pop_chars` includes any trailing whitespace typed between the
-            // trigger and the commit char (`build >`), which `trigger_chars`
-            // excludes. Popping the shorter count would leave residue that
-            // poisons the next 2s of matching.
+            // `pop_chars` runs to the buffer end so `build >` leaves no residue;
+            // `trigger_chars` would strand the space and poison the next match.
             let pop_chars = candidates[0].pop_chars;
             let candidate_ids: Vec<String> = candidates.into_iter().map(|m| m.prompt_id).collect();
             tracing::info!(
@@ -191,7 +197,7 @@ pub fn process_event(evt: &KeyEvent, deps: &HookDeps<'_>) -> HookDecision {
                 candidate_ids
             );
             deps.matcher.pop_last_chars(pop_chars);
-            (deps.on_fire)(candidate_ids, typed_form);
+            (deps.cb.on_fire)(candidate_ids, typed_form);
             return HookDecision::Suppress;
         }
         deps.matcher.observe_char(c, now);
@@ -206,81 +212,56 @@ pub fn spawn_grabbing_hook(
     matcher: Arc<MatcherState>,
     undo: Arc<UndoLog>,
     app_state: Arc<AppState>,
-    on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
-    on_undo: Arc<dyn Fn() + Send + Sync>,
-    on_literal_commit: Arc<dyn Fn(char) + Send + Sync>,
-    on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
+    cb: HookCallbacks,
 ) -> HookHandle {
     #[cfg(target_os = "macos")]
     {
-        spawn_macos(
-            matcher,
-            undo,
-            app_state,
-            on_fire,
-            on_undo,
-            on_literal_commit,
-            on_commit_observed,
-        );
+        spawn_macos(matcher, undo, app_state, cb);
     }
     #[cfg(target_os = "windows")]
     {
-        spawn_windows(
-            matcher,
-            undo,
-            app_state,
-            on_fire,
-            on_undo,
-            on_literal_commit,
-            on_commit_observed,
-        );
+        spawn_windows(matcher, undo, app_state, cb);
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (
-            matcher,
-            undo,
-            app_state,
-            on_fire,
-            on_undo,
-            on_literal_commit,
-            on_commit_observed,
-        );
+        let _ = (matcher, undo, app_state, cb);
     }
     HookHandle {
         _t: std::marker::PhantomData,
     }
 }
 
+/// macOS virtual keycode for Escape.
+#[cfg(target_os = "macos")]
+const KEY_CODE_ESCAPE_MAC: u16 = 53;
+
 #[cfg(target_os = "macos")]
 fn spawn_macos(
     matcher: Arc<MatcherState>,
     undo: Arc<UndoLog>,
     app_state: Arc<AppState>,
-    on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
-    on_undo: Arc<dyn Fn() + Send + Sync>,
-    on_literal_commit: Arc<dyn Fn(char) + Send + Sync>,
-    on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
+    cb: HookCallbacks,
 ) {
     use macos::EventHandler;
     let app_state_for_handler = app_state.clone();
     let handler: EventHandler = Arc::new(move |evt: macos::NativeKeyEvent| {
-        // macOS virtual keycodes: Return=36, Tab=48, KeypadEnter=76.
+        // macOS virtual keycodes: Return=36, Tab=48, KeypadEnter=76, Esc=53.
         let is_separator = matches!(evt.keycode, 36 | 48 | 76);
         let key = KeyEvent {
             typed: evt.typed,
             is_backspace: evt.is_backspace,
             is_pure_modifier: false, // macOS tap filters these at OS layer.
             is_separator,
+            is_escape: evt.keycode == KEY_CODE_ESCAPE_MAC,
         };
         let deps = HookDeps {
             matcher: &matcher,
             undo: &undo,
             app_state: &app_state_for_handler,
-            on_fire: &on_fire,
-            on_undo: &on_undo,
-            on_literal_commit: &on_literal_commit,
-            on_commit_observed: &on_commit_observed,
+            cb: &cb,
+            // Sampled per event: a cached value can be a poll interval stale,
+            // and stale-in-the-wrong-direction means touching a password field.
+            secure_input_active: crate::secure_input::is_active(),
         };
         match process_event(&key, &deps) {
             HookDecision::Pass => Some(()),
@@ -290,30 +271,16 @@ fn spawn_macos(
     macos::spawn(handler, app_state);
 }
 
-/// Re-spawn the macOS keyboard hook. Called from the Accessibility-status
-/// watcher when permission flips false→true after launch. Idempotent: if the
-/// previous tap is still alive, this is a no-op (caller checks `hook_alive`
-/// first, but we don't trust that — `macos::spawn` itself checks Accessibility
-/// before spawning).
+/// Re-spawn the macOS hook when Accessibility flips on after launch.
+/// Idempotent — `macos::spawn` re-checks permission itself.
 #[cfg(target_os = "macos")]
 pub fn respawn_macos(
     matcher: Arc<MatcherState>,
     undo: Arc<UndoLog>,
     app_state: Arc<AppState>,
-    on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
-    on_undo: Arc<dyn Fn() + Send + Sync>,
-    on_literal_commit: Arc<dyn Fn(char) + Send + Sync>,
-    on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
+    cb: HookCallbacks,
 ) {
-    spawn_macos(
-        matcher,
-        undo,
-        app_state,
-        on_fire,
-        on_undo,
-        on_literal_commit,
-        on_commit_observed,
-    );
+    spawn_macos(matcher, undo, app_state, cb);
 }
 
 #[cfg(target_os = "windows")]
@@ -321,253 +288,314 @@ fn spawn_windows(
     matcher: Arc<MatcherState>,
     undo: Arc<UndoLog>,
     app_state: Arc<AppState>,
-    on_fire: Arc<dyn Fn(Vec<crate::matcher::PromptId>, String) + Send + Sync>,
-    on_undo: Arc<dyn Fn() + Send + Sync>,
-    on_literal_commit: Arc<dyn Fn(char) + Send + Sync>,
-    on_commit_observed: Arc<dyn Fn(bool, usize) + Send + Sync>,
+    cb: HookCallbacks,
 ) {
-    // Native `WH_KEYBOARD_LL` hook — see `hook/windows.rs` for the full
-    // architecture rationale. Mirrors the macOS `CGEventTap` design,
-    // including filtering out our own injected events at the hook layer
-    // (via `LLKHF_INJECTED`) so the panic-ring doesn't see playback chars.
-    windows::spawn(
-        matcher,
-        undo,
-        app_state,
-        on_fire,
-        on_undo,
-        on_literal_commit,
-        on_commit_observed,
-    );
+    // Native `WH_KEYBOARD_LL`, mirroring the CGEventTap design — injected
+    // events are filtered here so the panic ring never sees playback chars.
+    windows::spawn(matcher, undo, app_state, cb);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::matcher::TriggerEntry;
+    use crate::telemetry::CancelReason;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    type FireCallback = Arc<dyn Fn(Vec<String>, String) + Send + Sync>;
-
-    fn make_deps_default() -> (Arc<MatcherState>, Arc<UndoLog>, Arc<AppState>) {
-        (
-            MatcherState::shared(),
-            Arc::new(UndoLog::new()),
-            AppState::shared(),
-        )
+    /// Owns everything `HookDeps` borrows, plus a counter per callback.
+    struct Harness {
+        matcher: Arc<MatcherState>,
+        undo: Arc<UndoLog>,
+        app_state: Arc<AppState>,
+        cb: HookCallbacks,
+        fires: Arc<AtomicUsize>,
+        undos: Arc<AtomicUsize>,
+        literals: Arc<AtomicUsize>,
+        commits: Arc<AtomicUsize>,
+        blocked: Arc<AtomicUsize>,
+        secure_input_active: bool,
     }
 
-    fn fire_count_callback() -> (FireCallback, Arc<AtomicUsize>) {
-        let count = Arc::new(AtomicUsize::new(0));
-        let count2 = count.clone();
-        let cb: FireCallback = Arc::new(move |_ids, _form| {
-            count2.fetch_add(1, Ordering::Relaxed);
-        });
-        (cb, count)
-    }
+    impl Harness {
+        fn new() -> Self {
+            let fires = Arc::new(AtomicUsize::new(0));
+            let undos = Arc::new(AtomicUsize::new(0));
+            let literals = Arc::new(AtomicUsize::new(0));
+            let commits = Arc::new(AtomicUsize::new(0));
+            let blocked = Arc::new(AtomicUsize::new(0));
+            let (f, u, l, c, b) = (
+                fires.clone(),
+                undos.clone(),
+                literals.clone(),
+                commits.clone(),
+                blocked.clone(),
+            );
+            Self {
+                matcher: MatcherState::shared(),
+                undo: Arc::new(UndoLog::new()),
+                app_state: AppState::shared(),
+                cb: HookCallbacks {
+                    on_fire: Arc::new(move |_ids, _form| {
+                        f.fetch_add(1, Ordering::Relaxed);
+                    }),
+                    on_undo: Arc::new(move || {
+                        u.fetch_add(1, Ordering::Relaxed);
+                    }),
+                    on_literal_commit: Arc::new(move |_c| {
+                        l.fetch_add(1, Ordering::Relaxed);
+                    }),
+                    on_commit_observed: Arc::new(move |_matched, _n| {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }),
+                    on_blocked_commit: Arc::new(move || {
+                        b.fetch_add(1, Ordering::Relaxed);
+                    }),
+                },
+                fires,
+                undos,
+                literals,
+                commits,
+                blocked,
+                secure_input_active: false,
+            }
+        }
 
-    fn no_op_undo_callback() -> Arc<dyn Fn() + Send + Sync> {
-        Arc::new(|| {})
-    }
+        fn armed() -> Self {
+            let h = Self::new();
+            h.app_state.set_armed(true);
+            h
+        }
 
-    fn no_op_literal_callback() -> Arc<dyn Fn(char) + Send + Sync> {
-        Arc::new(|_| {})
-    }
+        fn deps(&self) -> HookDeps<'_> {
+            HookDeps {
+                matcher: &self.matcher,
+                undo: &self.undo,
+                app_state: &self.app_state,
+                cb: &self.cb,
+                secure_input_active: self.secure_input_active,
+            }
+        }
 
-    fn no_op_commit_callback() -> Arc<dyn Fn(bool, usize) + Send + Sync> {
-        Arc::new(|_, _| {})
+        fn send(&self, evt: &KeyEvent) -> HookDecision {
+            process_event(evt, &self.deps())
+        }
+
+        fn type_str(&self, s: &str) {
+            for ch in s.chars() {
+                self.send(&ke(ch));
+            }
+        }
+
+        fn n(counter: &Arc<AtomicUsize>) -> usize {
+            counter.load(Ordering::Relaxed)
+        }
     }
 
     fn ke(c: char) -> KeyEvent {
         KeyEvent {
             typed: Some(c),
-            is_backspace: false,
-            is_pure_modifier: false,
-            is_separator: false,
+            ..Default::default()
+        }
+    }
+
+    fn backspace() -> KeyEvent {
+        KeyEvent {
+            is_backspace: true,
+            ..Default::default()
+        }
+    }
+
+    fn esc() -> KeyEvent {
+        KeyEvent {
+            is_escape: true,
+            ..Default::default()
+        }
+    }
+
+    fn build_trigger() -> TriggerEntry {
+        TriggerEntry {
+            canonical: "build".into(),
+            prompt_id: "p1".into(),
+            word_count: 1,
+            commit_char: '>',
         }
     }
 
     #[test]
     fn disarmed_passes_everything_through() {
-        let (matcher, undo, app_state) = make_deps_default();
-        let (on_fire, count) = fire_count_callback();
-        let on_undo = no_op_undo_callback();
-        let on_literal_commit = no_op_literal_callback();
-        let on_commit_observed = no_op_commit_callback();
-        let deps = HookDeps {
-            matcher: &matcher,
-            undo: &undo,
-            app_state: &app_state,
-            on_fire: &on_fire,
-            on_undo: &on_undo,
-            on_literal_commit: &on_literal_commit,
-            on_commit_observed: &on_commit_observed,
-        };
-        // Disarmed (default) — every event is Pass and never matches.
+        let h = Harness::new();
         for ch in ['b', 'u', 'i', 'l', 'd', '>'] {
-            let d = process_event(&ke(ch), &deps);
-            assert!(matches!(d, HookDecision::Pass));
+            assert!(matches!(h.send(&ke(ch)), HookDecision::Pass));
         }
-        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert_eq!(Harness::n(&h.fires), 0);
     }
 
     #[test]
     fn armed_with_no_trigger_passes_commit_char() {
-        let (matcher, undo, app_state) = make_deps_default();
-        app_state.set_armed(true);
-        let (on_fire, count) = fire_count_callback();
-        let on_undo = no_op_undo_callback();
-        let on_literal_commit = no_op_literal_callback();
-        let on_commit_observed = no_op_commit_callback();
-        let deps = HookDeps {
-            matcher: &matcher,
-            undo: &undo,
-            app_state: &app_state,
-            on_fire: &on_fire,
-            on_undo: &on_undo,
-            on_literal_commit: &on_literal_commit,
-            on_commit_observed: &on_commit_observed,
-        };
-        for ch in ['x', 'y', '>'] {
-            let _ = process_event(&ke(ch), &deps);
-        }
-        assert_eq!(count.load(Ordering::Relaxed), 0);
+        let h = Harness::armed();
+        h.type_str("xy>");
+        assert_eq!(Harness::n(&h.fires), 0);
+        assert_eq!(Harness::n(&h.commits), 1, "no-match commits still report");
     }
 
     #[test]
     fn armed_with_matching_trigger_fires_and_suppresses_commit() {
-        let (matcher, undo, app_state) = make_deps_default();
-        app_state.set_armed(true);
-        matcher.rebuild_index(vec![TriggerEntry {
-            canonical: "build".into(),
-            prompt_id: "p1".into(),
-            word_count: 1,
-            commit_char: '>',
-        }]);
-
-        let (on_fire, count) = fire_count_callback();
-        let on_undo = no_op_undo_callback();
-        let on_literal_commit = no_op_literal_callback();
-        let on_commit_observed = no_op_commit_callback();
-        let deps = HookDeps {
-            matcher: &matcher,
-            undo: &undo,
-            app_state: &app_state,
-            on_fire: &on_fire,
-            on_undo: &on_undo,
-            on_literal_commit: &on_literal_commit,
-            on_commit_observed: &on_commit_observed,
-        };
+        let h = Harness::armed();
+        h.matcher.rebuild_index(vec![build_trigger()]);
         for ch in ['B', 'u', 'i', 'l', 'd'] {
-            let d = process_event(&ke(ch), &deps);
-            assert!(matches!(d, HookDecision::Pass));
+            assert!(matches!(h.send(&ke(ch)), HookDecision::Pass));
         }
-        let d = process_event(&ke('>'), &deps);
         assert!(
-            matches!(d, HookDecision::Suppress),
+            matches!(h.send(&ke('>')), HookDecision::Suppress),
             "commit char must be suppressed when trigger matches"
         );
-        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert_eq!(Harness::n(&h.fires), 1);
+        assert_eq!(Harness::n(&h.commits), 1);
     }
 
     #[test]
     fn escape_hatch_for_commit_char() {
-        let (matcher, undo, app_state) = make_deps_default();
-        app_state.set_armed(true);
-        let (on_fire, count) = fire_count_callback();
-        let on_undo = no_op_undo_callback();
-        let literal_count = Arc::new(AtomicUsize::new(0));
-        let literal_count2 = literal_count.clone();
-        let on_literal_commit: Arc<dyn Fn(char) + Send + Sync> = Arc::new(move |c| {
-            assert_eq!(c, '>');
-            literal_count2.fetch_add(1, Ordering::Relaxed);
-        });
-        let on_commit_observed = no_op_commit_callback();
-        let deps = HookDeps {
-            matcher: &matcher,
-            undo: &undo,
-            app_state: &app_state,
-            on_fire: &on_fire,
-            on_undo: &on_undo,
-            on_literal_commit: &on_literal_commit,
-            on_commit_observed: &on_commit_observed,
-        };
-        // Type `\` then `>` — the hook suppresses `>` and asks the injector
-        // to replace the visible backslash with a literal commit char.
-        let _ = process_event(&ke('\\'), &deps);
-        let d = process_event(&ke('>'), &deps);
-        assert!(matches!(d, HookDecision::Suppress));
-        assert_eq!(count.load(Ordering::Relaxed), 0);
-        assert_eq!(literal_count.load(Ordering::Relaxed), 1);
-        assert_eq!(matcher.last_char(), Some('>'));
+        // `\>` types a literal commit char instead of firing.
+        let h = Harness::armed();
+        h.send(&ke('\\'));
+        assert!(matches!(h.send(&ke('>')), HookDecision::Suppress));
+        assert_eq!(Harness::n(&h.fires), 0);
+        assert_eq!(Harness::n(&h.literals), 1);
+        assert_eq!(h.matcher.last_char(), Some('>'));
     }
 
     #[test]
     fn backspace_during_undo_window_invokes_undo_callback() {
-        let (matcher, undo, app_state) = make_deps_default();
-        app_state.set_armed(true);
-        let undo_count = Arc::new(AtomicUsize::new(0));
-        let undo_count2 = undo_count.clone();
-        let on_fire: Arc<dyn Fn(Vec<String>, String) + Send + Sync> = Arc::new(|_, _| {});
-        let on_undo: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            undo_count2.fetch_add(1, Ordering::Relaxed);
-        });
-        let on_literal_commit = no_op_literal_callback();
-        let on_commit_observed = no_op_commit_callback();
-        // Seed the undo log with a recent expansion.
-        undo.record("Build".into(), 50);
-        let deps = HookDeps {
-            matcher: &matcher,
-            undo: &undo,
-            app_state: &app_state,
-            on_fire: &on_fire,
-            on_undo: &on_undo,
-            on_literal_commit: &on_literal_commit,
-            on_commit_observed: &on_commit_observed,
-        };
-        let key = KeyEvent {
-            typed: None,
-            is_backspace: true,
-            is_pure_modifier: false,
-            is_separator: false,
-        };
-        let d = process_event(&key, &deps);
-        assert!(matches!(d, HookDecision::Suppress));
-        assert_eq!(undo_count.load(Ordering::Relaxed), 1);
+        let h = Harness::armed();
+        h.undo.record("Build".into(), 50);
+        assert!(matches!(h.send(&backspace()), HookDecision::Suppress));
+        assert_eq!(Harness::n(&h.undos), 1);
     }
 
     #[test]
     fn pure_modifier_during_playback_does_not_count_toward_panic_ring() {
-        let (matcher, undo, app_state) = make_deps_default();
-        app_state.set_armed(true);
-        let cancel = app_state.begin_playback().expect("playback starts");
-        let (on_fire, _) = fire_count_callback();
-        let on_undo = no_op_undo_callback();
-        let on_literal_commit = no_op_literal_callback();
-        let on_commit_observed = no_op_commit_callback();
-        let deps = HookDeps {
-            matcher: &matcher,
-            undo: &undo,
-            app_state: &app_state,
-            on_fire: &on_fire,
-            on_undo: &on_undo,
-            on_literal_commit: &on_literal_commit,
-            on_commit_observed: &on_commit_observed,
-        };
-        // Three pure-modifier events in fast succession should NOT trigger
-        // the panic-cancel.
-        let modifier_event = KeyEvent {
-            typed: None,
-            is_backspace: false,
+        let h = Harness::armed();
+        let cancel = h.app_state.begin_playback().expect("playback starts");
+        let modifier = KeyEvent {
             is_pure_modifier: true,
-            is_separator: false,
+            ..Default::default()
         };
         for _ in 0..3 {
-            process_event(&modifier_event, &deps);
+            h.send(&modifier);
         }
+        assert!(!cancel.is_cancelled());
+    }
+
+    // ---- Esc as an explicit abort -------------------------------------
+
+    #[test]
+    fn escape_during_playback_cancels_immediately_and_is_swallowed() {
+        let h = Harness::armed();
+        let cancel = h.app_state.begin_playback().expect("playback starts");
         assert!(
-            !cancel.is_cancelled(),
-            "pure modifiers must not trip the panic ring"
+            matches!(h.send(&esc()), HookDecision::Suppress),
+            "Esc must not also reach the target app"
         );
+        assert!(cancel.is_cancelled(), "one Esc is enough");
+        assert_eq!(h.app_state.take_cancel_reason(), Some(CancelReason::Esc));
+    }
+
+    #[test]
+    fn escape_outside_playback_passes_through() {
+        let h = Harness::armed();
+        assert!(matches!(h.send(&esc()), HookDecision::Pass));
+        assert!(h.app_state.take_cancel_reason().is_none());
+    }
+
+    #[test]
+    fn escape_while_disarmed_passes_through() {
+        let h = Harness::new();
+        assert!(matches!(h.send(&esc()), HookDecision::Pass));
+    }
+
+    #[test]
+    fn panic_ring_still_reports_user_keystrokes() {
+        // Esc must not have stolen the ordinary abort's attribution.
+        let h = Harness::armed();
+        let cancel = h.app_state.begin_playback().expect("playback starts");
+        for ch in ['a', 's', 'd'] {
+            h.send(&ke(ch));
+        }
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            h.app_state.take_cancel_reason(),
+            Some(CancelReason::UserKeystrokes)
+        );
+    }
+
+    // ---- Secure-Input gate --------------------------------------------
+
+    #[test]
+    fn secure_input_passes_everything_and_never_suppresses() {
+        let mut h = Harness::armed();
+        h.secure_input_active = true;
+        h.matcher.rebuild_index(vec![build_trigger()]);
+        for ch in ['b', 'u', 'i', 'l', 'd', '>'] {
+            assert!(
+                matches!(h.send(&ke(ch)), HookDecision::Pass),
+                "nothing may be swallowed near a password field"
+            );
+        }
+        assert_eq!(Harness::n(&h.fires), 0);
+        assert_eq!(Harness::n(&h.commits), 0);
+    }
+
+    #[test]
+    fn secure_input_counts_the_commit_the_user_lost() {
+        // Separates "gate closed" (common, harmless) from "gate ate a trigger".
+        let mut h = Harness::armed();
+        h.secure_input_active = true;
+        h.type_str("build>");
+        assert_eq!(Harness::n(&h.blocked), 1);
+    }
+
+    #[test]
+    fn secure_input_does_not_count_ordinary_typing() {
+        let mut h = Harness::armed();
+        h.secure_input_active = true;
+        h.type_str("hunter2");
+        assert_eq!(Harness::n(&h.blocked), 0);
+    }
+
+    #[test]
+    fn secure_input_counts_per_prompt_commit_chars_too() {
+        let mut h = Harness::armed();
+        h.matcher.rebuild_index(vec![TriggerEntry {
+            canonical: "ship".into(),
+            prompt_id: "p2".into(),
+            word_count: 1,
+            commit_char: '!',
+        }]);
+        h.secure_input_active = true;
+        h.type_str("ship!");
+        assert_eq!(Harness::n(&h.blocked), 1);
+    }
+
+    #[test]
+    fn secure_input_gate_is_skipped_when_disarmed() {
+        // Disarmed short-circuits first — no phantom "lost trigger" counts.
+        let mut h = Harness::new();
+        h.secure_input_active = true;
+        h.type_str("build>");
+        assert_eq!(Harness::n(&h.blocked), 0);
+    }
+
+    #[test]
+    fn clearing_secure_input_restores_normal_matching() {
+        let mut h = Harness::armed();
+        h.matcher.rebuild_index(vec![build_trigger()]);
+        h.secure_input_active = true;
+        h.type_str("build>");
+        assert_eq!(Harness::n(&h.fires), 0);
+
+        h.secure_input_active = false;
+        h.type_str("build");
+        assert!(matches!(h.send(&ke('>')), HookDecision::Suppress));
+        assert_eq!(Harness::n(&h.fires), 1);
     }
 }

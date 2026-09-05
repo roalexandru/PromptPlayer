@@ -1,12 +1,6 @@
-//! Native macOS keyboard hook via `CGEventTap`.
-//!
-//! rdev's macOS path crashes on newer macOS because its `string_from_code`
-//! helper calls `TSMGetInputSourceProperty` from the tap callback thread,
-//! which violates dispatch-queue assertions and SIGTRAPs.
-//!
-//! We use `CGEventKeyboardGetUnicodeString` instead — that API reads the
-//! Unicode chars from the event directly without going through TSM, and is
-//! safe to call from the tap callback queue.
+//! Native macOS keyboard hook via `CGEventTap`. rdev SIGTRAPs here because its
+//! `string_from_code` calls TSM from the tap callback thread; we read chars with
+//! `CGEventKeyboardGetUnicodeString`, which is safe on that queue.
 
 use core_foundation::base::TCFType;
 use core_foundation::mach_port::CFMachPortRef;
@@ -88,18 +82,11 @@ pub struct NativeKeyEvent {
 
 const KEY_CODE_DELETE: u16 = 51; // backspace on US layout
 
-/// Spawn the CGEventTap on a dedicated thread with its own CFRunLoop.
-///
-/// `status` flips true once the tap is installed and listening, false on failure
-/// or when the run loop exits. The frontend reads this through `AppState` to
-/// surface a "grant Accessibility" row in the tray; the watcher thread re-spawns
-/// us when permission flips on. Returns true iff the tap installed successfully
-/// — caller can use that to decide whether to retry without consulting `status`.
+/// Spawn the CGEventTap on its own thread and CFRunLoop. `status` tracks
+/// liveness; the return value says whether the install itself succeeded.
 pub fn spawn(handler: EventHandler, status: std::sync::Arc<crate::state::AppState>) -> bool {
-    // Pre-flight: CGEventTapCreate is the slow path (3-5s on permission denial
-    // because the system shows its own diagnostic dialog). Skip it cleanly when
-    // we already know permission is missing — the watcher will respawn us when
-    // it's granted.
+    // CGEventTapCreate takes 3-5s on denial (the system shows a dialog), so
+    // skip it when we already know permission is missing.
     if !crate::tcc::is_accessibility_trusted() {
         tracing::warn!("Accessibility not trusted — CGEventTap install skipped");
         status.set_hook_alive(false);
@@ -110,9 +97,8 @@ pub fn spawn(handler: EventHandler, status: std::sync::Arc<crate::state::AppStat
         .name("prompt-player-cgevent-tap".into())
         .spawn(move || run_tap_thread(handler, status_for_thread))
         .expect("spawn cgevent tap thread");
-    // Tap install happens asynchronously on the spawned thread; status flips
-    // true inside `run_tap_thread`. We treat the spawn itself as success — the
-    // watcher polls `hook_alive` and re-spawns if it doesn't flip true.
+    // Install is async on the spawned thread, so the spawn itself counts as
+    // success; the watcher respawns if `hook_alive` never flips.
     true
 }
 
@@ -137,12 +123,8 @@ fn run_tap_thread(handler: EventHandler, status: std::sync::Arc<crate::state::Ap
         )
     };
     if tap_port.is_null() {
-        // Surface as ERROR so the level gets through any `info` filter and
-        // shows up in Console.app even if the user hasn't tweaked subsystem
-        // filters. The Accessibility hint covers the 95% case but other
-        // failure modes (MDM endpoint protection, sandbox restrictions) hit
-        // the same branch — make that explicit so we don't gaslight users
-        // whose permission is genuinely granted.
+        // ERROR so it clears any `info` filter in Console.app. Accessibility is
+        // the common cause, but MDM and sandboxing land here too — say so.
         tracing::error!(
             "CGEventTapCreate returned null. Likely causes: \
              (1) Accessibility permission denied, \
@@ -207,9 +189,8 @@ extern "C" fn tap_callback(
         return event;
     }
 
-    // Suppress our own injected keystrokes — when the typer fires, its events
-    // would otherwise bounce back through the tap and look like the user typing,
-    // which then cancels playback at the §2.6 3-keystroke threshold.
+    // Drop our own injected keys, or playback looks like user typing and
+    // self-cancels at the §2.6 threshold.
     let source_pid =
         unsafe { CGEventGetIntegerValueField(event, KCG_EVENT_SOURCE_UNIX_PROCESS_ID) } as u32;
     let our_pid = std::process::id();

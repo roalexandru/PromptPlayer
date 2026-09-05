@@ -64,16 +64,12 @@ pub struct Prompt {
     pub hotkey: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Per-prompt enable flag. When the global `armed` switch is on, only
-    /// prompts with `enabled: true` participate in trigger-matching and
-    /// hotkey registration. Defaults to `true` so existing prompts keep
-    /// working without touching their files.
+    /// Only enabled prompts take part in matching and hotkey registration.
+    /// Defaults true so existing files keep working untouched.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Tray surfacing flag. The menu-bar popup shows ONLY pinned prompts
-    /// (Apple Shortcuts model). Unpinned prompts still live in the library
-    /// and still fire from triggers — they're just not in the tray menu.
-    /// Defaults to `false` so existing prompts don't crowd the tray.
+    /// The tray shows only pinned prompts (Apple Shortcuts model); unpinned ones
+    /// still fire from triggers. Defaults false so the tray stays uncrowded.
     #[serde(default)]
     pub pinned: bool,
     /// Per-prompt override for how embedded newlines are typed. `None` follows

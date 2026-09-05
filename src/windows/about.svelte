@@ -47,9 +47,8 @@
     }
   }
 
-  // Open the GitHub project page in the user's default browser. WebView2
-  // (Windows) and WKWebView (macOS) both no-op `window.open(url, "_blank")`
-  // by default; the `open_external` IPC shells out to the OS handler.
+  // Both webviews no-op `window.open(url, "_blank")`, so this goes through the
+  // `open_external` IPC to reach the OS handler.
   async function openProject() {
     try {
       await ipc.openExternal("https://github.com/roalexandru/PromptPlayer");

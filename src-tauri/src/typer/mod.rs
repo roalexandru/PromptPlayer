@@ -1,9 +1,6 @@
-//! §3 — typing engine.
-//!
-//! The schedule (`schedule.rs`) is computed up front; the Typer (`mod.rs`)
-//! sleeps to each absolute time and asks the Injector to fire the keystroke.
-//! Cancellation flag is checked between every key.
-//! On cancel, the Typer releases all modifiers (§2.7 defensive).
+//! §3 — typing engine. Sleeps to each absolute time in the pre-computed
+//! schedule, checking the cancel flag between keys and releasing modifiers
+//! on abort (§2.7).
 
 pub mod distributions;
 pub mod profiles;
@@ -106,15 +103,8 @@ impl Default for PlaybackControl {
     }
 }
 
-/// Raises the OS timer resolution to 1 ms for the lifetime of the guard.
-///
-/// On Windows, `thread::sleep` honors only the current timer period, which
-/// defaults to ~15.6 ms (and is per-process since Win10 2004). Without this,
-/// every scheduled IKI gets re-quantized to a multiple of the timer period —
-/// re-introducing the exact "everything is a multiple of 16 ms" tell the
-/// jitter model (`distributions::jitter`) works to erase, and slowing the
-/// fast profiles well below their scheduled cadence. No-op on other platforms,
-/// where `thread::sleep` is already sub-millisecond.
+/// Raise the OS timer resolution to 1 ms while held. Windows' ~15.6ms default
+/// would re-quantize every IKI to a multiple of 16 ms. No-op elsewhere.
 pub struct TimerResolutionGuard {
     #[cfg(target_os = "windows")]
     active: bool,
@@ -149,20 +139,14 @@ impl Drop for TimerResolutionGuard {
     }
 }
 
-/// Trait abstracting keystroke synthesis. Implemented per platform.
-///
-/// Intentionally NOT `Send`: the macOS `Enigo` impl holds a `CGEventSource`
-/// raw pointer that can't cross threads. The Typer pattern is "create the
-/// injector on the typer thread, then play() the pre-computed schedule" —
-/// the schedule itself is `Send`, the injector is constructed thread-local.
+/// Per-platform keystroke synthesis, deliberately not `Send` — injectors are
+/// built on the typer thread while only the schedule crosses threads.
 pub trait Injector {
     fn type_char(&mut self, c: char);
     fn press_backspace(&mut self);
     fn press_enter(&mut self);
-    /// Insert a line break WITHOUT submitting. In chat apps (the primary
-    /// target — ChatGPT, Claude, Slack, Discord) a bare Enter sends the
-    /// message, so an embedded `\n` typed as Enter would fire the prompt
-    /// mid-body. Shift+Enter is the universal "newline, don't send".
+    /// Line break without submitting. A bare Enter sends the message in every
+    /// chat app, so an embedded `\n` would fire the prompt mid-body.
     fn press_shift_enter(&mut self);
     /// Defensive: release any modifier keys that might be physically held.
     /// Called on abort so we don't leave Shift/Ctrl/etc. stuck (§2.7).
@@ -172,21 +156,16 @@ pub trait Injector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayOutcome {
     pub completed: bool,
-    /// Net visible characters delivered so far. Backspaces saturating-subtract
-    /// one char so cancellation telemetry reflects partial playback instead
-    /// of always reporting all-or-nothing.
+    /// Net visible chars so far; backspaces saturating-subtract, so cancel
+    /// telemetry reports partial progress rather than all-or-nothing.
     pub visible_chars: usize,
-    /// True when playback aborted because the foreground app changed (vs. the
-    /// user's panic keystrokes / kill-switch). Lets the caller report a
-    /// distinct telemetry reason.
+    /// Aborted by a foreground change rather than the user's keystrokes, so the
+    /// caller can report a distinct reason.
     pub focus_changed: bool,
 }
 
-/// Plays a pre-computed schedule. Returns `true` on full completion, `false` if cancelled.
-///
-/// `cancel` is checked before every key. When set, the Typer:
-/// 1. Stops issuing keystrokes.
-/// 2. Calls `injector.release_all_modifiers()` (§2.7).
+/// Play a pre-computed schedule; false if cancelled. `cancel` is checked before
+/// every key, and a set flag stops typing and releases modifiers (§2.7).
 pub fn play(
     schedule: &[ScheduledKey],
     injector: &mut dyn Injector,
@@ -203,11 +182,8 @@ pub fn play_with_progress(
     play_guarded(schedule, injector, cancel, None)
 }
 
-/// Like `play_with_progress`, but also aborts if `focus_lost` returns `true`.
-/// `focus_lost` is polled on the same cadence as the cancel flag but throttled
-/// to ~100ms so the foreground query stays cheap. When it fires, playback stops
-/// and modifiers are released, exactly like a cancel — but the outcome carries
-/// `focus_changed: true` so the caller can distinguish the reason.
+/// `play_with_progress` plus a `focus_lost` abort, polled with the cancel flag
+/// but throttled to ~100ms. Behaves like a cancel, but flags `focus_changed`.
 pub fn play_guarded(
     schedule: &[ScheduledKey],
     injector: &mut dyn Injector,
@@ -474,9 +450,8 @@ mod tests {
 
     #[test]
     fn embedded_newline_routes_to_shift_enter() {
-        // An embedded '\n' must NOT be typed as a plain char or a bare Enter
-        // (which would submit mid-prompt in a chat app) — it goes through
-        // press_shift_enter.
+        // Never a plain char or bare Enter — that submits mid-prompt in a chat
+        // app. Goes through `press_shift_enter`.
         let schedule = vec![
             ScheduledKey {
                 key: Key::Char('a'),

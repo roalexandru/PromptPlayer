@@ -1,13 +1,8 @@
-//! Windows activation helpers — mirror the macOS module's surface so call
-//! sites can use a single `crate::platform::*` import per cfg.
+//! Windows activation helpers, mirroring the macOS module's surface so call
+//! sites need one `crate::platform::*` import per cfg.
 //!
-//! - `activate_app` is a no-op on Windows. macOS needs an explicit
-//!   `[NSApp activateIgnoringOtherApps:YES]` for an `.accessory` (Dockless)
-//!   app to bring its windows forward; Windows has no equivalent gate —
-//!   `ShowWindow + SetForegroundWindow` already does the right thing.
-//! - `order_panel_front_no_activate` shows the popup WITHOUT activating it,
-//!   relying on the `WS_EX_NOACTIVATE` ex-style applied by
-//!   `configure_popover_window`.
+//! `activate_app` is a no-op — Windows has no `.accessory` gate to get past.
+//! `order_panel_front_no_activate` relies on the `WS_EX_NOACTIVATE` ex-style.
 
 use tauri::WebviewWindow;
 use windows::Win32::Foundation::HWND;
@@ -24,9 +19,8 @@ const SW_SHOWNOACTIVATE: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(4);
 /// No-op on Windows — see module docs.
 pub fn activate_app() {}
 
-/// Show the popup window without activating it. With `WS_EX_NOACTIVATE` set
-/// (see `panel::configure_popover_window`), this shows the window topmost and
-/// the user's foreground app keeps its caret.
+/// Show the popup without activating. With `WS_EX_NOACTIVATE` set, it comes up
+/// topmost while the foreground app keeps its caret.
 pub fn order_panel_front_no_activate(window: &WebviewWindow) {
     let Ok(hwnd) = window.hwnd() else { return };
     let hwnd = HWND(hwnd.0 as _);

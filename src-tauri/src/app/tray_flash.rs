@@ -7,13 +7,18 @@
 //! popup, no notification), so without it a kill that failed and a kill that
 //! worked look identical from the stage.
 //!
-//! The red icon is derived from the tray icon already baked into the binary
-//! rather than shipped as a second asset, so it automatically follows the
-//! per-platform icon choice (macOS template glyph, Windows light/dark variant).
+//! The red icon is derived from the base tray asset rather than shipped as a
+//! second one, so it follows the per-platform icon choice automatically
+//! (macOS template glyph, Windows light/dark variant).
+//!
+//! Restoring goes through `tray_icon::refresh` rather than re-setting the base
+//! bytes: that module owns the attention badge, and re-setting the plain icon
+//! here would silently wipe a "hook is dead" or "update available" dot.
 
+use crate::tray_icon;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::image::Image;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 /// How long the icon stays red. Long enough to register in peripheral vision,
 /// short enough not to look like a stuck error state.
@@ -65,11 +70,10 @@ pub fn flash_kill(app: &AppHandle) {
 }
 
 fn flash_blocking(app: &AppHandle) {
-    let Some(tray) = app.tray_by_id("main") else {
+    let Some(tray) = app.tray_by_id(tray_icon::TRAY_ID) else {
         return;
     };
-    let base_bytes = crate::app::setup::tray_icon_bytes();
-    let Ok(base) = Image::from_bytes(base_bytes) else {
+    let Ok(base) = Image::from_bytes(tray_icon::base_bytes()) else {
         tracing::debug!("tray flash: could not decode the tray icon");
         return;
     };
@@ -80,20 +84,15 @@ fn flash_blocking(app: &AppHandle) {
     }
     // macOS tints template images to match the menu bar, which would undo the
     // red. Turn that off for the duration of the flash.
-    #[cfg(target_os = "macos")]
-    let _ = tray.set_icon_as_template(false);
+    if let Err(e) = tray.set_icon_as_template(false) {
+        tracing::debug!("tray flash: set_icon_as_template failed: {}", e);
+    }
 
     std::thread::sleep(std::time::Duration::from_millis(FLASH_MS));
 
-    #[cfg(target_os = "macos")]
-    let _ = tray.set_icon_as_template(true);
-    // Re-read the bytes rather than reusing `base`: on Windows the theme
-    // watcher may have swapped light/dark while we were red.
-    if let Ok(restored) = Image::from_bytes(crate::app::setup::tray_icon_bytes()) {
-        if let Err(e) = tray.set_icon(Some(restored)) {
-            tracing::warn!("tray flash: could not restore the icon: {}", e);
-        }
-    }
+    // Hand the icon back to the module that owns it, so the attention badge
+    // and the template flag both come back correct.
+    tray_icon::refresh(app);
 }
 
 #[cfg(test)]
@@ -133,8 +132,7 @@ mod tests {
     fn the_real_tray_icon_can_be_tinted() {
         // Guards the baked-in asset actually decoding — a bad include_bytes!
         // path would otherwise only surface as a silent no-op at runtime.
-        let base = Image::from_bytes(crate::app::setup::tray_icon_bytes())
-            .expect("bundled tray icon decodes");
+        let base = Image::from_bytes(tray_icon::base_bytes()).expect("bundled tray icon decodes");
         let out = tinted_red(&base);
         assert_eq!((out.width(), out.height()), (base.width(), base.height()));
     }

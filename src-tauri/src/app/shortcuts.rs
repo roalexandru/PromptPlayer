@@ -17,14 +17,13 @@ use crate::app::context::AppContext;
 use crate::app::FireService;
 use crate::config::AppConfig;
 use crate::hotkey;
-use crate::telemetry::{self, TelemetryEvent};
+use crate::telemetry::{self, CancelReason, HotkeyFailReason, PickerSource, TelemetryEvent};
 use std::str::FromStr;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-/// Primary modifier — Cmd on macOS, Ctrl on Windows. Using `SUPER` directly
-/// on Windows would map to the Win key, which collides with the OS-reserved
-/// Win+Shift+P (projection menu) and other system globals.
+/// Cmd on macOS, Ctrl on Windows. `SUPER` would be the Win key there, which
+/// collides with OS-reserved combos like Win+Shift+P.
 #[cfg(target_os = "macos")]
 const PRIMARY: Modifiers = Modifiers::SUPER;
 #[cfg(not(target_os = "macos"))]
@@ -175,21 +174,29 @@ pub fn register(
                 if shortcut == shortcut_arm {
                     let new = ctx_for_handler.state.toggle_armed();
                     tracing::info!("hotkey arm → enabled={}", new);
-                    refresh_tray_popup(&app_handle);
-                    telemetry::send(&app_handle, TelemetryEvent::ArmToggled { armed: new });
+                    set_armed_and_report(&app_handle, &ctx_for_handler, new);
                 } else if shortcut == shortcut_picker {
                     summon_picker(&app_handle, &ctx_for_handler);
                 } else if shortcut == shortcut_kill {
                     tracing::warn!("KILL-SWITCH invoked");
-                    ctx_for_handler.state.cancel_playback();
+                    let was_playing = ctx_for_handler.state.is_playing();
+                    ctx_for_handler
+                        .state
+                        .cancel_playback_with(CancelReason::Kill);
                     // §2.7 — the only feedback that an abort landed, since
                     // cancellation is otherwise silent by design.
                     crate::app::tray_flash::flash_kill(&app_handle);
-                    telemetry::send(&app_handle, TelemetryEvent::PromptKilled);
+                    telemetry::send(&app_handle, TelemetryEvent::PromptKilled { was_playing });
                 } else if shortcut == shortcut_panic {
                     tracing::warn!("PANIC-RESET invoked");
-                    ctx_for_handler.state.cancel_playback();
-                    ctx_for_handler.state.set_armed(false);
+                    let was_playing = ctx_for_handler.state.is_playing();
+                    ctx_for_handler
+                        .state
+                        .cancel_playback_with(CancelReason::Kill);
+                    telemetry::send(&app_handle, TelemetryEvent::PromptKilled { was_playing });
+                    if ctx_for_handler.state.is_armed() {
+                        set_armed_and_report(&app_handle, &ctx_for_handler, false);
+                    }
                     if let Ok(mut inj) = crate::inject::EnigoInjector::new() {
                         use crate::typer::Injector;
                         inj.release_all_modifiers();
@@ -259,6 +266,8 @@ pub fn register(
 /// failures so a rebind can report them.
 fn register_current(app: &AppHandle, ctx: &AppContext) -> Vec<String> {
     let gs = app.global_shortcut();
+    // Soft-fail: Windows rejects combos another app already claimed, and one
+    // conflict must not take out the rest.
     let mut failures = Vec::new();
     for (sc, label) in ctx.globals.read().labelled() {
         if let Err(e) = gs.register(sc) {
@@ -300,16 +309,33 @@ pub fn reregister_globals(app: &AppHandle, ctx: &AppContext) -> Vec<String> {
 }
 
 fn summon_picker(app: &AppHandle, ctx: &AppContext) {
-    // Picker open path used by both global shortcut and tray menu. We hop to
-    // the main thread because the AppKit calls (NSEvent.mouseLocation,
-    // NSScreen.screens, setFrameOrigin:) require it. The actual sequence
-    // (capture-if-not-visible, rebuild search, position, show) lives in
-    // `commands::picker::summon_picker` so every entry point behaves alike.
+    // Hop to the main thread: the AppKit positioning calls require it. The
+    // sequence itself lives in `commands::picker::summon_picker`.
     let app_for_main = app.clone();
     let ctx_for_main = ctx.clone();
     let _ = app.run_on_main_thread(move || {
-        crate::commands::picker::summon_picker(&app_for_main, &ctx_for_main);
+        crate::commands::picker::summon_picker(
+            &app_for_main,
+            &ctx_for_main,
+            PickerSource::Shortcut,
+            crate::commands::picker::FocusCapture::Take,
+        );
     });
+}
+
+/// Apply an armed state everywhere: runtime flag, persisted setting, tray, and
+/// telemetry. `hook_alive` rides along because arming a dead hook does nothing.
+pub fn set_armed_and_report(app: &AppHandle, ctx: &AppContext, armed: bool) {
+    ctx.state.set_armed(armed);
+    ctx.settings.update(|s| s.armed = armed);
+    refresh_tray_popup(app);
+    telemetry::send(
+        app,
+        TelemetryEvent::ArmToggled {
+            armed,
+            hook_alive: ctx.state.hook_alive(),
+        },
+    );
 }
 
 /// Re-register all prompt hotkeys after a library hot-reload or save.
@@ -334,20 +360,38 @@ pub fn rebuild_prompt_hotkeys(app: &AppHandle, ctx: &AppContext) {
             continue;
         }
         let normalized = hotkey::normalize(hk);
+        // A hotkey that fails to register just silently never works, so both
+        // failure modes are reported rather than only logged.
         match Shortcut::from_str(&normalized) {
             Ok(s) => match gs.register(s) {
                 Ok(()) => {
                     tracing::info!("registered hotkey {} → {}", hk, p.id);
                     new_map.insert(hk.clone(), p.id.clone());
                 }
-                Err(e) => tracing::warn!("hotkey {} register failed: {}", hk, e),
+                Err(e) => {
+                    tracing::warn!("hotkey {} register failed: {}", hk, e);
+                    telemetry::send(
+                        app,
+                        TelemetryEvent::HotkeyRegisterFailed {
+                            reason: HotkeyFailReason::Conflict,
+                        },
+                    );
+                }
             },
-            Err(e) => tracing::warn!(
-                "hotkey {} unparseable (normalized: {}): {}",
-                hk,
-                normalized,
-                e
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    "hotkey {} unparseable (normalized: {}): {}",
+                    hk,
+                    normalized,
+                    e
+                );
+                telemetry::send(
+                    app,
+                    TelemetryEvent::HotkeyRegisterFailed {
+                        reason: HotkeyFailReason::Unparseable,
+                    },
+                );
+            }
         }
     }
     *ctx.hotkeys.write() = new_map;

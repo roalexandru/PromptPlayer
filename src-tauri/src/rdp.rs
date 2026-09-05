@@ -1,14 +1,6 @@
-//! §9.3 — RDP host-mode detection.
-//!
-//! When the foreground app is a recognized RDP/VM client, switch to RDP-mode
-//! timing per §9.3:
-//!  - Minimum inter-key delay floor: 30 ms.
-//!  - Speed multiplier: ×1.3 slower than configured profile.
-//!  - Disable clipboard fallback (RDP clipboard sync is unreliable).
-//!  - Backspace coalescing: send single events, not bursts.
-//!
-//! All four are already implemented in `typer/schedule.rs` via
-//! `ScheduleOptions { rdp_mode: true }`. This module is the detection layer.
+//! §9.3 — detect a foreground RDP/VM client so the typer can switch to RDP
+//! timing: a 30 ms floor, ×1.3 slower, no clipboard fallback, and uncoalesced
+//! backspaces. Those live in `typer/schedule.rs`; this is only detection.
 
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -35,9 +27,8 @@ pub enum RdpMode {
     HostSide,
 }
 
-/// RDP-client list. The defaults below cover the major clients; users who
-/// need to add a custom client edit `promptplayer.yaml` directly (no
-/// dedicated Settings UI).
+/// Known RDP clients. A custom one means editing `promptplayer.yaml` — there's
+/// no Settings UI for it.
 #[derive(Debug, Clone)]
 pub struct RdpRegistry {
     inner: Arc<RwLock<Vec<String>>>,

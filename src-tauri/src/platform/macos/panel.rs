@@ -1,21 +1,8 @@
-//! NSPanel configuration — the canonical Spotlight/Raycast/Hammerspoon recipe
-//! for a borderless utility panel that:
+//! NSPanel setup — the Spotlight/Raycast recipe. The `canBecomeKeyWindow`
+//! override is what lets a nonactivating panel receive keys at all; the rest is
+//! style mask, collection behavior and window level, set below.
 //!
-//! 1. Is a subclassed `NSPanel` overriding `-canBecomeKeyWindow` → `YES`.
-//!    This is the trick that lets a `nonActivatingPanel` actually receive
-//!    keystrokes — without it the panel can never be key, so keys flow to
-//!    the underlying app no matter what other flags are set.
-//! 2. Has `styleMask |= NonactivatingPanel` so the panel can be key without
-//!    triggering app activation (which would switch Spaces).
-//! 3. Has `collectionBehavior = CanJoinAllSpaces | FullScreenAuxiliary` so
-//!    the panel surfaces on whatever Space is current (incl. fullscreen).
-//! 4. Has `level = NSPopUpMenuWindowLevel` (101).
-//! 5. Is shown via `makeKeyAndOrderFront(nil)`. **Never** call
-//!    `NSApp.activate(ignoringOtherApps:)` — that's what was switching
-//!    Spaces on every previous attempt. With `.accessory` activation policy
-//!    + the space-neutral library window (see `make_window_space_neutral`),
-//!      activation does not switch Spaces, so we activate the app for the
-//!      picker (it needs key/focus) but not for the popover.
+//! Never `NSApp.activate(ignoring:)` — that is what kept switching Spaces.
 
 use cocoa::base::id;
 use objc::runtime::Class;
@@ -26,10 +13,8 @@ extern "C" {
     fn object_setClass(obj: id, cls: *const Class) -> *const Class;
 }
 
-/// Configuration for an NSPanel that's about to be installed onto a Tauri
-/// `WebviewWindow`. `Default` matches what the picker needs; the popover
-/// uses a slightly different combination (no `can_become_key`, different
-/// collection-behavior bitset).
+/// NSPanel settings for a Tauri `WebviewWindow`. `Default` is the picker's;
+/// the popover differs (no `can_become_key`, other collection behavior).
 pub struct PanelOptions {
     /// Subclass NSPanel with a runtime class overriding `canBecomeKeyWindow`
     /// → YES. Required for keyboard-input-receiving panels (the picker).
@@ -91,9 +76,8 @@ fn apply_options(window: &tauri::WebviewWindow, opts: &PanelOptions) {
     unsafe {
         let ns_window: id = ns_window_ptr as id;
 
-        // Re-class the window to NSPanel (or our `canBecomeKey` subclass).
-        // After this the same object responds to NSPanel-only behaviors
-        // and the NonactivatingPanel style flag becomes effective.
+        // Re-class to NSPanel (or the `canBecomeKey` subclass) so NSPanel-only
+        // behavior and the NonactivatingPanel flag take effect.
         let target_cls = if opts.can_become_key {
             register_picker_panel_class()
         } else {
@@ -131,12 +115,8 @@ fn apply_options(window: &tauri::WebviewWindow, opts: &PanelOptions) {
     }
 }
 
-/// Apply `CanJoinAllSpaces | FullScreenAuxiliary` to the library / about
-/// windows so when our app is activated, macOS surfaces the window on the
-/// CURRENT Space instead of switching the user back to the Space where the
-/// app was launched. Without this, regular `NSWindow`s on an `.accessory`
-/// app get bound to the launch Space and look "invisible" when shown from
-/// a tray-popover click on a different Space.
+/// Make plain windows surface on the current Space. Otherwise an `.accessory`
+/// app binds them to the launch Space and they look invisible elsewhere.
 pub fn make_window_space_neutral(window: &tauri::WebviewWindow) {
     let Ok(ns_window_ptr) = window.ns_window() else {
         return;
@@ -148,14 +128,8 @@ pub fn make_window_space_neutral(window: &tauri::WebviewWindow) {
     }
 }
 
-/// Force a regular (non-panel) window to the very front of the window
-/// stack, regardless of who currently has key focus. Tauri's `show()` +
-/// `set_focus()` sequence is enough when the app is the foreground app,
-/// but on `.accessory` apps the OS sometimes refuses focus transfer and
-/// the window stays buried behind whichever app the user clicked from.
-/// `orderFrontRegardless` is the AppKit-blessed way out — it raises the
-/// window's z-order without requiring activation. Used by `show_window`
-/// after the standard `set_focus()` so library / about always surface.
+/// Raise a window without activating. `.accessory` apps sometimes get focus
+/// transfer refused, leaving the window buried behind the caller.
 pub fn order_window_front_regardless(window: &tauri::WebviewWindow) {
     let Ok(ns_window_ptr) = window.ns_window() else {
         return;
@@ -166,16 +140,13 @@ pub fn order_window_front_regardless(window: &tauri::WebviewWindow) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Runtime Obj-C class registration: `PromptPlayerKeyPanel` overrides
-// `canBecomeKeyWindow` and `canBecomeMainWindow` to return YES.
-// ---------------------------------------------------------------------------
+// Runtime Obj-C registration: `PromptPlayerKeyPanel` returns YES from
+// `canBecomeKeyWindow` and `canBecomeMainWindow`.
 
 /// Wrapper around a static `*const Class` so we can stash it in `OnceLock`.
 struct PanelClass(*const Class);
-// SAFETY: pointer is to an Obj-C class registered for the process lifetime.
-// Class metadata is immutable after registration, so the pointer is safe to
-// share across threads.
+// SAFETY: the class lives for the process lifetime and its metadata is
+// immutable after registration, so sharing the pointer is safe.
 unsafe impl Send for PanelClass {}
 unsafe impl Sync for PanelClass {}
 
@@ -230,9 +201,8 @@ mod tests {
         let p = &PanelOptions::POPOVER;
         assert!(!p.can_become_key);
         assert!(p.accepts_mouse_moved);
-        // MoveToActiveSpace, not CanJoinAllSpaces — the popover anchors to
-        // the active Space; CanJoinAllSpaces would make it appear duplicated
-        // across Mission Control thumbnails.
+        // MoveToActiveSpace, not CanJoinAllSpaces — the latter duplicates the
+        // popover across Mission Control thumbnails.
         assert!(p.collection_behavior & COLLECTION_MOVE_TO_ACTIVE_SPACE != 0);
     }
 

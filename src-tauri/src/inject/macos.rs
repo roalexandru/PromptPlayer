@@ -1,14 +1,8 @@
-//! macOS-specific keystroke synthesis notes.
+//! macOS keystroke synthesis. Per-key typing goes through `enigo`, which
+//! already uses `CGEventCreateKeyboardEvent`.
 //!
-//! `enigo` already uses `CGEventCreateKeyboardEvent`; for Phase 1 we rely on it
-//! directly via `inject::EnigoInjector`. Phase 9 may add a Unicode-string fast-path
-//! for runs of non-ASCII chars where `CGEventKeyboardSetUnicodeString` is faster
-//! than per-key events.
-//!
-//! `paste_via_clipboard` writes the body to `NSPasteboard.generalPasteboard`,
-//! synthesizes Cmd+V via CGEvent, waits for the target app to consume the
-//! paste, then restores the prior pasteboard text. Same shape as the Windows
-//! impl; see `inject/mod.rs` for the cross-platform entry point.
+//! `paste_via_clipboard` writes to `NSPasteboard`, synthesizes Cmd+V, waits for
+//! the target to consume it, then restores — same shape as the Windows impl.
 
 use super::PasteError;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
@@ -36,14 +30,8 @@ pub(super) fn paste_via_clipboard(body: &str) -> Result<(), PasteError> {
         return Err(PasteError::Injection(e));
     }
 
-    // 4. Let the paste land before we overwrite the pasteboard. The Cmd+V
-    //    keystroke is delivered asynchronously; Electron/browser chat apps
-    //    (the main target) can read the pasteboard well after the keystroke
-    //    under load. Restoring too early makes them paste the user's PREVIOUS
-    //    clipboard — potentially private content, live on stage. 250ms is
-    //    imperceptible (the text is already on screen) and covers slow
-    //    consumers; with playbacks mutually exclusive nothing else needs the
-    //    fire thread during this window.
+    // 4. Let the paste land first. Cmd+V is async, and restoring early makes a
+    //    loaded app paste the user's previous — possibly private — clipboard.
     std::thread::sleep(Duration::from_millis(250));
 
     // 5. Restore every pasteboard flavor we could snapshot.
@@ -110,9 +98,8 @@ fn write_pasteboard_string(text: &str) -> Result<(), String> {
         // `clearContents` returns the new change count; we don't track it.
         let _ = pb.clearContents();
         let ns_text: Retained<NSString> = NSString::from_str(text);
-        // `setString:forType:` is the simplest writer that handles a single
-        // textual flavor; we don't need writeObjects:'s array shape for one
-        // string. Returns BOOL: NO on failure (extremely rare in practice).
+        // Simplest single-flavor writer; `writeObjects:`'s array shape buys
+        // nothing here. Returns NO on failure, which is very rare.
         if pb.setString_forType(&ns_text, NSPasteboardTypeString) {
             Ok(())
         } else {

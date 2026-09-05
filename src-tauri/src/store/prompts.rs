@@ -1,11 +1,8 @@
-//! Prompt store — single source of truth for the in-memory prompt list.
+//! Single source of truth for the in-memory prompt list, wrapping the lock so
+//! call sites don't re-implement the same read-and-find dance.
 //!
-//! Wraps `Arc<RwLock<Vec<Prompt>>>` with cohesive methods so call sites don't
-//! re-implement the same `.read()`, `.iter().find(|p| p.id == ...)` dance.
-//!
-//! Carries a `generation: AtomicU64` that increments on every mutation. The
-//! picker's `SearchIndex` checks this to skip rebuilds when the prompts
-//! haven't changed (fixes the per-keystroke rebuild regression).
+//! `generation` increments on every mutation; the picker's `SearchIndex` uses it
+//! to skip rebuilds, which is what stopped the per-keystroke rebuild.
 
 use crate::error::{AppError, AppResult};
 use crate::prompts::{library, parser, Prompt, PromptOrigin};
@@ -252,9 +249,8 @@ impl PromptStore {
         Ok(snapshot)
     }
 
-    /// Persist a prompt to its `source_path` (or, for frontend-originated
-    /// saves, the existing stored source path for the same prompt id).
-    /// Returns the path written to.
+    /// Persist to the prompt's `source_path`, falling back to the stored path
+    /// for that id on frontend saves. Returns the path written.
     pub fn save(&self, prompt: &Prompt) -> AppResult<PathBuf> {
         self.ensure_writable(&prompt.id)?;
         self.validate_unique_triggers(prompt)?;
@@ -315,10 +311,8 @@ impl PromptStore {
                 source: e,
             })?;
         }
-        // Remove from the in-memory list immediately rather than waiting for
-        // the watcher's load-all reload — otherwise a deleted prompt keeps
-        // firing until the next filesystem event (and never, if the watcher
-        // failed to start). The caller reindexes the matcher afterward.
+        // Remove immediately: waiting for the watcher would keep a deleted
+        // prompt firing, and forever if the watcher never started.
         self.inner.write().retain(|p| p.id != id);
         self.bump_generation();
         Ok(())

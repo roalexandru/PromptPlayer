@@ -1,8 +1,5 @@
-// Thin façade over the auto-generated tauri-specta bindings.
-//
-// `ipc.gen.ts` is regenerated on every debug app launch (see
-// `src-tauri/src/app/setup.rs::generate_typescript_bindings`).
-// Treat it as source-controlled but auto-managed — do not edit by hand.
+// Thin façade over `ipc.gen.ts`, which is regenerated on every debug launch.
+// Source-controlled but auto-managed — never edit it by hand.
 
 import {
   commands,
@@ -13,6 +10,11 @@ import {
   type IpcError,
   type UpdateInfo,
   type ForegroundAppInfo,
+  type Diagnostics,
+  type SelfTestReport,
+  type SelfTestStep,
+  type UiSettings,
+  type KeepAwakeState,
   type AppConfig,
   type NewlineMode,
   type PickerDisplay,
@@ -38,6 +40,11 @@ export type {
   IpcError,
   UpdateInfo,
   ForegroundAppInfo,
+  Diagnostics,
+  SelfTestReport,
+  SelfTestStep,
+  UiSettings,
+  KeepAwakeState,
   AppConfig,
   NewlineMode,
   PickerDisplay,
@@ -69,18 +76,16 @@ export function sourceIdOf(p: Prompt): string | null {
   return p.origin?.kind === "remote" ? p.origin.source_id : null;
 }
 
-/// Unwrap a tauri-specta `Result<T, IpcError>` into a Promise that throws the
-/// IpcError on the error branch. Lets call sites use plain `await` syntax
-/// without juggling the `{ status, data | error }` discriminator.
+/// Turn a specta `Result` into a throwing Promise, so call sites can `await`
+/// without unpacking the `{ status, data | error }` discriminator.
 async function unwrap<T>(p: Promise<Result<T, IpcError>>): Promise<T> {
   const r = await p;
   if (r.status === "ok") return r.data;
   throw r.error;
 }
 
-/// Format an unknown thrown value into a user-visible string. `unwrap()`
-/// throws plain `{ kind, message }` IpcError objects, which `String(e)`
-/// renders as "[object Object]" — prefer the structured message when present.
+/// User-visible string for a thrown value. `String(e)` renders our IpcError
+/// objects as "[object Object]", so prefer the structured message.
 export function fmtErr(e: unknown): string {
   return (e as IpcError)?.message ?? String(e);
 }
@@ -93,9 +98,21 @@ export const ipc = {
   isPlaying: () => commands.isPlaying(),
   isHookAlive: () => commands.isHookAlive(),
   openAccessibilitySettings: () => commands.openAccessibilitySettings(),
+  resetAccessibility: () => commands.resetAccessibility(),
   // keep-awake (prevent display/screensaver/idle-sleep)
   getKeepAwake: () => commands.getKeepAwake(),
-  toggleKeepAwake: () => commands.toggleKeepAwake(),
+  toggleKeepAwake: (durationMins?: number) =>
+    commands.toggleKeepAwake(durationMins ?? null),
+  setKeepAwakeDuration: (durationMins: number) =>
+    commands.setKeepAwakeDuration(durationMins),
+  setKeepAwakeRestore: (restore: boolean) => commands.setKeepAwakeRestore(restore),
+  // diagnostics / first-run setup
+  getDiagnostics: () => commands.getDiagnostics(),
+  runSelfTest: () => commands.runSelfTest(),
+  selfTestType: () => commands.selfTestType(),
+  openDiagnostics: () => commands.openDiagnostics(),
+  getSettings: () => commands.getSettings(),
+  setRestoreArmed: (restore: boolean) => commands.setRestoreArmed(restore),
   // prompts
   listPrompts: () => commands.listPrompts(),
   libraryRoot: () => unwrap(commands.libraryRoot()),
@@ -127,6 +144,8 @@ export const ipc = {
   updaterCurrentVersion: () => commands.updaterCurrentVersion(),
   updaterCheck: () => unwrap(commands.updaterCheck()),
   updaterInstall: () => unwrap(commands.updaterInstall()),
+  updaterAnnounced: (version: string) => commands.updaterAnnounced(version),
+  updaterDismiss: (version: string) => commands.updaterDismiss(version),
   // library helpers (§10.2)
   captureForegroundApp: () => commands.captureForegroundApp(),
   expandPromptText: (text: string) => commands.expandPromptText(text),

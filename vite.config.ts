@@ -34,6 +34,7 @@ export default defineConfig({
         picker: resolve(__dirname, "picker.html"),
         "tray-popup": resolve(__dirname, "tray-popup.html"),
         about: resolve(__dirname, "about.html"),
+        diagnostics: resolve(__dirname, "diagnostics.html"),
       },
     },
   },

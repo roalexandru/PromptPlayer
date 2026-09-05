@@ -1,12 +1,6 @@
-//! §3.4 — pre-computed keystroke schedule.
-//!
-//! When a prompt fires, we pre-compute the entire keystroke schedule before
-//! sending the first key. Stolen from Duey.ai's pattern; nobody else does it.
-//!
-//! Why: main-thread jitter (GC pauses, scheduling, OS interrupts) skews
-//! per-key timing if scheduled live. Pre-computing produces a list of
-//! `{key, absolute_time_ms}` tuples; the typer thread sleeps to each
-//! absolute time. Drift stays bounded; profile statistics actually match.
+//! §3.4 — the whole schedule is computed before the first key, since live
+//! scheduling lets GC and OS jitter skew per-key timing. The typer sleeps to
+//! each absolute time, so drift stays bounded and the profile stats hold.
 
 use crate::config::NewlineMode;
 use crate::typer::distributions::{
@@ -80,10 +74,8 @@ pub fn newline_keys(mode: NewlineMode) -> &'static [Key] {
     }
 }
 
-/// Spec §3.4 signature: `schedule(text, profile, rng) -> Vec<ScheduledKey>`.
-///
-/// Walks `text` once, emits keys + corrections + bursts + pauses,
-/// returns a strictly time-monotonic list.
+/// §3.4. One pass over `text`, emitting keys, corrections, bursts and pauses
+/// as a strictly time-monotonic list.
 pub fn schedule<R: Rng + ?Sized>(
     text: &str,
     profile: &Profile,
@@ -108,10 +100,8 @@ pub fn schedule<R: Rng + ?Sized>(
     let mut typed_so_far: usize = 0; // counts emitted CHARACTERS (excluding backspaces)
 
     while text_pos < chars.len() {
-        // Boundary pause BEFORE this char (if any). Both the mean (via
-        // `profile.pause_scale`) and the σ (via `pause_variance_scale`) are
-        // attenuated independently — Fast Presenter wants smaller and tighter
-        // pauses, CEO wants larger and looser.
+        // Mean and σ attenuate independently: Fast Presenter wants pauses
+        // smaller *and* tighter, CEO larger and looser.
         let boundary = classify_boundary(&chars, text_pos);
         if let Some(b) = boundary {
             cursor += profile.pause_scale
@@ -326,10 +316,8 @@ fn classify_boundary(chars: &[char], i: usize) -> Option<Boundary> {
     if prev == ' ' && i >= 2 && matches!(chars[i - 2], '.' | '!' | '?') && chars[i] != ' ' {
         return Some(Boundary::Sentence);
     }
-    // Word: previous is whitespace (space OR a single newline — line-wrapped
-    // prompts and markdown lists break on `\n`, not just spaces), current is
-    // non-whitespace. Without the `\n` case, text after a single line break
-    // got no boundary pause at all and read as one machine-gun run.
+    // Newlines count as word boundaries too — without that, text after a line
+    // break got no pause and read as one machine-gun run.
     if (prev == ' ' || prev == '\n') && !chars[i].is_whitespace() {
         return Some(Boundary::Word);
     }
@@ -348,13 +336,8 @@ fn apply_iki_adjustments<R: Rng + ?Sized>(
         v = v.max(30.0);
     }
     v += jitter(rng);
-    // Profile-aware floor; the global `IKI_MIN_MS` is the absolute lower
-    // bound that no profile is allowed to go below (so even an aggressive
-    // override can't ask for 0 ms IKIs that the OS would coalesce). Fast
-    // Presenter sets `iki_min_ms` lower than the global IKI_MIN_MS, so we
-    // take the smaller of the two — i.e., the profile wins as long as
-    // it's still positive. (`IKI_MIN_MS = 60` previously won unconditionally,
-    // which is what made `iki_scale = 0.20` a no-op for the bulk of chars.)
+    // Profile-aware floor: the smaller of the two wins, so a fast profile can
+    // go below the global bound. A fixed 60ms made `iki_scale` a no-op.
     v.max(profile.iki_min_ms.max(1.0))
 }
 
@@ -401,22 +384,16 @@ fn emit_typo_sequence<R: Rng + ?Sized>(
     let target = chars[*text_pos];
     let in_burst = profile.burst_enabled && *burst_remaining > 0;
     let latency = sample_latency(rng) as usize;
-    // How many ORIGINAL chars are consumed by this typo+correction.
-    // Substitution: 1 wrong char, then `latency` more original chars typed, then notice & retype all `latency+1`.
-    // Transposition: 2 chars swapped (wrong = chars[pos+1] then chars[pos]); also followed by `latency` chars + correct.
-    // Omission: skip chars[pos] entirely; type next `latency` chars; notice; backspace `latency`, retype chars[pos..pos+latency+1] correctly. So the "missed" char enters at correction time.
-    //
-    // To keep state coherent, we cap latency at how many original chars remain after `text_pos`.
+    // Original chars consumed by the typo and its correction; latency is capped
+    // at whatever remains after `text_pos`.
     let remaining = chars.len() - *text_pos - 1;
     let latency = latency.min(remaining);
 
     match kind {
         TypoKind::Substitution => {
             let wrong = adjacent_qwerty(target, rng);
-            // No QWERTY neighbor (punctuation, accented/unicode, newline):
-            // running the correction choreography would delete CORRECT text
-            // and retype it identically — a bot-like tell, since humans only
-            // backspace over actual errors. Fall back to a plain keystroke.
+            // No QWERTY neighbor: the correction would delete correct text and
+            // retype it identically, which is a bot tell. Type it plainly.
             if wrong == target {
                 let iki = if in_burst {
                     sample_burst_iki(rng)
@@ -842,10 +819,8 @@ mod tests {
 
     #[test]
     fn iki_min_ms_is_profile_aware() {
-        // Regression: the global `IKI_MIN_MS` floor used to clamp every
-        // profile to 60 ms regardless of `iki_scale`. A profile-aware floor
-        // is what makes Fast Presenter actually fast — otherwise the 0.22
-        // scale would silently round up to 60 ms on the bulk of chars.
+        // Regression: a global 60ms floor clamped every profile regardless of
+        // `iki_scale`, so Fast Presenter wasn't actually fast.
         let mut fast = Profile::SALES_ENGINEER;
         fast.iki_scale = 0.10;
         fast.iki_min_ms = 15.0;
@@ -883,11 +858,8 @@ mod tests {
 
     #[test]
     fn pause_scale_shrinks_word_boundaries() {
-        // Regression: `pause_scale` exists so Fast modes don't stall on
-        // every space while flying between chars. Two profiles, identical
-        // IKI behavior, differing only in `pause_scale` — the lower one
-        // must finish meaningfully sooner on text with lots of word
-        // boundaries.
+        // Regression: two profiles differing only in `pause_scale` — the lower
+        // must finish sooner on text with many word boundaries.
         let mut tight = Profile::SALES_ENGINEER;
         tight.pause_scale = 0.2;
         tight.typos_enabled = false;

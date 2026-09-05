@@ -1,15 +1,7 @@
-//! NSEvent global / local monitor for the tray popover.
-//!
-//! Two monitors are installed when the popover is shown:
-//! - **Global mouse-down monitor** — dismisses the popover on any click
-//!   anywhere outside it (the canonical NSStatusItem-popover behavior).
-//! - **Local mouse-moved monitor** — feeds cursor positions to the popover
-//!   webview as Tauri events. WKWebView inside a non-activating NSPanel
-//!   doesn't dispatch mouseMoved events to JS, so CSS `:hover` and JS
-//!   hover state freeze without this workaround.
-//!
-//! `OutsideClickMonitor` Drop-removes both monitors if they're still
-//! installed, so app shutdown doesn't leak them.
+//! Two NSEvent monitors for the tray popover: a global mouse-down that
+//! dismisses on any outside click, and a local mouse-moved that feeds cursor
+//! positions to the webview, since a non-activating NSPanel never delivers
+//! them itself. `OutsideClickMonitor` removes both on Drop.
 
 use block::ConcreteBlock;
 use cocoa::base::{id, nil};

@@ -1,14 +1,8 @@
-//! §2 — trigger matcher.
+//! §2 — trigger matcher. A trigger is the non-whitespace run(s) right before
+//! the commit char; matching is case-insensitive with case propagation (§2.2).
 //!
-//! - Trigger word(s) = contiguous run(s) of non-whitespace chars
-//!   immediately preceding the commit char.
-//! - Match is **case-insensitive** with **case propagation** (§2.2): typed prefix
-//!   is preserved verbatim; the rest of the prompt is rendered with the user's case.
-//! - **Multi-word triggers** supported with greedy longest-match. Multi-word match
-//!   resets if user pauses >2s between words.
-//! - **Multiple aliases per prompt** (§2.2).
-//! - **Uniqueness** enforced at edit time.
-//! - Failed match: commit char passes through.
+//! Multi-word triggers use greedy longest-match and reset after a 2s pause.
+//! A prompt may have several aliases; a failed match passes the commit char.
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -21,10 +15,8 @@ pub const MAX_TRIGGER_WORDS: usize = 6;
 /// Per §2.2: multi-word match resets if user pauses >2s between words.
 pub const MULTI_WORD_RESET: Duration = Duration::from_secs(2);
 
-/// Maximum age of the FIRST char of a candidate trigger word. Anything older
-/// is considered stale context (e.g. residue from typing in another app
-/// before switching to the target). Prevents `<old context>hi>` from being
-/// treated as a single 8-char word.
+/// Max age of a candidate trigger's first char. Older is stale context, so
+/// `<old context>hi>` isn't treated as one long word.
 pub const TRIGGER_FRESHNESS: Duration = Duration::from_secs(2);
 
 /// Capacity of the keystroke ring buffer (~64 chars per §8.4 spec note).
@@ -96,9 +88,8 @@ impl MatchIndex {
         Self::default()
     }
 
-    /// Insert a trigger. Multiple entries per (canonical, commit_char) are allowed
-    /// — they're disambiguated at fire time by scope (§4). Same `prompt_id`
-    /// inserted twice errors.
+    /// Insert a trigger. Several entries may share (canonical, commit_char) —
+    /// scope disambiguates at fire time (§4). A repeated `prompt_id` errors.
     pub fn insert(&mut self, entry: TriggerEntry) -> Result<(), DuplicateError> {
         let bucket = self
             .by_canonical
@@ -156,11 +147,8 @@ pub struct Match {
     /// Number of chars in the buffer that are part of the trigger
     /// (excluding the commit char itself; that's already separately consumed).
     pub trigger_chars: usize,
-    /// Number of chars to pop from the back of the ring buffer to clear the
-    /// trigger from our shadow of the screen. Spans from the trigger's first
-    /// char to the buffer end, so it also includes any trailing whitespace
-    /// the user typed between the trigger and the commit char (`build >`).
-    /// Always `>= trigger_chars`.
+    /// Chars to pop to clear the trigger from our shadow of the screen. Runs to
+    /// the buffer end, so it covers trailing whitespace (`build >`).
     pub pop_chars: usize,
     /// Word count consumed.
     pub word_count: usize,
@@ -169,15 +157,8 @@ pub struct Match {
     pub typed_form: String,
 }
 
-/// Try to match the buffer ending right before `commit_char`.
-///
-/// `index`: the trigger index.
-/// `buffer`: keystroke ring (the most recent N typed chars).
-/// `commit_char`: the commit char that just landed.
-/// `now`: current instant (for the §2.2 multi-word 2s reset rule).
-///
-/// Returns the FIRST candidate of the longest matching trigger (greedy multi-word).
-/// Use `match_buffer_all` if you need every prompt that shares this trigger.
+/// First candidate of the longest match ending before `commit_char`; `now`
+/// drives the §2.2 reset. `match_buffer_all` returns them all.
 pub fn match_buffer(
     index: &MatchIndex,
     buffer: &RingBuffer,
@@ -214,10 +195,8 @@ pub fn match_buffer_all(
         return Vec::new();
     }
 
-    // Identify word ranges from the back: each word is contiguous non-whitespace
-    // typed within the freshness window. A char older than `TRIGGER_FRESHNESS`
-    // acts as an implicit boundary so stale context (typing in another app,
-    // long pauses) doesn't get glued onto the trigger word.
+    // Walk words backwards. A char older than `TRIGGER_FRESHNESS` is an
+    // implicit boundary, so stale context can't glue onto the trigger.
     let mut words: Vec<(usize, usize)> = Vec::new();
     let mut i = end;
     while i > 0 && words.len() < MAX_TRIGGER_WORDS {
@@ -249,9 +228,8 @@ pub fn match_buffer_all(
 
     // Try longest match first: starting from the longest possible word count, downward.
     for k in (1..=words.len()).rev() {
-        // Check the §2.2 freshness rule: between word boundaries we need <=2s gaps.
-        // Specifically, the time between the LAST char of word[i] and the FIRST char of word[i-1]
-        // (i.e., across the whitespace gap) must be ≤2s.
+        // §2.2 freshness: the gap between word[i]'s last char and word[i-1]'s
+        // first char must be ≤2s.
         let mut stale = false;
         for w in 0..k - 1 {
             let prev_word_first_char = entries[words[w].0]; // word[w] is later in time; first char in buffer order
@@ -284,18 +262,15 @@ pub fn match_buffer_all(
             let first_idx = words[k - 1].0;
             let last_idx = words[0].1;
             let trigger_chars = last_idx - first_idx;
-            // Pop count spans from the trigger start to the actual buffer end
-            // (not `last_idx`, which excludes trailing whitespace) so that a
-            // stray space typed before the commit char doesn't survive in the
-            // ring and poison subsequent matches.
+            // To the buffer end, not `last_idx` — a stray space before the
+            // commit char would otherwise survive and poison later matches.
             let pop_chars = entries.len() - first_idx;
             let last_char_age = now.duration_since(entries[last_idx - 1].at);
             if last_char_age > Duration::from_secs(10) {
                 continue;
             }
-            // Freshness — the FIRST char of the trigger word(s) must have been
-            // typed within TRIGGER_FRESHNESS of `now`. This prevents old context
-            // from being concatenated into the trigger.
+            // The trigger's first char must be within TRIGGER_FRESHNESS, so old
+            // context can't be concatenated into it.
             let first_char_age = now.duration_since(entries[first_idx].at);
             if first_char_age > TRIGGER_FRESHNESS {
                 continue;
@@ -315,13 +290,8 @@ pub fn match_buffer_all(
     Vec::new()
 }
 
-/// Apply case propagation per §2.2: render `body` with the same case style
-/// the user typed for `typed_form`.
-///
-/// Strategy:
-/// - If typed_form is ALL CAPS → uppercase the body.
-/// - If typed_form is Title Case (first char upper, rest lower) → capitalize first body char.
-/// - Else (all lower or mixed) → body untouched.
+/// §2.2 case propagation: ALL CAPS uppercases the body, Title Case capitalises
+/// its first char, anything else leaves it alone.
 pub fn propagate_case(typed_form: &str, body: &str) -> String {
     let alpha: Vec<char> = typed_form.chars().filter(|c| c.is_alphabetic()).collect();
     if alpha.is_empty() {
@@ -351,9 +321,8 @@ pub fn propagate_case(typed_form: &str, body: &str) -> String {
 pub struct MatcherState {
     pub index: RwLock<MatchIndex>,
     pub buffer: RwLock<RingBuffer>,
-    /// Set of every commit char registered across all triggers. The hook
-    /// consults this so per-prompt `commit-char:` overrides (§2.3) enter the
-    /// match path, not just the global commit char. Rebuilt with the index.
+    /// Every commit char across all triggers, so per-prompt `commit-char:`
+    /// overrides (§2.3) reach the match path. Rebuilt with the index.
     commit_chars: RwLock<std::collections::HashSet<char>>,
 }
 
@@ -362,12 +331,8 @@ impl MatcherState {
         Arc::new(Self::default())
     }
 
-    /// Rebuild the trigger index. Duplicate entries (matching prompt_id,
-    /// canonical form, and commit char) are skipped with a warning rather than
-    /// aborting the whole swap — a single colliding entry (e.g. a
-    /// `foo copy.pp.md` duplicate in the library) must not freeze the entire
-    /// index and silently break every other prompt's matching. Returns the
-    /// number of entries that were skipped.
+    /// Rebuild the trigger index, returning how many duplicates were skipped.
+    /// One colliding entry must not freeze the index for every other prompt.
     pub fn rebuild_index(&self, entries: Vec<TriggerEntry>) -> usize {
         let mut next = MatchIndex::new();
         let mut commit_chars = std::collections::HashSet::new();
@@ -398,11 +363,8 @@ impl MatcherState {
         self.buffer.write().push(ch, at);
     }
 
-    /// Observe a word-boundary key (Enter / Tab) that produces no character but
-    /// still separates words. Without this, `<line>\nbuild>` glues the line and
-    /// the trigger into one word and the match silently fails — the single most
-    /// common live-demo flow (type a line, press Enter, type a trigger). We push
-    /// a synthetic space so the matcher's word segmentation sees the boundary.
+    /// Record Enter/Tab as a synthetic space. Without it `<line>\nbuild>` is one
+    /// word and the most common demo flow silently fails to match.
     pub fn observe_separator(&self, at: Instant) {
         let mut buf = self.buffer.write();
         // Avoid stacking redundant separators (e.g. Enter then Tab).
@@ -503,9 +465,8 @@ mod tests {
 
     #[test]
     fn duplicate_in_rebuild_is_skipped_not_aborted() {
-        // A colliding entry must be dropped while the rest of the rebuild
-        // still takes effect — one bad duplicate can't be allowed to freeze
-        // the whole index (which would silently break every other prompt).
+        // Drop the collision but keep the rebuild — one duplicate can't be
+        // allowed to freeze the index for everything else.
         let state = MatcherState::default();
         state.rebuild_index(vec![t("p1", "build", 1)]);
         let skipped = state.rebuild_index(vec![

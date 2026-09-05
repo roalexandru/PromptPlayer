@@ -1,26 +1,8 @@
-//! Native Win32 popup menu for the system-tray icon on Windows.
+//! Native Win32 tray menu: a `WS_EX_NOACTIVATE` webview has no reliable
+//! outside-click dismiss, so `TrackPopupMenuEx` owns the interaction.
 //!
-//! Why native and not the Tauri webview popup we use on macOS: a non-
-//! activating webview window (`WS_EX_NOACTIVATE`) has no reliable
-//! outside-click dismiss mechanism on Windows. `WindowEvent::Focused(false)`
-//! never fires (window never has focus to lose); foreground-window polling
-//! can't distinguish "user clicked back into the same app they were already
-//! in" from "user did nothing"; `WH_MOUSE_LL` is silently blocked by EDR/AV
-//! on unsigned binaries. Native `TrackPopupMenuEx` lets the OS own the entire
-//! interaction — show, hover, dismiss-on-outside-click, dismiss-on-Escape,
-//! dismiss-on-alt-tab — so dismissal "just works" no matter the user's
-//! security posture.
-//!
-//! Architecture summary:
-//! - A hidden helper window (`HELPER_HWND`, lazily registered) is the menu's
-//!   owner. `TrackPopupMenuEx` requires an owner HWND in the calling
-//!   thread; the owner doesn't need to be visible.
-//! - Per the canonical MSDN tray-icon-menu recipe, we `SetForegroundWindow`
-//!   the helper before tracking and `PostMessage(WM_NULL)` after — the latter
-//!   is a documented workaround for a bug where the menu wouldn't dismiss
-//!   on outside clicks.
-//! - We use `TPM_RETURNCMD` so `TrackPopupMenuEx` returns the chosen item ID
-//!   directly (no `WM_COMMAND` plumbing through a window proc).
+//! A hidden helper window owns it, per the MSDN recipe — foreground before,
+//! `WM_NULL` after, `TPM_RETURNCMD` for the id.
 
 use crate::app::context::AppContext;
 use crate::app::FireService;
@@ -36,28 +18,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NULL, WNDCLASSW, WS_OVERLAPPED,
 };
 
-/// Static command IDs returned by `TrackPopupMenuEx`. Static items occupy the
-/// 100-band; pinned-prompt items start at `ID_PINNED_BASE` and are indexed by
-/// position in the snapshot vec.
+/// Command IDs from `TrackPopupMenuEx`. Static items use the 100-band; pinned
+/// prompts start at `ID_PINNED_BASE`, indexed by snapshot position.
 const ID_TOGGLE_ARMED: u32 = 100;
 const ID_PROMPT_LIBRARY: u32 = 101;
 const ID_COMMAND_PALETTE: u32 = 102;
 const ID_ABOUT: u32 = 103;
 const ID_QUIT: u32 = 104;
 const ID_KEEP_AWAKE: u32 = 105;
-const ID_NEXT_CUE: u32 = 106;
-const ID_PAUSE_PLAYBACK: u32 = 107;
-const ID_RESET_SETLIST: u32 = 108;
+const ID_DIAGNOSTICS: u32 = 106;
+const ID_HOOK_WARNING: u32 = 107;
+const ID_NEXT_CUE: u32 = 108;
+const ID_PAUSE_PLAYBACK: u32 = 109;
+const ID_RESET_SETLIST: u32 = 110;
 const ID_PINNED_BASE: u32 = 1000;
 
-/// Cached helper-window HWND. Win32 `HWND` isn't `Send`, but the raw
-/// pointer-as-isize is — and we only ever consume it back into an HWND on
-/// the UI thread that created it.
+/// Cached helper HWND as an isize: `HWND` isn't `Send`, the raw pointer is,
+/// and it's only rebuilt on the UI thread that created it.
 static HELPER_HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 
-/// Re-entrancy guard. `TrackPopupMenuEx` blocks but pumps messages; without
-/// this, a tray-icon click that dismisses the current menu can dispatch a
-/// fresh tray-click event → fresh menu → recursion.
+/// Re-entrancy guard: `TrackPopupMenuEx` blocks but pumps messages, so a
+/// dismissing click can otherwise open a fresh menu recursively.
 static MENU_TRACKING: AtomicBool = AtomicBool::new(false);
 
 /// Lazily register and create the hidden owner window. Idempotent.
@@ -68,18 +49,16 @@ unsafe fn helper_hwnd() -> HWND {
     }
     let hinstance = GetModuleHandleW(None).map(|h| h.into()).unwrap_or_default();
     let class_name = w!("PromptPlayerMenuOwner");
-    // `WNDCLASSW.lpfnWndProc` wants `Option<unsafe extern "system" fn(...)>`;
-    // `DefWindowProcW` from windows-rs is plain `unsafe fn(...)` so we need a
-    // thin `extern "system"` trampoline.
+    // windows-rs exposes `DefWindowProcW` as a plain `unsafe fn`, so it needs
+    // an `extern "system"` trampoline to fit `lpfnWndProc`.
     let class = WNDCLASSW {
         lpfnWndProc: Some(def_window_proc_trampoline),
         hInstance: hinstance,
         lpszClassName: class_name,
         ..Default::default()
     };
-    // RegisterClassW returns 0 on failure but also if the class already
-    // exists. We treat both as fine — the second-registration error doesn't
-    // prevent CreateWindowExW from finding the class.
+    // 0 means failure *or* already-registered; both are fine, since
+    // CreateWindowExW still finds the class.
     let _ = RegisterClassW(&class);
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
@@ -100,10 +79,8 @@ unsafe fn helper_hwnd() -> HWND {
     hwnd
 }
 
-/// Show the tray menu at the given tray-icon rect and dispatch the chosen
-/// action. Blocks the calling thread (`TrackPopupMenuEx` is modal) but
-/// pumps messages. Re-entrant calls (e.g. another tray click while the menu
-/// is up) are dropped.
+/// Show the tray menu at `rect` and dispatch the choice. Modal — blocks the
+/// caller while pumping messages; re-entrant calls are dropped.
 pub fn show_tray_menu(app: &AppHandle, rect: tauri::Rect) {
     if MENU_TRACKING.swap(true, Ordering::AcqRel) {
         return;
@@ -130,9 +107,8 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
         }
     };
 
-    // Snapshot state once. The user can't modify state while the menu is up
-    // (TrackPopupMenuEx is modal), so snapshotting eliminates the chance of
-    // a mid-build inconsistency.
+    // Snapshot once — the menu is modal, so nothing can change underneath and
+    // a mid-build inconsistency is impossible.
     let ctx = match app.try_state::<AppContext>() {
         Some(s) => s,
         None => {
@@ -149,13 +125,22 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
     let prompts = ctx.prompts.snapshot();
     let pinned: Vec<&crate::prompts::Prompt> = prompts.iter().filter(|p| p.pinned).collect();
 
-    // Capture the user's real foreground window NOW — before the
-    // `SetForegroundWindow(owner)` below hands foreground to the hidden helper
-    // window. If we captured after the menu (as the command-palette and
-    // pinned-fire dispatch paths used to), the snapshot would be the invisible
-    // helper, and any delivery (paste/typing) would land on nothing. Both
-    // dispatch paths rely on this snapshot to get focus back to the right app.
+    // Capture BEFORE `SetForegroundWindow(owner)` below, or the snapshot is
+    // the invisible helper and every later delivery lands on nothing.
     ctx.focus.capture();
+
+    // 0. Hook-health row. macOS has surfaced this in the popover since day
+    // one; Windows had no equivalent, so a dead hook there is silent.
+    if !ctx.state.hook_alive() {
+        let warn = wstr("⚠ Keyboard hook inactive — open Diagnostics");
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            ID_HOOK_WARNING as usize,
+            PCWSTR(warn.as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    }
 
     // 1. Armed toggle (with checkmark when on).
     let toggle_label = wstr("Prompt Player");
@@ -243,9 +228,9 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
         PCWSTR(cp.as_ptr()),
     );
 
-    // Keep Awake — checkbox item (MF_CHECKED when on). Prevents display sleep,
-    // the screensaver, and idle system sleep while enabled.
-    let ka = wstr("Keep Awake");
+    // Keep Awake — checkbox item, labelled with the remaining time so an
+    // eight-hour session can't hide behind an anonymous checkmark.
+    let ka = wstr(&keep_awake_label(&ctx));
     let ka_flags = if keep_awake {
         MF_STRING | MF_CHECKED
     } else {
@@ -253,23 +238,26 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
     };
     let _ = AppendMenuW(menu, ka_flags, ID_KEEP_AWAKE as usize, PCWSTR(ka.as_ptr()));
 
-    // 5. About + Quit.
+    // 5. Diagnostics + About + Quit.
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let diag = wstr("Diagnostics…");
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_DIAGNOSTICS as usize,
+        PCWSTR(diag.as_ptr()),
+    );
     let about = wstr("About Prompt Player");
     let _ = AppendMenuW(menu, MF_STRING, ID_ABOUT as usize, PCWSTR(about.as_ptr()));
     let quit = wstr("Quit\tCtrl+Q");
     let _ = AppendMenuW(menu, MF_STRING, ID_QUIT as usize, PCWSTR(quit.as_ptr()));
 
-    // Anchor the menu to the tray icon's top-left in physical pixels.
-    // TPM_BOTTOMALIGN places menu.bottom at y, so passing icon.top means
-    // the menu grows upward from the icon — correct for the default
-    // bottom-edge taskbar. For top/left/right taskbars the OS will adjust
-    // automatically to keep the menu on-screen.
+    // TPM_BOTTOMALIGN puts menu.bottom at y, so icon.top grows it upward —
+    // right for a bottom taskbar, and the OS re-fits the other edges.
     let (x, y) = anchor_xy(&rect);
 
-    // MSDN tray-menu recipe: SetForegroundWindow the owner before tracking,
-    // PostMessage(WM_NULL) after. Without these, the menu fails to dismiss
-    // on outside clicks — a documented Windows quirk for tray-style menus.
+    // MSDN recipe: foreground the owner before tracking, WM_NULL after, or
+    // the menu won't dismiss on outside clicks.
     let _ = SetForegroundWindow(owner);
 
     let cmd = TrackPopupMenuEx(
@@ -299,31 +287,66 @@ fn anchor_xy(rect: &tauri::Rect) -> (i32, i32) {
     }
 }
 
+/// "Keep Awake", plus the time left when a bounded session is running.
+fn keep_awake_label(ctx: &AppContext) -> String {
+    match ctx.power.remaining() {
+        Some(left) => {
+            let mins = (left.as_secs() + 59) / 60;
+            if mins >= 60 {
+                format!("Keep Awake\t{}h {}m left", mins / 60, mins % 60)
+            } else {
+                format!("Keep Awake\t{}m left", mins)
+            }
+        }
+        None if ctx.power.is_enabled() => "Keep Awake\tno limit".to_string(),
+        None => "Keep Awake".to_string(),
+    }
+}
+
 fn dispatch(app: &AppHandle, cmd_id: u32, pinned_ids: &[String]) {
     match cmd_id {
         ID_TOGGLE_ARMED => {
             if let Some(ctx) = app.try_state::<AppContext>() {
-                let _ = ctx.state.toggle_armed();
+                // Was a bare `toggle_armed()`, so the Windows tray was the one
+                // arm path that neither persisted nor reported.
+                let new = !ctx.state.is_armed();
+                crate::app::shortcuts::set_armed_and_report(app, &ctx, new);
             }
         }
         ID_PROMPT_LIBRARY => show_window(app, "library"),
         ID_COMMAND_PALETTE => {
             if let Some(ctx) = app.try_state::<AppContext>() {
-                // Focus was already captured in `run_menu` (before the helper
-                // window took foreground) — re-capturing here would snapshot
-                // the helper. Just refresh the index, position, and show.
-                ctx.search
-                    .lock()
-                    .rebuild_if_stale(ctx.prompts.generation(), &ctx.prompts.read());
-                crate::platform::windows::position_picker_on_cursor_screen(app);
-                crate::commands::picker::show_picker_window(app);
+                // Focus was already captured in `run_menu`, before the helper
+                // window took foreground — re-capturing would snapshot it.
+                crate::commands::picker::summon_picker(
+                    app,
+                    &ctx,
+                    crate::telemetry::PickerSource::TrayMenu,
+                    crate::commands::picker::FocusCapture::AlreadyTaken,
+                );
             }
         }
         ID_ABOUT => show_window(app, "about"),
+        ID_DIAGNOSTICS | ID_HOOK_WARNING => {
+            if let Some(ctx) = app.try_state::<AppContext>() {
+                ctx.settings.update(|s| s.setup_seen = true);
+                crate::telemetry::send(app, crate::telemetry::TelemetryEvent::DiagnosticsOpened);
+            }
+            show_window(app, "diagnostics");
+        }
         ID_QUIT => app.exit(0),
         ID_KEEP_AWAKE => {
             if let Some(ctx) = app.try_state::<AppContext>() {
-                let _ = ctx.power.toggle();
+                let mins = ctx.settings.get().keep_awake_mins;
+                let enabled = ctx.power.toggle_for(mins);
+                ctx.settings.update(|s| s.keep_awake = enabled);
+                crate::telemetry::send(
+                    app,
+                    crate::telemetry::TelemetryEvent::KeepAwakeToggled {
+                        enabled,
+                        duration_mins: if enabled { mins } else { 0 },
+                    },
+                );
             }
         }
         ID_PAUSE_PLAYBACK => {
@@ -369,12 +392,8 @@ fn dispatch(app: &AppHandle, cmd_id: u32, pinned_ids: &[String]) {
             let idx = (id - ID_PINNED_BASE) as usize;
             if let Some(prompt_id) = pinned_ids.get(idx) {
                 if let Some(ctx) = app.try_state::<AppContext>() {
-                    // After TrackPopupMenuEx the hidden helper window holds the
-                    // foreground (per the MSDN recipe). Restore the user's real
-                    // app — captured in run_menu before the menu — and wait for
-                    // the transfer; otherwise SendInput keystrokes land on the
-                    // helper and vanish. Offload so the focus-restore poll
-                    // doesn't block the event loop.
+                    // The helper holds the foreground now, so restore the app
+                    // captured in `run_menu` and wait, off the event loop.
                     let ctx_owned = ctx.inner().clone();
                     let app_owned = app.clone();
                     let prompt_id = prompt_id.clone();
@@ -388,7 +407,7 @@ fn dispatch(app: &AppHandle, cmd_id: u32, pinned_ids: &[String]) {
                                 std::thread::sleep(crate::picker::RESTORATION_DELAY);
                             }
                             let fire = FireService::new(ctx_owned, app_owned);
-                            fire.fire_from_picker(&prompt_id, crate::app::fire::PickMode::Human);
+                            fire.fire_from_tray(&prompt_id, crate::app::fire::PickMode::Human);
                         })
                         .expect("spawn tray-fire thread");
                 }
@@ -406,17 +425,14 @@ fn show_window(app: &AppHandle, label: &str) {
     }
 }
 
-/// UTF-16 + null terminator buffer for `PCWSTR`. The buffer must outlive the
-/// Win32 call that consumes it; menu text strings are copied internally by
-/// `AppendMenuW`, so each `wstr` can drop after its append.
+/// UTF-16 + NUL buffer for `PCWSTR`. `AppendMenuW` copies the text, so each
+/// buffer can drop right after its append.
 fn wstr(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Trampoline so we can put `DefWindowProcW` into the `extern "system"` slot
-/// in `WNDCLASSW.lpfnWndProc`. The windows-rs binding for `DefWindowProcW`
-/// is a plain `unsafe fn`, not `extern "system"`, so we need a thin layer
-/// to give it the right ABI.
+/// ABI trampoline: windows-rs types `DefWindowProcW` as a plain `unsafe fn`,
+/// but `lpfnWndProc` needs `extern "system"`.
 unsafe extern "system" fn def_window_proc_trampoline(
     hwnd: HWND,
     msg: u32,

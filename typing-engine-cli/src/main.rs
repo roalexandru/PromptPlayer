@@ -1,12 +1,6 @@
-//! Phase 1 — standalone Rust binary per spec §16.
-//!
-//! Reads text from stdin, types into the focused window with full log-normal
-//! mixture cadence, hierarchical pauses, typo+correction, and three profiles.
-//!
-//! Usage:
-//!   echo "Build me a React component..." | typing-engine-cli --profile sales-engineer
-//!   typing-engine-cli --profile fast-presenter --rdp --seed 42 < input.txt
-//!   typing-engine-cli --dry-run --seed 42 < input.txt   # JSON schedule, no typing
+//! §16 — standalone CLI over the typing engine. Reads stdin and types into the
+//! focused window with the full cadence model; `--dry-run` prints the schedule
+//! as JSON instead. See `--help` for the flags.
 
 use prompt_player::inject::EnigoInjector;
 use prompt_player::typer::{

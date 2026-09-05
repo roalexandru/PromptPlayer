@@ -39,9 +39,8 @@
     if (p === "thoughtful-ceo") return { ikiScale: 0.85, pauseScale: 1.3, varianceScale: 1.5 };
     const base = { ikiScale: 0.5, pauseScale: 0.9, varianceScale: 1.0 };
     if (p === "custom" && overrides) {
-      // sampleIki()'s main mode has median ≈ e^4.95 ≈ 140 ms, so scaling by
-      // (requested median / 140) makes the preview's median IKI track the
-      // override the way the Rust engine does.
+      // `sampleIki()`'s main mode has a ~140 ms median, so scaling by
+      // (requested / 140) tracks the override the way the Rust engine does.
       const iki = overrides["iki-median-ms"];
       if (iki != null && iki > 0) base.ikiScale = iki / 140;
       const pv = overrides["pause-variance-scale"];

@@ -23,37 +23,84 @@ async isPlaying() : Promise<boolean> {
     return await TAURI_INVOKE("is_playing");
 },
 /**
- * True iff the platform keyboard hook is currently installed and dispatching
- * events. False on macOS when Accessibility permission is missing or the tap
- * failed to install. The tray popup uses this to surface a "Grant Accessibility"
- * row instead of silently failing.
+ * Whether the keyboard hook is installed and dispatching. The tray uses it to
+ * warn instead of failing silently.
  */
 async isHookAlive() : Promise<boolean> {
     return await TAURI_INVOKE("is_hook_alive");
 },
 /**
- * Open the macOS System Settings → Privacy & Security → Accessibility pane and
- * re-prompt. The prompt call adds this app to the Accessibility list (if not
- * already present) so the user has something to toggle when the pane opens.
- * On Windows this is a no-op (no equivalent permission system).
+ * Open the macOS Accessibility pane, re-prompting first so we're listed there
+ * and the user has something to toggle. No-op on Windows.
  */
 async openAccessibilitySettings() : Promise<void> {
     await TAURI_INVOKE("open_accessibility_settings");
 },
 /**
- * Current keep-awake state. Read by the macOS tray popover on every show.
+ * `tccutil reset Accessibility`, then re-prompt and open the pane. This is the
+ * fix for the "approved but not working" state an unsigned update leaves.
  */
-async getKeepAwake() : Promise<boolean> {
+async resetAccessibility() : Promise<boolean> {
+    return await TAURI_INVOKE("reset_accessibility");
+},
+async getKeepAwake() : Promise<KeepAwakeState> {
     return await TAURI_INVOKE("get_keep_awake");
 },
 /**
- * Flip keep-awake, apply the OS-level assertion, and return the new state.
- * Refreshes the tray popover (macOS) so the checkmark stays in sync; the
- * Windows native menu is rebuilt from a fresh snapshot on every open, so it
- * needs no explicit refresh.
+ * Flip keep-awake and apply the OS assertion. Turning on starts a bounded
+ * session, which is what stops the multi-day sessions we saw in the field.
  */
-async toggleKeepAwake() : Promise<boolean> {
-    return await TAURI_INVOKE("toggle_keep_awake");
+async toggleKeepAwake(durationMins: number | null) : Promise<KeepAwakeState> {
+    return await TAURI_INVOKE("toggle_keep_awake", { durationMins });
+},
+/**
+ * Change the default auto-off without toggling. Re-arms a running session so
+ * picking "30 min" while already on takes effect immediately.
+ */
+async setKeepAwakeDuration(durationMins: number) : Promise<KeepAwakeState> {
+    return await TAURI_INVOKE("set_keep_awake_duration", { durationMins });
+},
+/**
+ * Opt in/out of restoring keep-awake at launch.
+ */
+async setKeepAwakeRestore(restore: boolean) : Promise<KeepAwakeState> {
+    return await TAURI_INVOKE("set_keep_awake_restore", { restore });
+},
+async getDiagnostics() : Promise<Diagnostics> {
+    return await TAURI_INVOKE("get_diagnostics");
+},
+/**
+ * Check everything between a keypress and a typed character, in order, and
+ * stop at the first failure so the UI can name one actionable thing.
+ */
+async runSelfTest() : Promise<SelfTestReport> {
+    return await TAURI_INVOKE("run_self_test");
+},
+/**
+ * Type [`SELF_TEST_PROBE`] into whatever has focus. The window focuses its own
+ * field first, making this a real end-to-end check rather than a status read.
+ */
+async selfTestType() : Promise<void> {
+    await TAURI_INVOKE("self_test_type");
+},
+/**
+ * Show the diagnostics window, creating nothing — it's declared in
+ * `tauri.conf.json` like the other secondary windows.
+ */
+async openDiagnostics() : Promise<void> {
+    await TAURI_INVOKE("open_diagnostics");
+},
+/**
+ * Read the persisted settings the UI can edit.
+ */
+async getSettings() : Promise<UiSettings> {
+    return await TAURI_INVOKE("get_settings");
+},
+/**
+ * Opt in/out of restoring `armed` at launch. §10.1 stays the default.
+ */
+async setRestoreArmed(restore: boolean) : Promise<UiSettings> {
+    return await TAURI_INVOKE("set_restore_armed", { restore });
 },
 async listPrompts() : Promise<Prompt[]> {
     return await TAURI_INVOKE("list_prompts");
@@ -153,12 +200,8 @@ async trayPopupHide() : Promise<Result<null, IpcError>> {
 }
 },
 /**
- * Run a prompt from the tray (left-click on a pinned row, macOS only — the
- * Windows path goes through the native menu's `dispatch` instead). Hides the
- * popup first, then fires through the picker pipeline at human cadence. The
- * menu-bar / system-tray click never activates the app
- * (`NSNonactivatingPanelMask` on macOS, native menu on Windows), so the
- * original foreground app is still focused — no focus-restore dance needed.
+ * Fire a pinned prompt from the macOS popover. The tray click never activates
+ * us, so the user's app still has focus and needs no restore.
  */
 async trayFirePrompt(promptId: string) : Promise<Result<null, IpcError>> {
     try {
@@ -187,24 +230,33 @@ async updaterInstall() : Promise<Result<null, IpcError>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * The user saw an "Install update" affordance. Once per version, so a
+ * long-ignored update doesn't inflate the count on every poll.
+ */
+async updaterAnnounced(version: string) : Promise<void> {
+    await TAURI_INVOKE("updater_announced", { version });
+},
+/**
+ * User dismissed the update. Clears the tray badge and suppresses the nag
+ * until a newer version lands.
+ */
+async updaterDismiss(version: string) : Promise<void> {
+    await TAURI_INVOKE("updater_dismiss", { version });
+},
 async captureForegroundApp() : Promise<ForegroundAppInfo> {
     return await TAURI_INVOKE("capture_foreground_app");
 },
 /**
- * Run a string through the same placeholder + expression pipeline used at
- * fire time. Powers the editor's "Test" button. Errors inside `${{ … }}`
- * blocks surface inline as `[expr error: …]` (consistent with how typing
- * would handle them). Tab-stops, choices, and selection are not resolved
- * here — the body is rendered as if the user had no clipboard / selection
- * context, which is the right default for an authoring preview.
+ * Run a string through the fire-time expansion pipeline for the editor's
+ * "Test" button. Tab-stops and selection stay unresolved in a preview.
  */
 async expandPromptText(text: string) : Promise<string> {
     return await TAURI_INVOKE("expand_prompt_text", { text });
 },
 /**
- * Import a `.pp.md` file: read it, parse it (validates frontmatter),
- * then copy into the library root with a fresh ID if one already exists.
- * Returns the parsed `Prompt` so the frontend can select it immediately.
+ * Read and parse a `.pp.md`, then copy it into the library root with a fresh
+ * id on collision. Returns the prompt so the frontend can select it.
  */
 async importPrompt(sourcePath: string) : Promise<Result<Prompt, IpcError>> {
     try {
@@ -215,9 +267,8 @@ async importPrompt(sourcePath: string) : Promise<Result<Prompt, IpcError>> {
 }
 },
 /**
- * Export a prompt to a user-chosen path. Re-serializes the in-memory
- * `Prompt` to `.pp.md` rather than copying the source file, so unsaved
- * edits in the library don't get exported as the older on-disk version.
+ * Export a prompt, re-serializing from memory rather than copying the file —
+ * otherwise unsaved edits export as the older on-disk version.
  */
 async exportPrompt(promptId: string, destPath: string) : Promise<Result<null, IpcError>> {
     try {
@@ -228,9 +279,8 @@ async exportPrompt(promptId: string, destPath: string) : Promise<Result<null, Ip
 }
 },
 /**
- * Open an `http://` or `https://` URL in the user's default browser.
- * Rejects any other scheme — keeps the IPC from doubling as a generic
- * shell-execute primitive.
+ * Open an http(s) URL in the default browser. Other schemes are rejected, so
+ * this can't double as a shell-execute primitive.
  */
 async openExternal(url: string) : Promise<Result<null, IpcError>> {
     try {
@@ -556,18 +606,61 @@ sources: SourceSpec[];
  */
 "repo-hints": string[] }
 /**
- * Identifying info for a foreground app. Every field is optional because
- * platforms surface different subsets — Mac always has bundle_id+name,
- * Windows always has executable+window_title, neither has both.
+ * Everything the diagnostics window shows. One round trip, so the UI can't
+ * render a half-stale picture of a machine that is mid-repair.
+ */
+export type Diagnostics = { version: string; os: string; 
+/**
+ * macOS Accessibility (TCC). Always true where the concept doesn't apply.
+ */
+accessibilityTrusted: boolean; 
+/**
+ * The keyboard hook is installed and dispatching.
+ */
+hookAlive: boolean; 
+/**
+ * macOS Secure Input is engaged right now, so triggers are gated off.
+ */
+secureInputActive: boolean; armed: boolean; keepAwake: boolean; prompts: number; enabledPrompts: number; triggers: number; hotkeys: number; libraryRoot: string; logDir: string; 
+/**
+ * True when the hook cannot work and the user must act.
+ */
+needsAttention: boolean }
+/**
+ * Foreground-app identity. All optional: macOS gives bundle_id + name,
+ * Windows gives executable + window_title, neither gives both.
  */
 export type ForegroundAppInfo = { bundleId: string | null; name: string | null; executable: string | null; windowTitle: string | null }
 /**
- * Specta-friendly mirror of `AppError`. The IPC layer returns this so the
- * generated TypeScript bindings have a clean structured-error shape:
- * `{ kind: string; message: string }`. `From<AppError>` converts at the
- * command boundary.
+ * Specta-friendly mirror of `AppError`, so the generated bindings get a clean
+ * `{ kind, message }`. `From<AppError>` converts at the command boundary.
  */
 export type IpcError = { kind: string; message: string }
+/**
+ * Keep-awake state for the UI: on/off, the chosen auto-off, and how long is
+ * left so the tray can render "1h 12m left" instead of a bare checkmark.
+ */
+export type KeepAwakeState = { enabled: boolean; 
+/**
+ * Auto-off for the active session, in minutes. `0` = indefinite.
+ */
+durationMins: number; 
+/**
+ * Seconds until auto-off, or `None` when off or indefinite.
+ */
+remainingSecs: number | null; 
+/**
+ * The user's default auto-off, applied to the next enable.
+ */
+defaultMins: number; 
+/**
+ * Selectable durations, so the UI doesn't hardcode its own list.
+ */
+choices: number[]; 
+/**
+ * Whether keep-awake is restored at launch.
+ */
+restore: boolean }
 /**
  * How an embedded `\n` in a prompt body is delivered.
  * 
@@ -648,17 +741,13 @@ export type ProfileKind = "sales-engineer" | "fast-presenter" | "thoughtful-ceo"
  */
 export type Prompt = { id: string; name: string; description?: string; triggers: string[]; commit_char?: string; priority?: number; typing_profile?: ProfileKind; typing_overrides?: TypingOverrides; scope?: ScopeFilter | null; filters?: string[]; hotkey?: string | null; tags?: string[]; 
 /**
- * Per-prompt enable flag. When the global `armed` switch is on, only
- * prompts with `enabled: true` participate in trigger-matching and
- * hotkey registration. Defaults to `true` so existing prompts keep
- * working without touching their files.
+ * Only enabled prompts take part in matching and hotkey registration.
+ * Defaults true so existing files keep working untouched.
  */
 enabled?: boolean; 
 /**
- * Tray surfacing flag. The menu-bar popup shows ONLY pinned prompts
- * (Apple Shortcuts model). Unpinned prompts still live in the library
- * and still fire from triggers — they're just not in the tray menu.
- * Defaults to `false` so existing prompts don't crowd the tray.
+ * The tray shows only pinned prompts (Apple Shortcuts model); unpinned ones
+ * still fire from triggers. Defaults false so the tray stays uncrowded.
  */
 pinned?: boolean; 
 /**
@@ -737,6 +826,18 @@ export type SearchHit = { prompt_id: string; score: number;
  */
 highlights: number[] }
 /**
+ * Result of the pre-flight self test.
+ */
+export type SelfTestReport = { passed: boolean; steps: SelfTestStep[]; 
+/**
+ * The string `self_test_type` will inject, for the UI to compare against.
+ */
+probe: string }
+/**
+ * One self-test step and whether it passed.
+ */
+export type SelfTestStep = { name: string; passed: boolean; detail: string }
+/**
  * One row of the setlist editor.
  */
 export type SetlistEntry = { promptId: string; 
@@ -812,11 +913,18 @@ htmlUrl: string }
  */
 export type TypingOverrides = { "iki-median-ms": number | null; "typo-rate": number | null; "pause-variance-scale": number | null; "burst-enabled": boolean | null; "typos-enabled": boolean | null; "pre-submit-pause-enabled": boolean | null; "send-final-enter": boolean | null; "rephrase-enabled": boolean | null; "rephrase-rate": number | null }
 /**
- * Result of a `check()` call. `version` and `notes` are populated only
- * when an update is available; otherwise `available` is `false` and the
- * fields are `None`.
+ * The editable subset the UI sees.
  */
-export type UpdateInfo = { available: boolean; currentVersion: string; version: string | null; notes: string | null }
+export type UiSettings = { restoreArmed: boolean; keepAwakeMins: number; restoreKeepAwake: boolean }
+/**
+ * Result of a `check()`. `version` and `notes` are set only when an update is
+ * actually available.
+ */
+export type UpdateInfo = { available: boolean; currentVersion: string; version: string | null; notes: string | null; 
+/**
+ * True when the user has already dismissed this exact version.
+ */
+dismissed: boolean }
 
 /** tauri-specta globals **/
 

@@ -3,6 +3,7 @@
 
 pub mod armed;
 pub mod config;
+pub mod diagnostics;
 pub mod library;
 pub mod picker;
 pub mod power;
@@ -12,15 +13,8 @@ pub mod sources;
 pub mod tray;
 pub mod updater;
 
-/// Single source of truth for the command name list.
-///
-/// Every entry here MUST appear in:
-/// - `tauri::generate_handler![...]` in `app::setup::register_commands_and_state`
-/// - `tauri_specta::collect_commands![...]` in `app::setup::generate_typescript_bindings`
-///
-/// The test in `tests/ipc_registry.rs` cross-checks all three lists at every
-/// `cargo test` run, so adding a command without registering it everywhere
-/// fails CI before it can ship.
+/// Single source of truth for the command list; `generate_handler!` and
+/// `collect_commands!` must match it in order, and a test enforces that.
 pub const COMMAND_NAMES: &[&str] = &[
     "get_armed",
     "toggle_armed",
@@ -28,8 +22,17 @@ pub const COMMAND_NAMES: &[&str] = &[
     "is_playing",
     "is_hook_alive",
     "open_accessibility_settings",
+    "reset_accessibility",
     "get_keep_awake",
     "toggle_keep_awake",
+    "set_keep_awake_duration",
+    "set_keep_awake_restore",
+    "get_diagnostics",
+    "run_self_test",
+    "self_test_type",
+    "open_diagnostics",
+    "get_settings",
+    "set_restore_armed",
     "list_prompts",
     "library_root",
     "save_prompt",
@@ -48,6 +51,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "updater_current_version",
     "updater_check",
     "updater_install",
+    "updater_announced",
+    "updater_dismiss",
     "capture_foreground_app",
     "expand_prompt_text",
     "import_prompt",
@@ -78,10 +83,8 @@ pub const COMMAND_NAMES: &[&str] = &[
 
 #[cfg(test)]
 mod registry_tests {
-    //! Cross-check tests for the IPC command registry. Run on every
-    //! platform via `cargo test` (no Tauri runtime dependency, unlike
-    //! `tests/ipc_registry.rs`). Catches drift between `COMMAND_NAMES`
-    //! and the macro lists in `app/setup.rs`.
+    //! Registry cross-checks with no Tauri runtime dependency, so they run on
+    //! every platform. Catches drift between `COMMAND_NAMES` and the macros.
     use super::COMMAND_NAMES;
 
     const SETUP_RS: &str = include_str!("../app/setup.rs");

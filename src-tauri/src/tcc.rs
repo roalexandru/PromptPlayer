@@ -1,10 +1,9 @@
-//! §9.1 — macOS TCC reset utility.
-//!
-//! When Accessibility permission gets stuck in the "approved but not working"
-//! state (common after upgrades or signing changes), surface a one-click
-//! "Reset & Reapprove" that runs:
-//!     tccutil reset Accessibility com.roalexandru.promptplayer
-//! and walks the user back through the System Settings approval flow.
+//! §9.1 — macOS Accessibility (TCC). `reset_accessibility` fixes the
+//! "approved but not working" state an unsigned upgrade leaves behind, and is
+//! surfaced by the diagnostics window's "Reset & Reapprove".
+
+/// Bundle id, locked (CI asserts it) — see `tauri.conf.json`.
+pub const BUNDLE_ID: &str = "com.roalexandru.promptplayer";
 
 #[cfg(target_os = "macos")]
 fn ax_is_trusted(prompt: bool) -> bool {
@@ -33,10 +32,8 @@ pub fn is_accessibility_trusted() -> bool {
     ax_is_trusted(false)
 }
 
-/// First-launch probe. Setting `prompt=true` makes macOS register this app in
-/// the Accessibility list (so the System Settings pane has something to toggle)
-/// and surfaces the system permission prompt. Idempotent — safe to call on every
-/// launch; if already trusted it just returns true with no UI.
+/// First-launch probe: prompting registers us in the Accessibility list so the
+/// pane has a toggle. Idempotent, and silent when already trusted.
 #[cfg(target_os = "macos")]
 pub fn prompt_for_accessibility() -> bool {
     ax_is_trusted(true)
@@ -55,16 +52,26 @@ pub fn prompt_for_accessibility() -> bool {
 /// Run `tccutil reset Accessibility <bundle_id>`. macOS only.
 /// Returns the exit status of the subprocess.
 #[cfg(target_os = "macos")]
-pub fn reset_accessibility(bundle_id: &str) -> std::io::Result<std::process::ExitStatus> {
-    std::process::Command::new("tccutil")
+pub fn reset_accessibility(bundle_id: &str) -> bool {
+    match std::process::Command::new("tccutil")
         .args(["reset", "Accessibility", bundle_id])
         .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            tracing::warn!("tccutil reset Accessibility exited {}", status);
+            false
+        }
+        Err(e) => {
+            tracing::warn!("tccutil reset Accessibility failed: {}", e);
+            false
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn reset_accessibility(_bundle_id: &str) -> std::io::Result<std::process::ExitStatus> {
-    use std::os::process::ExitStatusExt;
-    Ok(std::process::ExitStatus::from_raw(0))
+pub fn reset_accessibility(_bundle_id: &str) -> bool {
+    false
 }
 
 /// Open the System Settings → Privacy & Security → Accessibility pane.

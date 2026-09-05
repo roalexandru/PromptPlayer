@@ -25,9 +25,8 @@
   let pendingKey = $state<string | null>(null);
   let inputEl = $state<HTMLDivElement | null>(null);
 
-  // Reserved Prompt Player globals + per-OS system shortcuts. Selected at
-  // module-eval time from `IS_MAC` so we can do an O(1) lookup against the
-  // normalized hotkey string and surface a precise "claimed by …" message.
+  // Reserved globals plus per-OS system shortcuts, picked at module eval so a
+  // collision is an O(1) lookup with a precise "claimed by …" message.
   const RESERVED_MAC: Record<string, string> = {
     "cmd+shift+p": "Prompt Player arm/disarm",
     "alt+cmd+\\": "Prompt Player picker",
@@ -121,9 +120,8 @@
       .split(/[+\-\s]+/)
       .filter((p) => p.length > 0)
       .map((p) => {
-        // On Mac we collapse super/win/meta to "cmd" (single primary key).
-        // On Windows we keep "win" distinct from "ctrl" so reserved-list
-        // collisions match correctly (Win+L vs Ctrl+L).
+        // Mac collapses super/win/meta to "cmd"; Windows keeps "win" distinct
+        // from "ctrl" so Win+L and Ctrl+L match the reserved list separately.
         if (IS_MAC) {
           if (p === "command" || p === "meta" || p === "super" || p === "win" || p === "windows") return "cmd";
         } else {

@@ -1,8 +1,9 @@
 //! Armed-state IPC commands.
 
+use crate::app::context::AppContext;
 use crate::app::shortcuts;
 use crate::state::AppState;
-use crate::telemetry::{self, TelemetryEvent};
+use crate::telemetry::{self, CancelReason, TelemetryEvent};
 use std::sync::Arc;
 use tauri::AppHandle;
 
@@ -14,21 +15,23 @@ pub fn get_armed(state: tauri::State<'_, Arc<AppState>>) -> bool {
 
 #[tauri::command]
 #[specta::specta]
-pub fn toggle_armed(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) -> bool {
-    let new = state.toggle_armed();
-    shortcuts::refresh_tray_popup(&app);
-    telemetry::send(&app, TelemetryEvent::ArmToggled { armed: new });
+pub fn toggle_armed(app: AppHandle, ctx: tauri::State<'_, AppContext>) -> bool {
+    let new = ctx.state.toggle_armed();
+    shortcuts::set_armed_and_report(&app, &ctx, new);
     new
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn kill(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) {
-    state.cancel_playback();
+    // Read before cancelling: `was_playing=false` means the user hit the kill
+    // switch with nothing in flight, which reads nothing like a real abort.
+    let was_playing = state.is_playing();
+    state.cancel_playback_with(CancelReason::Kill);
     // §2.7 — same red flash as the global kill-switch, so an abort from the
     // tray's "Stop typing" row is as visible as one from the hotkey.
     crate::app::tray_flash::flash_kill(&app);
-    telemetry::send(&app, TelemetryEvent::PromptKilled);
+    telemetry::send(&app, TelemetryEvent::PromptKilled { was_playing });
 }
 
 /// True while a typing playback is in flight. Used by the tray Quit handler
@@ -39,29 +42,38 @@ pub fn is_playing(state: tauri::State<'_, Arc<AppState>>) -> bool {
     state.is_playing()
 }
 
-/// True iff the platform keyboard hook is currently installed and dispatching
-/// events. False on macOS when Accessibility permission is missing or the tap
-/// failed to install. The tray popup uses this to surface a "Grant Accessibility"
-/// row instead of silently failing.
+/// Whether the keyboard hook is installed and dispatching. The tray uses it to
+/// warn instead of failing silently.
 #[tauri::command]
 #[specta::specta]
 pub fn is_hook_alive(state: tauri::State<'_, Arc<AppState>>) -> bool {
     state.hook_alive()
 }
 
-/// Open the macOS System Settings → Privacy & Security → Accessibility pane and
-/// re-prompt. The prompt call adds this app to the Accessibility list (if not
-/// already present) so the user has something to toggle when the pane opens.
-/// On Windows this is a no-op (no equivalent permission system).
+/// Open the macOS Accessibility pane, re-prompting first so we're listed there
+/// and the user has something to toggle. No-op on Windows.
 #[tauri::command]
 #[specta::specta]
 pub fn open_accessibility_settings() {
     #[cfg(target_os = "macos")]
     {
-        // Trigger the prompt first — this adds us to the Accessibility list if
-        // we aren't already there, so the System Settings pane has the right
-        // entry visible when the user lands on it.
+        // Prompt first so we're in the Accessibility list before the pane opens.
         let _ = crate::tcc::prompt_for_accessibility();
         crate::tcc::open_accessibility_settings();
     }
+}
+
+/// `tccutil reset Accessibility`, then re-prompt and open the pane. This is the
+/// fix for the "approved but not working" state an unsigned update leaves.
+#[tauri::command]
+#[specta::specta]
+pub fn reset_accessibility(app: AppHandle) -> bool {
+    telemetry::send(&app, TelemetryEvent::AccessibilityReset);
+    if !crate::tcc::reset_accessibility(crate::tcc::BUNDLE_ID) {
+        return false;
+    }
+    // Re-register in the list, then send the user to the toggle.
+    let _ = crate::tcc::prompt_for_accessibility();
+    crate::tcc::open_accessibility_settings();
+    true
 }

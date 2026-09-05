@@ -1,12 +1,6 @@
-//! §3.2 — typo model.
-//!
-//! - Rate: ~1 typo per 90 chars (profile-configurable).
-//! - Skip rules: prompts <30 chars, within trigger word, first 5 chars.
-//! - Type distribution: 80% adjacent-substitution, 15% transposition, 5% omission.
-//! - Layout-aware: QWERTY default; AZERTY/Colemak optional.
-//! - Detection latency: 1–3 chars uniform.
-//! - "I noticed" pause: Normal(350, 100) ms.
-//! - Correction: backspace (latency+1), retype.
+//! §3.2 — typo model: ~1 per 90 chars, 80/15/5 substitution/transposition/
+//! omission, QWERTY-adjacent, noticed 1–3 chars later after a ~350 ms pause,
+//! then backspaced and retyped. Skipped in short prompts and the first 5 chars.
 
 use rand::Rng;
 
@@ -44,11 +38,8 @@ pub fn sample_latency<R: Rng + ?Sized>(rng: &mut R) -> u8 {
     rng.gen_range(1..=3)
 }
 
-/// Should we emit a typo at the given position? Applies the §3.2 skip rules.
-///
-/// - `prompt_len` is the total char count of the body.
-/// - `position` is the current 0-indexed char position in the body.
-/// - `profile_typo_rate` is the per-char probability.
+/// Whether to emit a typo at `position`, applying the §3.2 skip rules.
+/// `profile_typo_rate` is the per-char probability.
 pub fn should_inject_typo<R: Rng + ?Sized>(
     rng: &mut R,
     position: usize,
@@ -68,9 +59,8 @@ pub fn should_inject_typo<R: Rng + ?Sized>(
     rng.gen::<f64>() < profile_typo_rate
 }
 
-/// Pick a wrong character that simulates a finger slip.
-/// QWERTY adjacency by default. Returns the original char if no neighbor exists
-/// (rare, e.g. obscure punctuation).
+/// A QWERTY-adjacent wrong character, or the original when it has no neighbor
+/// (obscure punctuation).
 pub fn adjacent_qwerty<R: Rng + ?Sized>(c: char, rng: &mut R) -> char {
     let lower = c.to_ascii_lowercase();
     let neighbors: &[char] = match lower {

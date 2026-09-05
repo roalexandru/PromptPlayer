@@ -1,18 +1,8 @@
-//! §6.2 — VS Code-style placeholders.
+//! §6.2 — VS Code-style placeholders: tab stops, the built-in variables listed
+//! in `builtin_var`, and `${VAR/regex/repl/flags}` with case modifiers.
 //!
-//! Supported now (Phase 5):
-//!  - `$N` and `${N}` tab stops (rendered in Phase 5 as empty; Phase 6's picker handles fill-in).
-//!  - `${N:default}` tab stops with default — rendered as default text.
-//!  - `$0` final cursor position (rendered as empty).
-//!  - `$NAME` and `${NAME}` built-in variables: `CLIPBOARD`, `SELECTION`, `DATE`,
-//!    `TIME`, `DATETIME`, `UUID`, `APP_NAME`, `APP_BUNDLE`, `WINDOW_TITLE`,
-//!    `USER`, `MACHINE`, `RANDOM`, `TM_FILENAME`.
-//!  - `${VAR/regex/repl/flags}` transformation with case modifiers
-//!    (`/upcase`, `/downcase`, `/capitalize`, `/camelcase`, `/pascalcase`,
-//!    `/kebabcase`).
-//!
-//! Choice placeholders `${1|a,b,c|}` are recognized and reported but resolved
-//! by the Picker UI in Phase 6 (no modal popups per §6.4).
+//! Choices `${1|a,b,c|}` are recognized here but resolved by the picker, since
+//! §6.4 rules out modal popups.
 
 use chrono::Local;
 use serde::Serialize;
@@ -464,12 +454,8 @@ fn hostname() -> Option<String> {
     }
 }
 
-/// Apply `${VAR/regex/repl/flags}` transformation. We support a subset:
-/// - regex match + group references via `${N:/upcase}` etc.
-/// - case modifiers on the captured value when `repl` is empty or when format includes
-///   `${1:/upcase}` style hints.
-///
-/// For Phase 5 we implement the simple cases — full VS Code transform syntax is large.
+/// `${VAR/regex/repl/flags}`, as a subset: group references and case modifiers
+/// on the captured value. Full VS Code transform syntax is much larger.
 fn apply_transform(value: &str, spec: &str) -> String {
     // spec format: `regex/repl/flags` — slashes inside nested `${...}` don't split.
     let parts = split_top_level(spec, '/', 3);

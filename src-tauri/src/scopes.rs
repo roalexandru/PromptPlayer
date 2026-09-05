@@ -38,15 +38,8 @@ pub fn capture_foreground_context() -> ForegroundContext {
     }
 }
 
-/// A cheap, stable identifier for the current foreground app, used to detect
-/// focus changes mid-playback (mac: frontmost app pid; win: foreground HWND).
-/// Returns `None` when it can't be determined — callers treat that as "don't
-/// abort" so a transient read failure never cuts off a legitimate playback.
-///
-/// Note: our own injected keystrokes don't change the foreground (we're an
-/// accessory app on macOS; `SendInput` doesn't activate on Windows), so the
-/// target's identity is stable throughout a normal playback — a change means
-/// real focus loss (a click, Alt/Cmd-Tab, a notification stealing focus).
+/// Process id of the foreground app, for detecting focus loss mid-playback.
+/// `None` is unknown, which callers treat as don't-abort.
 pub fn foreground_identity() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
@@ -56,13 +49,19 @@ pub fn foreground_identity() -> Option<u64> {
     }
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId,
+        };
+        // SAFETY: plain Win32 reads; the null HWND is checked before use and
+        // `pid` is a valid out-pointer for the call.
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.0.is_null() {
-            None
-        } else {
-            Some(hwnd.0 as u64)
+            return None;
         }
+        let mut pid: u32 = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        // Zero pid = lookup failed (window died); unknown, so playback runs on.
+        (pid != 0).then_some(pid as u64)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -117,9 +116,8 @@ fn capture_windows() -> ForegroundContext {
             .and_then(|h| {
                 let mut buf = [0u16; 1024];
                 let mut sz = buf.len() as u32;
-                // QueryFullProcessImageNameW takes a PWSTR (windows-rs newtype)
-                // — wrap the buffer pointer rather than passing the array
-                // reference, which doesn't deref to PWSTR.
+                // Wrap the buffer pointer — an array reference doesn't deref to
+                // the PWSTR newtype this expects.
                 let pwstr = windows::core::PWSTR(buf.as_mut_ptr());
                 let ok =
                     QueryFullProcessImageNameW(h, PROCESS_NAME_FORMAT::default(), pwstr, &mut sz);
@@ -139,12 +137,8 @@ fn capture_windows() -> ForegroundContext {
     }
 }
 
-/// Pick the best prompt id from a set of candidate prompts that share a trigger.
-/// Resolution order per §4.2:
-///   1. Scope must match the foreground context (or be empty).
-///   2. Higher `priority` wins.
-///   3. Tie → more specific scope (more constraints) wins.
-///   4. Final tie → first in input order.
+/// Best candidate among prompts sharing a trigger. §4.2 order: scope must match
+/// (or be empty), then higher `priority`, then more constraints, then input order.
 pub fn pick_best(prompts: &[crate::prompts::Prompt], ctx: &ForegroundContext) -> Option<String> {
     let mut best: Option<&crate::prompts::Prompt> = None;
     let mut best_specificity: i64 = -1;
@@ -294,6 +288,31 @@ fn matches_time_of_day(spec: &str, minute: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Windows arm is raw FFI, so it can't be exercised from a mac test
+    /// runner. Pin the contract textually instead of leaving it unguarded.
+    #[test]
+    fn foreground_identity_reports_a_process_not_a_window() {
+        const SRC: &str = include_str!("scopes.rs");
+        let start = SRC
+            .find("pub fn foreground_identity()")
+            .expect("foreground_identity");
+        let body = &SRC[start..];
+        let body = &body[..body.find("\n}").expect("fn end")];
+
+        // Match the call, not the `use` line — that import names the same
+        // symbol and made an earlier version of this assertion vacuous.
+        assert!(
+            body.contains("GetWindowThreadProcessId(hwnd"),
+            "the Windows arm must resolve the HWND to its owning process — \
+             returning the raw handle aborts playback whenever the target app \
+             opens a tooltip or autocomplete list"
+        );
+        assert!(
+            !body.contains("hwnd.0 as "),
+            "the raw HWND is a window id, not an application id"
+        );
+    }
 
     #[test]
     fn empty_scope_matches_everything() {
