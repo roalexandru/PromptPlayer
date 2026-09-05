@@ -138,3 +138,55 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets
+
+      # TEMPORARY diagnostic: the Windows lib-test binary started failing to
+      # load with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139), which means an
+      # imported function is missing from the DLL that provides it. The loader
+      # doesn't say which one, so cross-reference the exe's import table
+      # against each DLL's actual exports and name it. Revert once fixed.
+      - name: Diagnose Windows loader failure
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $exe = Get-ChildItem target\debug\deps\prompt_player-*.exe |
+                 Sort-Object LastWriteTime | Select-Object -Last 1
+          if (-not $exe) { Write-Host 'no test exe found'; exit 0 }
+          Write-Host "exe: $($exe.FullName) ($($exe.Length) bytes)"
+
+          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse `
+                       -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+          if (-not $dumpbin) { Write-Host 'dumpbin not found'; exit 0 }
+
+          $raw = & $dumpbin.FullName /imports $exe.FullName 2>$null
+          $imports = @{}   # dll -> list of imported names
+          $dll = $null
+          foreach ($line in $raw) {
+            if ($line -match '^\s{4}(\S+\.dll)\s*$') { $dll = $matches[1].ToLower(); $imports[$dll] = @(); continue }
+            if ($dll -and $line -match '^\s+[0-9A-Fa-f]+\s+([A-Za-z_][A-Za-z0-9_@\?\$]*)\s*$') {
+              $imports[$dll] += $matches[1]
+            }
+          }
+          Write-Host "imported DLLs: $($imports.Keys.Count)"
+
+          foreach ($d in $imports.Keys | Sort-Object) {
+            $path = Join-Path $env:WINDIR "System32\$d"
+            if (-not (Test-Path $path)) {
+              $found = (Get-Command $d -ErrorAction SilentlyContinue).Source
+              if ($found) { $path = $found } else { Write-Host "MISSING DLL: $d"; continue }
+            }
+            $ex = & $dumpbin.FullName /exports $path 2>$null
+            $exports = @{}
+            foreach ($line in $ex) {
+              if ($line -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)') { $exports[$matches[1]] = $true }
+              elseif ($line -match '^\s+\d+\s+[0-9A-Fa-f]+\s+(\S+)') { $exports[$matches[1]] = $true }
+            }
+            if ($exports.Count -eq 0) { continue }
+            foreach ($fn in $imports[$d]) {
+              if (-not $exports.ContainsKey($fn)) {
+                Write-Host "MISSING ENTRYPOINT: $d -> $fn"
+              }
+            }
+          }
+          Write-Host 'diagnostic complete'
