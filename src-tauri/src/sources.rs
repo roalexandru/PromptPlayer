@@ -442,6 +442,25 @@ pub fn extract_prompts(archive: &[u8], dest: &Path, subdir: Option<&str>) -> Res
     Ok(written)
 }
 
+/// Read a response body, refusing it as soon as it exceeds `cap`.
+async fn read_capped(mut resp: reqwest::Response, cap: u64) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("read archive body: {e}"))?
+    {
+        if buf.len() as u64 + chunk.len() as u64 > cap {
+            return Err(format!(
+                "archive exceeded the {} MB limit mid-download",
+                cap / (1024 * 1024)
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Fetch (or confirm) one source's cache.
 ///
 /// Skips the archive download when the resolved commit already matches the
@@ -489,13 +508,12 @@ pub async fn fetch_into(root: &Path, spec: &SourceSpec) -> Result<FetchOutcome, 
             ));
         }
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("read archive body: {e}"))?;
-    if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
-        return Err("archive exceeded the size limit mid-download".into());
-    }
+    // Stream with a running cap rather than `bytes()`. GitHub's tarball
+    // endpoint is chunked and often sends no `Content-Length`, so the check
+    // above can be skipped entirely — and `bytes()` buffers the whole body
+    // first, meaning the post-hoc length check only fires after the memory is
+    // already committed.
+    let bytes = read_capped(resp, MAX_ARCHIVE_BYTES).await?;
 
     // Pass one: the pack manifest, which can redirect and gate what follows.
     let pack = read_pack_manifest(&bytes);

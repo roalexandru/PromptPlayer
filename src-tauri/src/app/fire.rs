@@ -255,6 +255,11 @@ impl FireService {
                     // A playback is already running — don't stomp it.
                     return;
                 };
+                // Same RAII guard the fire path uses. Three hand-written
+                // `end_playback()` calls were correct, but one early return
+                // away from leaving `playing` true forever — which silently
+                // disables every trigger for the rest of the session.
+                let _playback_guard = PlaybackEndGuard::new(app_state.clone());
                 let mut inj = match EnigoInjector::new() {
                     Ok(i) => i,
                     Err(e) => {
@@ -265,20 +270,18 @@ impl FireService {
                                 stage: InjectionStage::Undo,
                             },
                         );
-                        app_state.end_playback();
                         return;
                     }
                 };
                 for _ in 0..entry.body_chars_typed {
                     if control.is_cancelled() {
                         inj.release_all_modifiers();
-                        app_state.end_playback();
                         return;
                     }
                     inj.press_backspace();
                     thread::sleep(std::time::Duration::from_millis(15));
                 }
-                app_state.end_playback();
+                drop(_playback_guard);
                 // Re-sync the ring with the screen: the trigger is still visible
                 // but was popped at fire time.
                 let now = std::time::Instant::now();
