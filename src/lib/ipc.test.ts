@@ -1,10 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 
-// `ipc.ts` is a thin façade over the auto-generated tauri-specta bindings
-// in `ipc.gen.ts`. Mocking the generated file lets us assert that the
-// façade preserves the expected wrapper shape (a regression guard for the
-// API surface — if a method goes missing the caller breaks at compile time
-// in TS, but rename drift in the gen file would break at runtime).
+// Mocking `ipc.gen.ts` lets us assert the façade's shape. TS catches a missing
+// method at compile time, but rename drift in the gen file breaks at runtime.
 
 describe("ipc façade", () => {
   it("exposes the expected method surface", async () => {
@@ -34,6 +31,17 @@ describe("ipc façade", () => {
       "isPlaying",
       "isHookAlive",
       "openAccessibilitySettings",
+      "resetAccessibility",
+      "getKeepAwake",
+      "toggleKeepAwake",
+      "setKeepAwakeDuration",
+      "setKeepAwakeRestore",
+      "getDiagnostics",
+      "runSelfTest",
+      "selfTestType",
+      "openDiagnostics",
+      "getSettings",
+      "setRestoreArmed",
       "listPrompts",
       "libraryRoot",
       "savePrompt",
@@ -52,6 +60,8 @@ describe("ipc façade", () => {
       "updaterCurrentVersion",
       "updaterCheck",
       "updaterInstall",
+      "updaterAnnounced",
+      "updaterDismiss",
       "captureForegroundApp",
       "expandPromptText",
       "importPrompt",
@@ -61,5 +71,8 @@ describe("ipc façade", () => {
     for (const key of expected) {
       expect(typeof (ipc as Record<string, unknown>)[key]).toBe("function");
     }
+    // Both directions: a new command added to the façade without being listed
+    // here is drift too, and the one-way check let `getKeepAwake` go unnoticed.
+    expect(Object.keys(ipc).sort()).toEqual([...expected].sort());
   });
 });

@@ -3,7 +3,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
   import { confirm } from "@tauri-apps/plugin-dialog";
-  import { ipc, type Prompt } from "$lib/ipc";
+  import { ipc, type Prompt, type KeepAwakeState } from "$lib/ipc";
   import { IS_MAC } from "$lib/platform";
 
   let armed = $state(false);
@@ -11,22 +11,20 @@
   // True while a typing playback is in flight — drives the emergency
   // "Stop typing" row at the top of the popup.
   let playing = $state(false);
-  // hookAlive == false on macOS means the CGEventTap couldn't install (almost
-  // always Accessibility permission). The tray surfaces a red banner row that
-  // deep-links to System Settings. The Rust-side watcher respawns the hook
-  // when permission flips on, so the banner disappears automatically — we
-  // re-poll on every popover show to pick that up without a heavier event bus.
-  let hookAlive = $state(true);
-  // Keep-awake: when on, the OS won't dim/screensaver/sleep. In-memory only
-  // (resets each launch, like `armed`). Re-polled on every popover show.
-  let keepAwake = $state(false);
+  // Hook health. Tri-state on purpose: "unknown" is not "fine", and defaulting
+  // a failed read to alive hides the one warning that matters.
+  let hookStatus = $state<"ok" | "dead" | "unknown">("ok");
+  // macOS Secure Input is engaged, so triggers are gated off right now.
+  let secureInput = $state(false);
+  // Keep-awake, with the auto-off the backend is enforcing.
+  let keepAwake = $state<KeepAwakeState | null>(null);
+  let showAwakeMenu = $state(false);
   let unlisten: UnlistenFn | null = null;
   let unlistenUpdate: UnlistenFn | null = null;
   let rootEl = $state<HTMLDivElement | null>(null);
 
-  // Updater state. `update` is null when no update is known to be available.
-  // `checkState` flips between idle/checking/checked/error to drive the menu
-  // entry label without leaking error detail to the user.
+  // Updater state. `checkState` drives the row's label without surfacing any
+  // error detail to the user.
   type CheckState =
     | { kind: "idle" }
     | { kind: "checking" }
@@ -36,9 +34,8 @@
     | { kind: "installing" };
   let checkState = $state<CheckState>({ kind: "idle" });
   let currentVersion = $state<string>("");
-  // JS-driven hover. CSS :hover is unreliable inside non-activating NSPanels
-  // because WKWebView doesn't always dispatch mouse-moved events to the
-  // CSS engine. Tracking hover in Svelte state bypasses the issue entirely.
+  // JS hover: WKWebView in a non-activating NSPanel doesn't reliably feed
+  // mouse-moved events to the CSS engine, so `:hover` misses.
   let hoverKey = $state<string | null>(null);
 
   // Right-click context menu — anchored at click position; one prompt at a
@@ -68,24 +65,29 @@
       playing = false;
     }
     try {
-      hookAlive = await ipc.isHookAlive();
+      // One read covers hook health and the Secure Input gate, which is
+      // otherwise invisible while it silently swallows every trigger.
+      const d = await ipc.getDiagnostics();
+      hookStatus = d.hookAlive ? "ok" : "dead";
+      secureInput = d.secureInputActive;
     } catch {
-      // If the IPC fails (shouldn't happen) assume alive — better to under-
-      // report than spam the user with a false-positive permission banner.
-      hookAlive = true;
+      hookStatus = "unknown";
+      secureInput = false;
     }
     try {
       keepAwake = await ipc.getKeepAwake();
     } catch {
-      keepAwake = false;
+      keepAwake = null;
     }
   }
 
-  async function fixAccessibility() {
+  // Send the user to the diagnostics window rather than straight to System
+  // Settings: if the checkbox is already ticked, the pane alone doesn't help.
+  async function openDiagnostics() {
     try {
-      await ipc.openAccessibilitySettings();
+      await ipc.openDiagnostics();
     } catch (e) {
-      console.error("open accessibility failed", e);
+      console.error("open diagnostics failed", e);
     }
     await dismiss();
   }
@@ -94,23 +96,41 @@
     armed = await ipc.toggleArmed();
   }
 
-  // Keep-awake toggle. Optimistic flip so the checkmark responds instantly;
-  // reconcile with the backend's authoritative return (rolls back on error).
   async function toggleKeepAwake() {
-    const optimistic = !keepAwake;
-    keepAwake = optimistic;
     try {
       keepAwake = await ipc.toggleKeepAwake();
     } catch (e) {
       console.error("toggle keep-awake failed", e);
-      keepAwake = !optimistic;
     }
   }
 
-  // Left-click on a pinned prompt FIRES it (Apple Shortcuts behavior). The
-  // tray popup hides itself; the menu bar / system tray click never activated
-  // the app, so the user's foreground app is still focused — the typing
-  // engine delivers into it.
+  async function pickAwakeDuration(mins: number) {
+    showAwakeMenu = false;
+    try {
+      keepAwake = await ipc.setKeepAwakeDuration(mins);
+      if (!keepAwake.enabled) keepAwake = await ipc.toggleKeepAwake(mins);
+    } catch (e) {
+      console.error("set keep-awake duration failed", e);
+    }
+  }
+
+  function durationLabel(mins: number): string {
+    if (mins === 0) return "Until I turn it off";
+    return mins >= 60 ? `${mins / 60} hour${mins === 60 ? "" : "s"}` : `${mins} minutes`;
+  }
+
+  // "Keep Awake · 1h 12m left" — an eight-hour session shouldn't hide behind
+  // an anonymous checkmark.
+  const keepAwakeSuffix = $derived.by(() => {
+    if (!keepAwake?.enabled) return "";
+    const secs = keepAwake.remainingSecs;
+    if (secs == null) return "no limit";
+    const mins = Math.ceil(secs / 60);
+    return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m left` : `${mins}m left`;
+  });
+
+  // Left-click fires it (Apple Shortcuts behavior). The tray click never
+  // activated us, so the user's app still has focus to receive the typing.
   async function firePrompt(p: Prompt) {
     try {
       await ipc.trayFirePrompt(p.id);
@@ -181,11 +201,8 @@
     }
   }
 
-  // The tray menu only surfaces the updater row when there's actually something
-  // to act on (an available update, or an in-progress install). Manual "Check
-  // for Updates" lives in the About window; the 6h background poller flips
-  // checkState to `available` when a new release publishes, and that's when
-  // the row appears.
+  // Only shown when there's something to act on. Manual checks live in About;
+  // the 6h poller flips `checkState` when a release lands.
   const showUpdateRow = $derived(
     checkState.kind === "available" || checkState.kind === "installing"
   );
@@ -199,6 +216,18 @@
   const updateClickable = $derived(checkState.kind === "available");
   function onUpdateClick() {
     if (checkState.kind === "available") installUpdate();
+  }
+
+  // Clears the tray badge and stops the nag until a newer version ships.
+  async function skipUpdate() {
+    if (checkState.kind !== "available") return;
+    const version = checkState.version;
+    checkState = { kind: "idle" };
+    try {
+      await ipc.updaterDismiss(version);
+    } catch (e) {
+      console.error("dismiss update failed", e);
+    }
   }
 
   function onKey(e: KeyboardEvent) {
@@ -229,9 +258,8 @@
     if (!e.relatedTarget) onLeaveDocument();
   }
 
-  // Some WKWebView + NSPanel combos drop mouse-moved events. As a last
-  // resort, poll on rAF using the most recent known cursor position.
-  // Cheap (no allocation; one elementFromPoint per frame).
+  // Last resort for WKWebView+NSPanel combos that drop mouse-moved entirely:
+  // one `elementFromPoint` per frame against the last known cursor position.
   function startPoll() {
     let prev: string | null = null;
     const tick = () => {
@@ -247,9 +275,8 @@
 
   let unlistenMouseMove: UnlistenFn | null = null;
 
-  // Block the WebView's default browser context menu (Reload / Inspect
-  // Element) on rows other than prompts. Prompt rows have their own custom
-  // context menu via `onPromptContextMenu`.
+  // Suppress the browser context menu everywhere except prompt rows, which
+  // have their own via `onPromptContextMenu`.
   function blockBrowserContextMenu(e: MouseEvent) {
     e.preventDefault();
   }
@@ -325,12 +352,16 @@
   onMount(async () => {
     await refresh();
     currentVersion = await ipc.updaterCurrentVersion();
-    // Background poller in Rust emits `update-available` when its 6h check
-    // turns up a new release. Surface it in the menu without forcing the
-    // user to click "Check for updates…".
+    // The Rust poller emits this on its 6h check, so the row appears without
+    // the user having to go looking.
     unlistenUpdate = await listen<{ version: string; notes: string | null }>(
       "update-available",
-      (e) => { checkState = { kind: "available", version: e.payload.version }; },
+      (e) => {
+        checkState = { kind: "available", version: e.payload.version };
+        // Records that the affordance was actually rendered — the update
+        // funnel used to be a single point with no shown/dismissed steps.
+        ipc.updaterAnnounced(e.payload.version).catch(() => {});
+      },
     );
     await fitWindow();
     document.addEventListener("mousemove", onAnyMouseMove, true);
@@ -346,11 +377,8 @@
       ctxMenu = null;
       await fitWindow();
     });
-    // Native bridge: macOS NSEvent monitor in Rust feeds us cursor positions
-    // (x, y in CSS px relative to the popover window) since WKWebView in a
-    // non-activating NSPanel drops mouse-moved events. WebView2 on Windows
-    // dispatches mouse-move natively, so the bridge is never installed and
-    // we skip subscribing to avoid a no-op IPC listener.
+    // macOS only: an NSEvent monitor in Rust feeds cursor positions, since the
+    // panel's webview drops mouse-moved. WebView2 dispatches them natively.
     if (IS_MAC) {
       unlistenMouseMove = await listen<[number, number]>(
         "tray-popup-mousemove",
@@ -394,10 +422,8 @@
   // prompts still fire from triggers; they're just not in the menu.
   const pinnedPrompts = $derived(prompts.filter((p) => p.pinned));
   const hasAnyPrompts = $derived(prompts.length > 0);
-  // Source of truth: src-tauri/src/app/shortcuts.rs.
-  // Picker (Command Palette): Modifiers::ALT | PRIMARY + Code::Backslash
-  //   → Mac: ⌘⌥\, Win: Ctrl+Alt+\.
-  // Library has no global shortcut registered — don't show one in the menu.
+  // Mirrors src-tauri/src/app/shortcuts.rs — ⌘⌥\ on Mac, Ctrl+Alt+\ on Windows.
+  // Library has no global shortcut, so it shows none.
   const primaryShortcut = IS_MAC ? "⌘⌥\\" : "Ctrl+Alt+\\";
   const quitShortcut = IS_MAC ? "⌘Q" : "Ctrl+Q";
 </script>
@@ -445,20 +471,29 @@
 
   <div class="sep"></div>
 
-  {#if !hookAlive && IS_MAC}
-    <!-- Surface the silent-fail mode where Accessibility wasn't granted (or
-         was revoked). Without this banner the user sees toggle=on, types a
-         trigger, and nothing happens — the worst kind of silent failure. -->
+  {#if hookStatus !== "ok"}
+    <!-- Without this the user sees toggle=on, types a trigger, and nothing
+         happens. "unknown" shows too — a failed read is not reassurance. -->
     <button
       class="row warn"
       class:hover={hoverKey === "ax"}
       data-hkey="ax"
-      onclick={fixAccessibility}
+      onclick={openDiagnostics}
       title="The keyboard listener is not running"
     >
       <span class="warn-dot"></span>
-      <span class="label">Grant Accessibility…</span>
+      <span class="label">
+        {hookStatus === "dead" ? "Triggers won't fire — fix…" : "Status unavailable — check…"}
+      </span>
     </button>
+    <div class="sep"></div>
+  {:else if secureInput}
+    <!-- The gate is shut right now: keystrokes pass straight through and no
+         trigger can match. Silent until this row existed. -->
+    <div class="row warn static" title="macOS Secure Input is active">
+      <span class="warn-dot"></span>
+      <span class="label">Secure Input active — triggers paused</span>
+    </div>
     <div class="sep"></div>
   {/if}
 
@@ -514,21 +549,43 @@
     <span class="label">Command Palette…</span>
     <span class="shortcut">{primaryShortcut}</span>
   </button>
-  <!-- Keep Awake — checkmark reflects state (macOS menu idiom), matching the
-       Windows native menu's MF_CHECKED. Prevents display sleep / screensaver /
-       idle system sleep while on. -->
+  <!-- Keep Awake — checkmark matches the Windows menu's MF_CHECKED; the
+       suffix shows the auto-off so a long session can't go unnoticed. -->
   <button
     class="row plain"
     class:hover={hoverKey === "keepawake"}
     data-hkey="keepawake"
     role="menuitemcheckbox"
-    aria-checked={keepAwake}
+    aria-checked={keepAwake?.enabled ?? false}
     onclick={toggleKeepAwake}
     title="Prevent the screen from sleeping or the screensaver from starting"
   >
     <span class="label">Keep Awake</span>
-    {#if keepAwake}<span class="check">✓</span>{/if}
+    {#if keepAwakeSuffix}<span class="shortcut">{keepAwakeSuffix}</span>{/if}
+    {#if keepAwake?.enabled}<span class="check">✓</span>{/if}
   </button>
+  <button
+    class="row plain sub"
+    class:hover={hoverKey === "awakedur"}
+    data-hkey="awakedur"
+    onclick={() => (showAwakeMenu = !showAwakeMenu)}
+  >
+    <span class="label">Keep Awake for…</span>
+    <span class="shortcut">{durationLabel(keepAwake?.defaultMins ?? 120)}</span>
+  </button>
+  {#if showAwakeMenu && keepAwake}
+    {#each keepAwake.choices as mins}
+      <button
+        class="row plain sub indent"
+        class:hover={hoverKey === `awake-${mins}`}
+        data-hkey={`awake-${mins}`}
+        onclick={() => pickAwakeDuration(mins)}
+      >
+        <span class="label">{durationLabel(mins)}</span>
+        {#if keepAwake.defaultMins === mins}<span class="check">✓</span>{/if}
+      </button>
+    {/each}
+  {/if}
 
   <div class="sep"></div>
 
@@ -544,7 +601,25 @@
     >
       <span class="label">{updateLabel}</span>
     </button>
+    {#if checkState.kind === "available"}
+      <button
+        class="row plain sub"
+        class:hover={hoverKey === "update-skip"}
+        data-hkey="update-skip"
+        onclick={skipUpdate}
+      >
+        <span class="label">Skip this version</span>
+      </button>
+    {/if}
   {/if}
+  <button
+    class="row plain"
+    class:hover={hoverKey === "diagnostics"}
+    data-hkey="diagnostics"
+    onclick={openDiagnostics}
+  >
+    <span class="label">Diagnostics…</span>
+  </button>
   <button
     class="row plain"
     class:hover={hoverKey === "about"}
@@ -758,6 +833,18 @@
     margin-right: 8px;
     flex-shrink: 0;
     box-shadow: 0 0 6px rgba(255, 159, 10, 0.6);
+  }
+  /* Status text, not an action — no hover affordance. */
+  .row.static {
+    cursor: default;
+  }
+  /* Secondary line under the row it belongs to. */
+  .row.sub .label {
+    padding-left: 14px;
+    color: rgba(255, 255, 255, 0.6);
+  }
+  .row.sub.indent .label {
+    padding-left: 26px;
   }
 
   .label {

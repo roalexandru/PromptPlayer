@@ -1,13 +1,6 @@
-//! NSWorkspace bridge — single source of truth for "which app is in the
-//! foreground" and "activate this PID's app".
-//!
-//! Replaces the duplicate `capture_macos` impls that lived in `scopes.rs` and
-//! `picker/focus.rs`. Both call sites now go through this module.
-//!
-//! Uses the modern `objc2-app-kit` API for type-safe Obj-C calls (no
-//! `msg_send!` macros). This is the migration target for the rest of the
-//! macOS surface — all new platform code should follow the pattern in this
-//! file.
+//! NSWorkspace bridge — the one place answering "which app is foreground" and
+//! "activate this pid". Uses type-safe `objc2-app-kit` rather than `msg_send!`,
+//! the pattern new macOS platform code should follow.
 
 use objc2::rc::Retained;
 use objc2_app_kit::{
@@ -58,9 +51,8 @@ pub fn activate_pid(pid: i32) -> bool {
     }
 }
 
-/// Set our application's activation policy to `.accessory` (no Dock icon,
-/// no Cmd+Tab entry, friendly activation behavior). Should be called once
-/// at app startup.
+/// Set the `.accessory` activation policy — no Dock icon, no Cmd+Tab entry.
+/// Call once at startup.
 pub fn set_accessory_activation_policy() {
     // SAFETY: Tauri's setup hook runs on the main thread.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };

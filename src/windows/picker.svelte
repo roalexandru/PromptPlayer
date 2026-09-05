@@ -20,9 +20,8 @@
     prompts = new Map(all.map((p) => [p.id, p]));
   }
 
-  // Monotonic request token: responses can arrive out of order while the
-  // user types, and applying a stale response would show results for an
-  // older query (and reset the selection against the wrong list).
+  // Monotonic token — responses can arrive out of order while typing, and a
+  // stale one would show results for an older query.
   let searchSeq = 0;
   async function search() {
     const seq = ++searchSeq;
@@ -83,9 +82,8 @@
     return Math.max(1, Math.round((words / promptWpm(p)) * 60));
   }
 
-  // Split a prompt name into plain/highlighted runs from the backend's
-  // match offsets. Offsets index the search haystack (name-first), so only
-  // those < name.length apply here — the rest hit triggers/tags/etc.
+  // Offsets index the whole search haystack (name first), so only those below
+  // `name.length` highlight here; the rest hit triggers and tags.
   function nameSegments(
     name: string,
     highlights: number[],
@@ -152,9 +150,8 @@
     }
     if (e.key === "Enter") {
       e.preventDefault();
-      // Stop propagation so other listeners (and Win32 default `Enter` =
-      // form-submit semantics, which on Windows can race the modifier read)
-      // can't override our mode classification.
+      // Stop propagation so nothing else — including Win32's form-submit
+      // Enter — can race our modifier read and override the mode.
       e.stopPropagation();
       if (e.shiftKey) pick("fast");
       else if (e.altKey) pick("human");
@@ -190,14 +187,8 @@
       clearInterval(focusPollHandle);
       focusPollHandle = null;
     }
-    // Retry focus until the OS (not just the DOM) actually has focus on
-    // our input. The race: `makeKeyWindow` returns before AppKit's run-loop
-    // drains the key transition, so a one-shot focus() can land while the
-    // panel is still not really key, leaving keystrokes routed to the
-    // previously-active app — even though `document.activeElement` looks
-    // correct. The exit condition must be `document.hasFocus() &&
-    // activeElement === inputEl`. setInterval (not rAF) so the loop ticks
-    // even while the panel is alpha-0 / not yet composited.
+    // Retry until the OS, not just the DOM, has focus — `makeKeyWindow` returns
+    // before AppKit drains the transition. setInterval ticks while alpha-0.
     const start = performance.now();
     const tryGrab = () => {
       if (!inputEl) {
@@ -221,13 +212,8 @@
     focusPollHandle = setInterval(tryGrab, 30);
   }
 
-  // Capture-phase keydown handler at document level. The previous
-  // `<svelte:window on:keydown>` worked on Mac but Alt+Enter never fired
-  // its handler on Windows. Capturing on `document` runs the listener
-  // before WebView2's bubble-phase processing of system-key events
-  // (WM_SYSKEYDOWN, which is what tao routes Alt-modified keystrokes
-  // through), so we see Alt+Enter regardless of any later handler that
-  // might consume it.
+  // Capture phase on `document`: WebView2 routes Alt-modified keys through
+  // WM_SYSKEYDOWN, so a bubble-phase handler never saw Alt+Enter on Windows.
   function onKeyCapture(e: KeyboardEvent) {
     onKey(e);
   }
@@ -235,9 +221,7 @@
   onMount(async () => {
     document.addEventListener("keydown", onKeyCapture, true);
     await loadPrompts();
-    // No explicit search() here — the `$effect` above runs once on mount
-    // (and again on every q change), so calling it here too would fire a
-    // duplicate initial query.
+    // No search() here — the `$effect` above already runs once on mount.
     await focusInput();
     // Refocus + clear query each time the picker is shown so subsequent
     // open cycles start fresh with the input ready.
@@ -245,16 +229,11 @@
       await loadPrompts();
       q = "";
       selected = 0;
-      // Run search() explicitly: the reactive `$effect` only re-runs when
-      // `q` actually changes, so if the user dismissed the previous open
-      // with q already empty (the common case), the effect would no-op
-      // and `hits` would stay frozen at its last value. That's the empty
-      // "Nothing here yet" bug — first open happened before any prompts
-      // existed, every subsequent open kept the cached empty array.
+      // Explicit: the effect only re-runs when `q` changes, so reopening with
+      // an already-empty q would keep serving the stale cached results.
       await search();
-      // Yield to the microtask queue so the q="" reactive update + search
-      // effect have flushed before we start the focus poll. Otherwise
-      // focus could be stolen by the list re-render that follows.
+      // Let the q="" update and its search flush first, or the list re-render
+      // steals focus back.
       await Promise.resolve();
       await tick();
       await focusInput();

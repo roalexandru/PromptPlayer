@@ -50,7 +50,8 @@ Cargo workspace (`Cargo.toml` at root) with three member crates:
 - `guest-helper/` — small helper binary.
 
 Frontend `src/` is mounted through per-window HTML entry points at repo root:
-`index.html` (library), `picker.html`, `tray-popup.html`, `about.html`.
+`index.html` (library), `picker.html`, `tray-popup.html`, `about.html`,
+`diagnostics.html`. Each also needs an entry in `vite.config.ts`.
 
 ## Backend module map (`src-tauri/src/`)
 
@@ -63,20 +64,22 @@ Frontend `src/` is mounted through per-window HTML entry points at repo root:
     spawns the update poller, and (debug only) regenerates the TS bindings.
   - `context.rs` — `AppContext`: the master `Clone` handle bundling every
     long-lived `Arc` (state, prompts, matcher, undo, focus, search, rdp,
-    hotkeys, **power**).
+    hotkeys, power, **settings**, **secure_input**, picker_search, fire_count).
   - `shortcuts.rs` — global shortcuts, `rebuild_prompt_hotkeys`,
     `refresh_tray_popup`.
   - `fire.rs` — `FireService`, the typing pipeline (expand → schedule → inject).
   - `lifecycle.rs` — window close-to-hide / focus-loss handlers.
 - `commands/` — **all IPC handlers**, one file per domain (`armed`, `power`,
-  `prompts`, `picker`, `tray`, `updater`, `library`, `shell`). `mod.rs` holds
-  `COMMAND_NAMES` (the single source of truth — see IPC contract below).
+  `prompts`, `picker`, `tray`, `updater`, `library`, `shell`, `diagnostics`).
+  `mod.rs` holds `COMMAND_NAMES` (the single source of truth — see below).
 - `state.rs` — `AppState`: runtime flags (`armed`, `playing`, cancel flag +
   panic-stroke ring, `commit_char`, `hook_alive`). All in-memory.
 - `power/` — **"Keep Awake"** controller (`PowerManager`): inhibits display
   sleep / screensaver / idle system sleep. macOS = IOKit
   `PreventUserIdleDisplaySleep` assertion; Windows = `SetThreadExecutionState`
-  on a dedicated owner thread; other = no-op. In-memory, resets each launch.
+  on a dedicated owner thread; other = no-op. Every session carries a deadline.
+- `settings.rs` — persisted JSON preferences (`Settings` on disk, `UiSettings`
+  over IPC). The only general settings store.
 - `store/` — `PromptStore`: in-memory `Vec<Prompt>` + a `generation` counter;
   mutations write through to the `.pp.md` files on disk.
 - `prompts/` — `Prompt` struct + `.pp.md` load/parse/watch (`library.rs`),
@@ -91,9 +94,10 @@ Frontend `src/` is mounted through per-window HTML entry points at repo root:
   Windows-only: `menu.rs` (native tray menu), `tray_theme.rs` (icon light/dark
   swap). macOS-only: `monitor.rs` (`OutsideClickMonitor`), `nsworkspace.rs`.
 - `picker/` — Command Palette window, focus store, fuzzy search.
-- `telemetry.rs` — Aptabase events (whitelist enum). `tcc.rs` — macOS
-  Accessibility (TCC) permission. `secure_input.rs`, `rdp.rs`, `scopes.rs`,
-  `filters.rs`, `undo.rs`, `hotkey.rs`, `error.rs`.
+- `telemetry.rs` — Aptabase events (whitelist enum; see Telemetry rules below).
+  `tcc.rs` — macOS Accessibility (TCC) permission + `reset_accessibility`.
+  `secure_input.rs` — the gate plus `SecureInputTracker`, which aggregates it.
+  `rdp.rs`, `scopes.rs`, `filters.rs`, `undo.rs`, `hotkey.rs`, `error.rs`.
 
 ## The two-implementation tray menu (important gotcha)
 
@@ -109,7 +113,13 @@ chosen at compile time:
 **Adding/changing a tray item means editing BOTH** — the Svelte markup *and*
 `menu.rs` (`run_menu` to render + an `ID_*` const + a `dispatch` arm) — usually
 bridged by a shared `AppContext` field and an IPC command. The `armed` toggle
-and the new `Keep Awake` toggle are the reference examples end-to-end.
+and the `Keep Awake` toggle are the reference examples end-to-end.
+
+Both paths must also *report*: the Windows `armed` toggle was a bare
+`state.toggle_armed()` for a whole release, so it neither persisted nor emitted
+telemetry. Route state changes through a shared helper
+(`shortcuts::set_armed_and_report`, `commands::picker::summon_picker`) rather
+than reimplementing the sequence per platform.
 
 ## IPC contract (strict 3-place lockstep + codegen)
 
@@ -132,10 +142,16 @@ forbids raw `invoke()` outside `$lib/ipc`.
 
 ## State & persistence
 
-- Runtime flags (`AppState`) and Keep Awake (`PowerManager`) are **in-memory and
-  reset every launch** — `armed` deliberately starts off (§10.1), `commit_char`
-  defaults to `>`. There is **no general settings store** (`tauri-plugin-store`
-  is not a dependency).
+- Runtime flags (`AppState`) and Keep Awake (`PowerManager`) live in memory —
+  `armed` starts off (§10.1), `commit_char` defaults to `>`.
+- **`settings.rs` is the general settings store** — a hand-rolled JSON file at
+  `<app-data>/settings.json` (sibling of `prompts/`, honours
+  `PROMPT_PLAYER_PROMPTS`). No `tauri-plugin-store` dependency. It holds the
+  opt-in `restore_armed` / `restore_keep_awake` flags, the Keep Awake auto-off
+  duration, and update-nag bookkeeping. `Settings` is the on-disk shape;
+  `UiSettings` is the narrower struct exposed over IPC (specta rejects `u64`).
+- Keep Awake sessions are **bounded** — every enable carries a deadline and
+  `PowerManager::expire_if_due` is driven by a poll loop in `setup.rs`.
 - **Prompts persist as one `.pp.md` Markdown file each** under the OS app-data
   dir (macOS `~/Library/Application Support/PromptPlayer/prompts`, Windows
   `%APPDATA%\promptplayer\prompts`; override with `PROMPT_PLAYER_PROMPTS`).
@@ -198,6 +214,29 @@ checks at startup +15s then every 6h and emits an `update-available`
   and release also checks the tag equals `package.json` version. **Bump all three
   together.**
 
+## Writing style — this repository is public
+
+`roalexandru/PromptPlayer` is public. Commit messages, PR bodies, code comments
+and log lines are all read by strangers. Write for a competent engineer who has
+no context on the conversation that produced the change.
+
+**Comments** — 1–2 lines. Explain *why*; the code already says *what*. Module
+headers (`//!`) may run to two short paragraphs. Delete a comment rather than
+let it drift out of date. A comment restating the next line is noise.
+
+**Commit messages** — imperative subject under 72 chars, no trailing period, no
+type prefix required. Wrap the body at 72 and use it to explain the problem and
+why this is the fix. Describe behaviour, not process: "Windows never sent
+`UpdateApplied`", not "fixed the bug found earlier".
+
+**PR bodies** — problem and evidence first, then the change, then how it was
+verified *and what was not*. Prefer tables and short sections to prose walls. A
+reviewer who has to discover a testing gap on their own has been misled.
+
+**Never in a public artifact** — session narration or chat transcripts, "I
+noticed / let me / as requested", apologies, decorative emoji, invented
+metrics, customer names, secrets, or absolute paths under `/Users/<name>`.
+
 ## Conventions & gotchas checklist
 
 - Adding an IPC command → update `COMMAND_NAMES` + both macros in `setup.rs`
@@ -206,6 +245,41 @@ checks at startup +15s then every 6h and emits an `update-available`
 - Adding a managed `.manage()` type → edit BOTH the inline block in `run()` and
   `manage_state()` (a test enforces they match). Adding a field to `AppContext`
   is the low-friction alternative (it's already managed).
+- Adding a window → `tauri.conf.json`, a root `*.html`, a `src/windows/*.ts`
+  mount, and the `rollupOptions.input` map in `vite.config.ts`.
+- **Changing anything shared by `hook/`, `inject/` or `platform/` → cross-check
+  the other OS.** `cargo check -p prompt-player --target x86_64-pc-windows-gnu`
+  from a Mac. A `cfg`-gated module is not compiled on the other host, so a
+  refactor of `hook/mod.rs` can leave `hook/windows.rs` broken with a fully
+  green local build; only the CI matrix would catch it. That check compiles
+  only — it does not link or run, so it cannot catch the next item.
+- **A `#[cfg(test)]` module in the lib must not touch a Tauri runtime type.**
+  Referencing `tauri::Wry` / `App` / `WebviewWindow` from a test retains a
+  WebView2 import that the linker would otherwise strip; the Windows runner
+  cannot resolve it at load and the entire lib test binary dies with
+  `STATUS_ENTRYPOINT_NOT_FOUND` before a single test runs. Gate such tests with
+  `not(target_os = "windows")` — see `app::setup::bindings_tests` and
+  `tests/ipc_registry.rs`.
 - Icons are baked into the binary via `include_bytes!` (runtime paths differ
   between `cargo run` and the packaged bundle).
 - Bump version in all three manifests together.
+
+## Telemetry rules (enforced by `tests/telemetry_contract.rs`)
+
+Four rules, each learned from a defect in the first release's field data:
+
+- **Every `TelemetryEvent` variant needs an emit site.** `PickerSearchChars` and
+  `ExpressionError` shipped dead for three releases.
+- **Aggregate poller output; never emit a raw edge.** `SecureInputDetected`
+  fired per rising edge of a gate that flaps every few seconds — 91% of all
+  events, and it still couldn't say how long the gate stayed shut.
+  `SecureInputTracker` + `flush_secure_input` is the reference pattern.
+- **Health signals must not live downstream of the thing that breaks.**
+  `CommitObserved` is emitted inside the keyboard hook, so a dead hook silences
+  it. `Heartbeat` and `HookStateChanged` run on independent threads.
+- **Never restate an Aptabase column** (`os`, `locale`, `app_version`, …) or
+  ship a field that's a constant or a restatement of another field.
+
+Flush explicitly (`telemetry::send_and_flush`) on any path where the process is
+about to die — the plugin only auto-flushes on `RunEvent::Exit`, which
+`app.restart()` and the Windows installer handoff both bypass.

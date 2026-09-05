@@ -1,11 +1,6 @@
-//! §5.4 — picker window: hide from screen capture by default.
-//!
-//! - macOS: `[NSWindow setSharingType: NSWindowSharingNone]`.
-//! - Windows: `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)`.
-//!
-//! Both APIs cause OS-level screen recorders, broadcasters, and capture-card
-//! drivers to render this window as black/missing. Default-on with no toggle
-//! — rehearsal recording of the picker UI itself is a niche we don't support.
+//! §5.4 — the picker is hidden from screen capture by default, via
+//! `NSWindowSharingNone` on macOS and `WDA_EXCLUDEFROMCAPTURE` on Windows.
+//! Recorders and capture cards render it black. No toggle.
 
 use tauri::WebviewWindow;
 
@@ -40,12 +35,9 @@ mod plat {
 
 #[cfg(target_os = "windows")]
 mod plat {
-    //! Windows applies `WDA_EXCLUDEFROMCAPTURE` to the picker's top-level
-    //! HWND. `SetWindowDisplayAffinity` only accepts top-level windows of the
-    //! calling process — child HWNDs, WebView2's included, are rejected (see
-    //! `platform/windows/capture.rs::apply_display_affinity`) — so there is
-    //! no descendant walk. The helper also detects the Win11 win32k
-    //! `ERROR_NOT_ENOUGH_MEMORY` bug and falls back to `WDA_MONITOR`.
+    //! `WDA_EXCLUDEFROMCAPTURE` on the picker's top-level HWND.
+    //! `SetWindowDisplayAffinity` rejects child windows, WebView2's included,
+    //! so there is no descendant walk — see `windows::capture`.
     use crate::platform::windows::capture::apply_display_affinity;
     use tauri::WebviewWindow;
     use windows::Win32::Foundation::HWND;
@@ -76,11 +68,8 @@ pub fn apply_screen_capture_exclusion(window: &WebviewWindow, hide: bool) -> Res
     plat::set_screen_capture_exclusion(window, hide)
 }
 
-/// Configure the picker window for first show: capture-exclude, position
-/// centered on the screen the user is currently looking at (the one that
-/// contains the cursor) — not the OS "main" screen, which would put the
-/// picker on the wrong display when the user is on a secondary monitor or
-/// inside a fullscreen app on another space.
+/// Prepare the picker for first show: capture-exclude, then center on the
+/// cursor's screen rather than the OS "main" one.
 pub fn prepare_picker(app: &tauri::AppHandle, hide_from_capture: bool) -> Result<(), String> {
     use tauri::Manager;
     if let Some(w) = app.get_webview_window("picker") {

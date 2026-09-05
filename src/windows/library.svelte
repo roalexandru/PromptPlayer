@@ -86,9 +86,8 @@
     draft ? Math.round((wordCount / draftWpm(draft)) * 60 + 1.0) : 0,
   );
 
-  // Frontmatter fields are optional in the on-disk form; the parser fills in
-  // defaults but the generated TS contract reflects the optional shape. Use
-  // these helpers everywhere we touch optional fields.
+  // Frontmatter fields are optional on disk, so the generated TS type is too.
+  // These helpers are the only place that resolves the defaults.
   const EMPTY_OVERRIDES = {} as NonNullable<Prompt["typing_overrides"]>;
   function tov(p: Prompt | null) {
     return p?.typing_overrides ?? EMPTY_OVERRIDES;
@@ -244,9 +243,8 @@
     return s.split(",").map((x) => x.trim()).filter((x) => x.length > 0);
   }
 
-  // Manual drag — call Tauri's startDragging() on mousedown. This works
-  // reliably across the transparent + Overlay + macOSPrivateApi config
-  // where `data-tauri-drag-region` and `-webkit-app-region: drag` are flaky.
+  // Manual `startDragging()` on mousedown — the declarative drag regions are
+  // flaky under transparent + Overlay + macOSPrivateApi.
   async function startDrag(e: MouseEvent) {
     const target = e.target as HTMLElement;
     if (!target.closest(".ribbon")) return;
@@ -299,15 +297,10 @@
     }
   }
 
-  // ──────────────────────────────────────────────────────────────────────
   // §10.2 helpers — scope auto-capture, expression Test, import/export.
-  // ──────────────────────────────────────────────────────────────────────
 
-  // ── Scope editor ──
-  // The scope frontmatter exists in YAML but had no editor surface; new in
-  // this slice. We expose the `app` bundle-ID list (chips) and the optional
-  // window-title-regex. URL-regex / time-of-day stay frontmatter-only —
-  // niche enough that yaml editing is fine.
+  // Scope editor: bundle-ID chips and the window-title regex. URL-regex and
+  // time-of-day stay frontmatter-only.
   function ensureScope(p: Prompt) {
     if (!p.scope) p.scope = { app: [], "window-title-regex": null, "url-regex": null, "time-of-day": null };
     return p.scope;
@@ -326,12 +319,8 @@
     markDirty();
   }
 
-  // ── Capture-foreground flow ──
-  // Hide library, count down 3s while the user focuses the target app, ask
-  // the backend which app is foreground, then re-show. The 3s is enough for
-  // a single deliberate window switch (Cmd+Tab + click) on every system
-  // we've tested. If the captured app is Prompt Player itself the user
-  // didn't switch in time — drop it on the floor with a small toast.
+  // Hide, count down 3s while the user switches apps, capture, re-show.
+  // Capturing ourselves means they didn't switch in time — toast and drop it.
   let capturing = $state(false);
   let captureCountdown = $state(3);
   let captureMsg = $state<string | null>(null);
@@ -366,11 +355,71 @@
     }
   }
 
-  // ── Expression Test ──
-  // Runs the body through expressions + placeholders so authors can verify
-  // a `${{ now.toISOString() }}` block resolves the way they expect without
-  // firing the prompt for real. Empty clipboard / selection / app metadata
-  // is documented in the helper.
+  // Expressions and placeholders were never used in the field, and there was
+  // nowhere in the app that listed them. Click-to-insert reference.
+  let refOpen = $state(false);
+  const SNIPPET_GROUPS = [
+    {
+      title: "Tab stops",
+      items: [
+        { label: "$1", insert: "$1", help: "First tab stop" },
+        { label: "$0", insert: "$0", help: "Final cursor position" },
+        { label: "${1:default}", insert: "${1:default}", help: "Tab stop with default text" },
+        { label: "${1|a,b|}", insert: "${1|a,b|}", help: "Choice, resolved in the picker" },
+      ],
+    },
+    {
+      title: "Variables",
+      items: [
+        { label: "$CLIPBOARD", insert: "$CLIPBOARD", help: "Current clipboard text" },
+        { label: "$SELECTION", insert: "$SELECTION", help: "Selected text" },
+        { label: "$DATE", insert: "$DATE", help: "Today, YYYY-MM-DD" },
+        { label: "$TIME", insert: "$TIME", help: "Current time" },
+        { label: "$APP_NAME", insert: "$APP_NAME", help: "Foreground app name" },
+        { label: "$WINDOW_TITLE", insert: "$WINDOW_TITLE", help: "Foreground window title" },
+        { label: "$UUID", insert: "$UUID", help: "Random UUID" },
+      ],
+    },
+    {
+      title: "Expressions",
+      items: [
+        { label: "today", insert: "${{ today }}", help: "Sandboxed JS — today's date" },
+        { label: "now", insert: "${{ now.toISOString() }}", help: "ISO timestamp" },
+        {
+          label: "format_date",
+          insert: '${{ format_date(now, "%Y-%m-%d") }}',
+          help: "Format a date",
+        },
+        {
+          label: "random_choice",
+          insert: '${{ random_choice(["a", "b"]) }}',
+          help: "Pick one at random",
+        },
+        { label: "app.name", insert: "${{ app.name }}", help: "Foreground app, in JS" },
+      ],
+    },
+  ];
+
+  // Insert at the caret so the reference composes with what's already typed.
+  function insertSnippet(text: string) {
+    if (!draft) return;
+    const el = document.getElementById("prompt-body") as HTMLTextAreaElement | null;
+    const body = draft.body ?? "";
+    const start = el?.selectionStart ?? body.length;
+    const end = el?.selectionEnd ?? body.length;
+    draft.body = body.slice(0, start) + text + body.slice(end);
+    markDirty();
+    // Caret after the inserted text, once Svelte has written the new value.
+    queueMicrotask(() => {
+      if (!el) return;
+      el.focus();
+      const caret = start + text.length;
+      el.setSelectionRange(caret, caret);
+    });
+  }
+
+  // Run the body through expressions + placeholders so authors can check a
+  // `${{ … }}` block without firing for real.
   let testOpen = $state(false);
   let testResult = $state<string>("");
   let testRunning = $state(false);
@@ -930,11 +979,32 @@
                 placeholder="The text the app will type..."
               ></textarea>
               <small class="body-hint">
-                Supports VS Code-style placeholders (<code>$1</code>, <code>$0</code>,
-                <code>${"{1|a,b|}"}</code>), built-in vars
-                (<code>$CLIPBOARD</code>, <code>$SELECTION</code>, <code>$DATE</code>…),
-                and TypeScript expressions (<code>${"{{ now.toISOString() }}"}</code>).
+                Placeholders, built-in variables and TypeScript expressions.
+                <button class="linky" onclick={() => (refOpen = !refOpen)}>
+                  {refOpen ? "Hide reference" : "Show reference"}
+                </button>
               </small>
+              {#if refOpen}
+                <div class="ref-pane">
+                  {#each SNIPPET_GROUPS as group}
+                    <div class="ref-group">
+                      <div class="ref-title">{group.title}</div>
+                      <div class="ref-chips">
+                        {#each group.items as item}
+                          <button
+                            class="chip snippet"
+                            title={item.help}
+                            onclick={() => insertSnippet(item.insert)}
+                          >
+                            <code>{item.label}</code>
+                          </button>
+                        {/each}
+                      </div>
+                    </div>
+                  {/each}
+                  <small class="hint">Click to insert at the cursor.</small>
+                </div>
+              {/if}
               {#if testOpen}
                 <div class="test-pane">
                   <div class="test-header">
@@ -1405,6 +1475,47 @@
     .chip { background: rgba(0, 122, 255, 0.1); }
   }
 
+  /* Placeholder / expression reference */
+  .linky {
+    font: inherit;
+    background: none;
+    border: 0;
+    padding: 0;
+    color: var(--accent);
+    cursor: default;
+    text-decoration: underline;
+  }
+  .ref-pane {
+    margin-top: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--separator);
+    border-radius: 8px;
+    background: var(--bg-card);
+  }
+  .ref-group + .ref-group {
+    margin-top: 10px;
+  }
+  .ref-title {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    opacity: 0.55;
+    margin-bottom: 5px;
+  }
+  .ref-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+  }
+  button.chip.snippet {
+    border: 1px solid transparent;
+    cursor: default;
+  }
+  button.chip.snippet:hover {
+    border-color: var(--accent);
+  }
+
   /* Content */
   .content {
     overflow-y: auto;
@@ -1638,13 +1749,6 @@
     color: var(--text-muted);
     font-size: 11px;
     line-height: 1.5;
-  }
-  .body-hint code {
-    background: var(--hover);
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-size: 11px;
-    color: var(--text-secondary);
   }
 
   /* Body header — label + Test/Hide buttons on the right. */

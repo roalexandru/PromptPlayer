@@ -32,9 +32,8 @@ impl SearchIndex {
         }
     }
 
-    /// Rebuild only if `current_generation` differs from the last build.
-    /// `current_generation` of 0 always rebuilds (guarantees first-build
-    /// works without bookkeeping).
+    /// Rebuild only when the generation changed. Generation 0 always rebuilds,
+    /// so the first build needs no extra bookkeeping.
     pub fn rebuild_if_stale(&mut self, current_generation: u64, prompts: &[Prompt]) {
         if current_generation != 0 && current_generation == self.last_built_generation {
             return;

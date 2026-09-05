@@ -1,22 +1,8 @@
-//! FireService — the single pipeline that takes a prompt id (and the
-//! user-typed form, if any) and produces typed output.
+//! FireService — the one pipeline from prompt id to typed output, shared by
+//! the hook, the picker, the tray and per-prompt hotkeys.
 //!
-//! Used by:
-//! - The keyboard hook's `on_fire` callback (trigger word + commit char).
-//! - The picker's `ipc_picker_select` (mode = human/fast/paste/run).
-//! - Per-prompt global hotkeys (no commit char, no typed form).
-//!
-//! Pipeline:
-//! 1. Capture `ForegroundContext` (what app is focused).
-//! 2. Pick best candidate via `scopes::pick_best` (priority + specificity).
-//! 3. Expand `${{ TS expr }}` blocks (with the foreground context).
-//! 4. Expand VS Code-style placeholders.
-//! 5. Apply filter chain.
-//! 6. Apply case propagation (only when there's a typed form).
-//! 7. Detect RDP host-side mode → schedule with floor + multiplier.
-//! 8. Pre-compute schedule from profile + overrides.
-//! 9. Spawn a typer thread; play schedule via Injector.
-//! 10. On completion, record undo entry (typed form + body length).
+//! Numbered stage comments below follow: capture foreground → pick candidate →
+//! expressions → placeholders → filters → case → RDP → schedule → play → undo.
 
 use crate::app::context::AppContext;
 use crate::filters;
@@ -27,7 +13,10 @@ use crate::prompts::placeholders::{expand, PlaceholderContext};
 use crate::prompts::Prompt;
 use crate::rdp::RdpMode;
 use crate::scopes;
-use crate::telemetry::{self, CancelReason, CharBucket, PromptMode, TargetAppKind, TelemetryEvent};
+use crate::telemetry::{
+    self, CancelReason, CharBucket, DurationBucket, InjectionStage, PromptMode, TargetAppKind,
+    TelemetryEvent,
+};
 use crate::typer::{play_guarded, schedule, Injector, Key, ScheduleOptions};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -69,15 +58,8 @@ impl FireService {
         Self { ctx, app }
     }
 
-    /// Fire a prompt triggered by the keyboard hook (commit-char + typed form).
-    /// `candidate_ids` may contain multiple prompts sharing this trigger;
-    /// `pick_best` resolves by scope+priority+specificity.
-    ///
-    /// Called directly from the OS keyboard-hook callback, which on Windows
-    /// runs under the `LowLevelHooksTimeout` budget (~300ms): exceeding it
-    /// makes Windows silently unhook us. So we do NO work here beyond spawning
-    /// a dispatch thread — foreground capture, the prompt-store read, and
-    /// scope resolution all happen off the hook thread.
+    /// Fire from the hook. Only spawns a thread — this runs under Windows'
+    /// ~300ms `LowLevelHooksTimeout`, and overrunning it unhooks us.
     pub fn fire_from_trigger(&self, candidate_ids: Vec<String>, typed_form: String) {
         let svc = self.clone();
         thread::Builder::new()
@@ -97,13 +79,18 @@ impl FireService {
                     return;
                 }
                 let Some(picked_id) = scopes::pick_best(&candidates, &foreground) else {
-                    // The trigger matched (so the hook already suppressed the
-                    // commit char and popped the trigger from the ring), but no
-                    // candidate's scope matches the current app. Put the eaten
-                    // commit char back so the user isn't left with a silently
-                    // missing `>`, and re-observe trigger+commit so the ring
-                    // mirrors the screen again. All candidates share the same
-                    // commit char (the matcher filters on it).
+                    // Matched but no scope fits: put the eaten commit char back
+                    // and report, since this looks like a broken trigger.
+                    telemetry::send(
+                        &svc.app,
+                        TelemetryEvent::ScopeRejected {
+                            candidates: crate::telemetry::CountBucket::classify(candidates.len()),
+                            target_app_kind: classify_target_app(
+                                &foreground,
+                                svc.ctx.rdp.detect(&foreground),
+                            ),
+                        },
+                    );
                     let commit = candidates[0].commit_char;
                     tracing::debug!("no scope match for trigger; re-injecting '{}'", commit);
                     if let Ok(mut inj) = EnigoInjector::new() {
@@ -131,10 +118,19 @@ impl FireService {
             .expect("spawn fire dispatch thread");
     }
 
-    /// Fire a prompt selected from the picker. Mode controls modifier-on-Enter
-    /// behavior (human cadence, fast, paste, run). Picker runs scope/expr/
-    /// filters too — it's the same pipeline.
+    /// Fire from the picker. `mode` is the modifier-on-Enter behavior; the
+    /// pipeline (scope, expressions, filters) is otherwise identical.
     pub fn fire_from_picker(&self, prompt_id: &str, mode: PickMode) {
+        self.fire_selected(prompt_id, mode, PromptMode::Picker);
+    }
+
+    /// Fire a pinned prompt clicked in the tray. Same pipeline as the picker;
+    /// only the reported mode differs, so tray use is finally distinguishable.
+    pub fn fire_from_tray(&self, prompt_id: &str, mode: PickMode) {
+        self.fire_selected(prompt_id, mode, PromptMode::Tray);
+    }
+
+    fn fire_selected(&self, prompt_id: &str, mode: PickMode, telem_mode: PromptMode) {
         let svc = self.clone();
         let prompt_id = prompt_id.to_string();
         thread::Builder::new()
@@ -151,7 +147,7 @@ impl FireService {
                 // Picker runs after focus restore — capture foreground anew so
                 // scope/expr context reflects the target app, not Prompt Player.
                 let foreground = scopes::capture_foreground_context();
-                svc.run_resolved(prompt, None, PromptMode::Picker, foreground, Some(mode));
+                svc.run_resolved(prompt, None, telem_mode, foreground, Some(mode));
             })
             .expect("spawn picker fire thread");
     }
@@ -170,14 +166,14 @@ impl FireService {
                     return;
                 }
                 let foreground = scopes::capture_foreground_context();
-                svc.run_resolved(prompt, None, PromptMode::Stealth, foreground, None);
+                telemetry::send(&svc.app, TelemetryEvent::HotkeyFired);
+                svc.run_resolved(prompt, None, PromptMode::Hotkey, foreground, None);
             })
             .expect("spawn hotkey fire thread");
     }
 
-    /// Run a fully-resolved fire on the current (dispatch) thread. Acquires the
-    /// playback lock; bails if another playback is already typing so keystrokes
-    /// can't interleave into the same window.
+    /// Run a resolved fire on the dispatch thread. Bails if a playback is
+    /// already typing, so two fires can't interleave into one window.
     fn run_resolved(
         &self,
         prompt: Prompt,
@@ -204,12 +200,8 @@ impl FireService {
         );
     }
 
-    /// Backspace-undo flow — separate from fire because it doesn't run the
-    /// pipeline. The trigger word itself was never erased during expansion
-    /// (the body is typed as a continuation after it), so undo only needs to
-    /// backspace the body chars; the user's original trigger stays on screen.
-    /// We then re-observe the trigger into the matcher buffer (which had it
-    /// popped at fire time) so `trigger>` can fire again immediately after.
+    /// Backspace-undo. Only the body is erased — the trigger was never removed
+    /// — then it's re-observed so `trigger>` can fire again right away.
     pub fn run_undo(&self) {
         let app_state = self.ctx.state.clone();
         let undo = self.ctx.undo.clone();
@@ -229,6 +221,12 @@ impl FireService {
                     Ok(i) => i,
                     Err(e) => {
                         tracing::error!("undo enigo init failed: {:?}", e);
+                        telemetry::send(
+                            &app,
+                            TelemetryEvent::InjectionFailed {
+                                stage: InjectionStage::Undo,
+                            },
+                        );
                         app_state.end_playback();
                         return;
                     }
@@ -243,10 +241,8 @@ impl FireService {
                     thread::sleep(std::time::Duration::from_millis(15));
                 }
                 app_state.end_playback();
-                // Restore the matcher's shadow of the screen: the trigger text
-                // is back on screen (we never erased it), but it was popped
-                // from the ring at fire time. Re-observe it so a fresh `>`
-                // can re-fire without the user retyping the trigger.
+                // Re-sync the ring with the screen: the trigger is still visible
+                // but was popped at fire time.
                 let now = std::time::Instant::now();
                 for c in entry.trigger_form.chars() {
                     matcher.observe_char(c, now);
@@ -271,10 +267,8 @@ fn run_fire_pipeline(
     rdp_registry: Arc<crate::rdp::RdpRegistry>,
 ) {
     let _playback_guard = PlaybackEndGuard::new(app_state.clone());
-    // 1+2 — already done by caller (foreground capture, scope pick).
-    // Read the clipboard only when the body actually references it — avoids
-    // touching the user's clipboard on every fire (privacy + cost). Covers both
-    // the `$CLIPBOARD` placeholder and the `clipboard` expression builtin.
+    // 1+2 done by the caller. Read the clipboard only when referenced — no
+    // reason to touch the user's clipboard on every fire.
     let clipboard = if prompt.body.contains("CLIPBOARD") || prompt.body.contains("clipboard") {
         crate::inject::read_clipboard_text()
     } else {
@@ -293,8 +287,13 @@ fn run_fire_pipeline(
         clipboard: clipboard.clone(),
         ..Default::default()
     };
-    let body_after_expr = crate::prompts::expressions::expand_expressions(&prompt.body, &expr_ctx);
-    let has_expressions = body_after_expr.len() != prompt.body.len();
+    let expansion =
+        crate::prompts::expressions::expand_expressions_reporting(&prompt.body, &expr_ctx);
+    let has_expressions = expansion.had_expressions;
+    for err in &expansion.errors {
+        telemetry::send(&app, TelemetryEvent::ExpressionError { kind: err.kind() });
+    }
+    let body_after_expr = expansion.text;
 
     // 4 — placeholders.
     let ph_ctx = PlaceholderContext {
@@ -332,9 +331,8 @@ fn run_fire_pipeline(
     let mut profile = prompt.effective_profile();
     let mut opts = ScheduleOptions {
         rdp_mode: rdp_mode == RdpMode::HostSide,
-        // Pre-typing pause is only meaningful for the trigger path
-        // (after the suppressed `>`). Picker selections type from a
-        // restored-focus app — no pause needed.
+        // Only meaningful after a suppressed `>`; picker selections type into
+        // an already-restored app.
         include_pre_typing_pause: typed_form.is_some(),
     };
     let mut paste_mode = false;
@@ -342,14 +340,8 @@ fn run_fire_pipeline(
         opts.include_pre_typing_pause = false;
         match mode {
             PickMode::Fast => {
-                // Picker "Fast" is more aggressive than the FAST_PRESENTER
-                // named profile: this is "I want the body NOW but still want
-                // it to look typed, not pasted". Numbers are tuned so every
-                // dial actually takes effect (low `iki_min_ms` keeps the
-                // global floor from clamping `iki_scale` away) and so word
-                // / sentence pauses don't visibly stall — they shrink with
-                // the IKI via `pause_scale`. Burst is disabled because at
-                // this floor it adds no perceptual variety.
+                // More aggressive than FAST_PRESENTER: still typed, but now.
+                // Low `iki_min_ms` keeps the global floor from clamping the scale.
                 profile.iki_scale = 0.16;
                 profile.iki_min_ms = 12.0;
                 profile.pause_scale = 0.2;
@@ -362,23 +354,18 @@ fn run_fire_pipeline(
             _ => {}
         }
     }
-    // RDP host-side: clipboard sync to the remote session is unreliable
-    // (spec §9.3), so a real clipboard paste can silently land the body on
-    // the wrong side. Demote paste to the human-typed path in that case.
+    // §9.3 — RDP clipboard sync is unreliable and can land the body on the
+    // wrong side, so paste falls back to typing.
     if paste_mode && rdp_mode == RdpMode::HostSide {
         tracing::info!("paste demoted to typed flow under RDP host-side mode");
         paste_mode = false;
     }
 
     let target_app = classify_target_app(&foreground, rdp_mode);
-    let scope_match = !matches!(target_app, TargetAppKind::Unknown);
+    let scoped = prompt.scope.is_some();
 
-    // 8 — schedule. Skipped entirely in paste mode: a clipboard paste
-    // dispatches in one Ctrl/Cmd+V keystroke, no per-key cadence to build,
-    // and the previous code threw the schedule away anyway after computing
-    // it. That alone shaves tens of ms off the paste cold-start on big
-    // prompts. The RNG is only seeded when the schedule is actually built,
-    // saving an entropy-pool draw on every paste fire.
+    // 8 — schedule. Skipped for paste: one keystroke, no cadence to build,
+    // and this avoids seeding the RNG on every paste fire.
     let scheduled = if paste_mode {
         Vec::new()
     } else {
@@ -402,23 +389,22 @@ fn run_fire_pipeline(
             )
     };
 
+    let char_bucket = CharBucket::classify(body_chars);
     telemetry::send(
         &app,
         TelemetryEvent::PromptFired {
-            mode: telem_mode,
-            char_count_bucket: CharBucket::classify(body_chars),
+            mode: telem_mode.clone(),
+            char_count_bucket: char_bucket.clone(),
             has_expressions,
             target_app_kind: target_app,
-            scope_match,
+            scoped,
+            paste: paste_mode,
         },
     );
+    let started_at = std::time::Instant::now();
 
-    // 9 — play.
-    // Snapshot the target app's identity so we can bail if focus leaves it
-    // mid-playback (a click, Alt/Cmd-Tab, a notification) — otherwise the
-    // remainder of the prompt gets typed into whatever now has focus (a chat
-    // with a customer, a terminal, a password field). The §2.6 panic ring only
-    // catches *typed* keystrokes; a silent focus change produces none.
+    // 9 — play. Snapshot the target so we can bail on focus loss: the §2.6
+    // panic ring only sees keystrokes, and a silent focus change makes none.
     let target_identity = scopes::foreground_identity();
     let focus_lost = move || match (target_identity, scopes::foreground_identity()) {
         // Abort only when both are known and differ — a transient read failure
@@ -429,13 +415,8 @@ fn run_fire_pipeline(
     let mut focus_changed = false;
     let mut completed_chars = 0usize;
     let completed = if paste_mode {
-        // Clipboard paste: save → set → Ctrl/Cmd+V → wait → restore.
-        // Focus was confirmed by the caller (`picker_select` →
-        // `FocusStore::restore_and_wait`), so the synthesized paste
-        // keystroke lands on the right window. Cancel is checked once
-        // before we touch the clipboard — once Ctrl/Cmd+V is in flight
-        // the paste is effectively atomic, so per-char cancellation
-        // doesn't apply.
+        // save → set → Ctrl/Cmd+V → wait → restore. The caller already
+        // confirmed focus, and once V is in flight the paste is atomic.
         if cancel.load(Ordering::Relaxed) {
             false
         } else {
@@ -448,6 +429,14 @@ fn run_fire_pipeline(
                     tracing::warn!(
                         "clipboard paste failed, falling back to typed playback: {:?}",
                         e
+                    );
+                    // User-visible: paste becomes per-key typing at a very
+                    // different speed. Was tracing-only until now.
+                    telemetry::send(
+                        &app,
+                        TelemetryEvent::InjectionFailed {
+                            stage: InjectionStage::Clipboard,
+                        },
                     );
                     let mut rng = ChaCha8Rng::from_entropy();
                     let fallback_schedule = schedule(&body, &profile, &opts, &mut rng);
@@ -466,6 +455,12 @@ fn run_fire_pipeline(
                         }
                         Err(e) => {
                             tracing::error!("fallback enigo init failed: {:?}", e);
+                            telemetry::send(
+                                &app,
+                                TelemetryEvent::InjectionFailed {
+                                    stage: InjectionStage::Init,
+                                },
+                            );
                             false
                         }
                     }
@@ -477,6 +472,19 @@ fn run_fire_pipeline(
             Ok(i) => i,
             Err(e) => {
                 tracing::error!("enigo init failed: {:?}", e);
+                telemetry::send(
+                    &app,
+                    TelemetryEvent::InjectionFailed {
+                        stage: InjectionStage::Init,
+                    },
+                );
+                telemetry::send(
+                    &app,
+                    TelemetryEvent::PromptCancelled {
+                        reason: CancelReason::Error,
+                        completed_chars_pct: 0,
+                    },
+                );
                 return;
             }
         };
@@ -491,33 +499,43 @@ fn run_fire_pipeline(
     };
 
     if completed {
+        let mut undo_offered = false;
         if let Some(form) = typed_form.as_deref() {
             if profile.send_final_enter {
-                // The profile pressed Enter to submit the message. Backspace-
-                // undo can't un-send it, and the backspaces would delete from
-                // whatever field now has focus (often empty) — so don't arm
-                // undo for a submitted prompt.
+                // Backspace-undo can't un-send a submitted message, and the
+                // backspaces would hit whatever field has focus now.
                 tracing::debug!("not recording undo: prompt was submitted via final Enter");
             } else {
                 undo.record(form.to_string(), body_chars);
+                undo_offered = true;
             }
         }
+        telemetry::send(
+            &app,
+            TelemetryEvent::PromptCompleted {
+                mode: telem_mode,
+                char_count_bucket: char_bucket,
+                duration: DurationBucket::classify(started_at.elapsed()),
+                paste: paste_mode,
+                undo_offered,
+            },
+        );
     } else {
-        // Paste is effectively atomic — `completed=false` means we never
-        // got past the cancel check or the clipboard/Ctrl+V failed before
-        // any character landed. Report 0% so telemetry doesn't claim a
-        // full paste happened when nothing did. The typed-path estimator
-        // uses `remaining_chars(&scheduled)` (still coarse — see the
-        // function comment).
+        // Paste is atomic, so `completed=false` there means nothing landed.
+        // The typed path estimates from `visible_chars` (coarse, see above).
         let pct = if body_chars == 0 {
             0
         } else {
             (completed_chars * 100 / body_chars).min(100) as u8
         };
+        // Focus loss is decided here; everything else was attributed by
+        // whoever tripped the flag (Esc, kill-switch, panic ring).
         let reason = if focus_changed {
             CancelReason::FocusChanged
         } else {
-            CancelReason::UserKeystrokes
+            app_state
+                .take_cancel_reason()
+                .unwrap_or(CancelReason::UserKeystrokes)
         };
         telemetry::send(
             &app,
@@ -549,26 +567,143 @@ fn classify_target_app(ctx: &scopes::ForegroundContext, rdp: RdpMode) -> TargetA
     if rdp == RdpMode::HostSide {
         return TargetAppKind::Rdp;
     }
-    let bundle = ctx.bundle_id.as_deref().unwrap_or("");
+    // Lowercased: bundle ids are capitalised (`com.apple.Safari`), so the old
+    // case-sensitive `contains("safari")` never matched anything.
+    let bundle = ctx.bundle_id.as_deref().unwrap_or("").to_lowercase();
+    let bundle = bundle.as_str();
     let exe = ctx
         .executable
         .as_deref()
         .map(|s| s.rsplit(['/', '\\']).next().unwrap_or(s).to_lowercase())
         .unwrap_or_default();
-    let is_browser = bundle.contains("safari")
-        || bundle.contains("chrome")
-        || bundle.contains("firefox")
-        || bundle.contains("edge")
-        || bundle.contains("brave")
-        || bundle.contains("arc")
-        || exe == "chrome.exe"
-        || exe == "firefox.exe"
-        || exe == "msedge.exe";
-    if is_browser {
+    if is_browser(bundle, &exe) {
         return TargetAppKind::Browser;
     }
     if !bundle.is_empty() || !exe.is_empty() {
         return TargetAppKind::Native;
     }
     TargetAppKind::Unknown
+}
+
+/// Lowercased bundle-id substrings, so channel variants hit the same arm.
+/// Each is distinctive enough not to collide — bare `"arc"` matches `monarch`.
+const BROWSER_BUNDLES: &[&str] = &[
+    "safari",
+    "chrome",
+    "chromium",
+    "firefox",
+    "edgemac",
+    "brave",
+    "thebrowser",
+    "operasoftware",
+    "vivaldi",
+    "zen-browser",
+    "duckduckgo",
+];
+
+/// Windows executable names for browsers, lowercased with extension.
+const BROWSER_EXES: &[&str] = &[
+    "chrome.exe",
+    "chromium.exe",
+    "firefox.exe",
+    "msedge.exe",
+    "brave.exe",
+    "opera.exe",
+    "opera_gx.exe",
+    "vivaldi.exe",
+    "arc.exe",
+    "iexplore.exe",
+    "zen.exe",
+];
+
+/// The original list covered five browsers and three Windows exes, and matched
+/// nothing in 67 days of field data on a tool whose whole job is web demos.
+fn is_browser(bundle: &str, exe: &str) -> bool {
+    BROWSER_BUNDLES.iter().any(|b| bundle.contains(b)) || BROWSER_EXES.contains(&exe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(bundle: &str, exe: &str) -> scopes::ForegroundContext {
+        scopes::ForegroundContext {
+            bundle_id: (!bundle.is_empty()).then(|| bundle.to_string()),
+            executable: (!exe.is_empty()).then(|| exe.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn kind(bundle: &str, exe: &str) -> TargetAppKind {
+        classify_target_app(&ctx(bundle, exe), RdpMode::Off)
+    }
+
+    #[test]
+    fn classifies_macos_browsers_by_bundle_id() {
+        for b in [
+            "com.apple.Safari",
+            "com.google.Chrome",
+            "com.google.Chrome.canary",
+            "org.mozilla.firefox",
+            "com.microsoft.edgemac",
+            "com.brave.Browser",
+            "company.thebrowser.Browser",
+            "com.operasoftware.Opera",
+            "com.vivaldi.Vivaldi",
+            "app.zen-browser.zen",
+            "com.duckduckgo.macos.browser",
+        ] {
+            assert_eq!(kind(b, ""), TargetAppKind::Browser, "bundle {b}");
+        }
+    }
+
+    #[test]
+    fn classifies_windows_browsers_by_exe() {
+        for e in [
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+            "C:\\Program Files (x86)\\Microsoft\\Edge\\msedge.exe",
+            "C:\\Users\\x\\AppData\\Local\\BraveSoftware\\brave.exe",
+            "C:\\Program Files\\Vivaldi\\Application\\vivaldi.exe",
+            "C:\\Users\\x\\AppData\\Local\\Programs\\Opera\\opera.exe",
+        ] {
+            assert_eq!(kind("", e), TargetAppKind::Browser, "exe {e}");
+        }
+    }
+
+    #[test]
+    fn non_browsers_are_native() {
+        // Electron apps embed Chromium but are native windows to the user.
+        for (b, e) in [
+            ("com.tinyspeck.slackmacgap", ""),
+            ("com.microsoft.VSCode", ""),
+            ("com.apple.Terminal", ""),
+            // Substring near-misses the bundle list must not claim.
+            ("com.monarch.app", ""),
+            ("com.example.frozen", ""),
+            ("", "C:\\Program Files\\Slack\\slack.exe"),
+            ("", "C:\\Windows\\System32\\notepad.exe"),
+        ] {
+            assert_eq!(kind(b, e), TargetAppKind::Native, "{b} {e}");
+        }
+    }
+
+    #[test]
+    fn unknown_when_nothing_identifies_the_app() {
+        assert_eq!(kind("", ""), TargetAppKind::Unknown);
+    }
+
+    #[test]
+    fn rdp_wins_over_everything() {
+        assert_eq!(
+            classify_target_app(&ctx("com.google.Chrome", ""), RdpMode::HostSide),
+            TargetAppKind::Rdp
+        );
+    }
+
+    #[test]
+    fn exe_match_is_exact_not_substring() {
+        // `notchrome.exe` must not pass just because it ends in chrome.exe.
+        assert_eq!(kind("", "C:\\tools\\notchrome.exe"), TargetAppKind::Native);
+    }
 }

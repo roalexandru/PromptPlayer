@@ -1,30 +1,6 @@
-//! Integration tests for the picker's `SetWindowDisplayAffinity` handling,
-//! against a bare Win32 window (no Tauri / WebView2 dependency).
-//!
-//! ```text
-//!   parent (popup, off-screen, hidden)
-//!   └── child (WS_CHILD)
-//! ```
-//!
-//! Cases:
-//!  - **A** `apply_display_affinity(WDA_EXCLUDEFROMCAPTURE)` on a top-level
-//!    window succeeds and reads back via `GetWindowDisplayAffinity`.
-//!  - **B** Toggling back with `WDA_NONE` reverts it.
-//!  - **C** Re-applying is idempotent and reports the same effective affinity.
-//!  - **D** A null HWND returns `Err`, no panic.
-//!  - **E** A `WS_CHILD` HWND is rejected by *both* `SetWindowDisplayAffinity`
-//!    and `GetWindowDisplayAffinity`. This is the documented "top-level window
-//!    only" restriction, observed on a real Windows runner (CI run
-//!    33971305104: an earlier descendant walk got `applied=1 attempted=4`).
-//!    It pins why `capture.rs` has no `EnumChildWindows` walk — WebView2's
-//!    child HWNDs cannot be given the flag from the host process.
-//!
-//! Why an integration test and not a unit test: this exercises real Win32
-//! state (RegisterClass, CreateWindow, Set/GetWindowDisplayAffinity), which
-//! is heavier than fits inline in `capture.rs`'s `#[cfg(test)] mod`.
-//! Integration-test placement also avoids the `tauri/test` linkage issue
-//! that gates `tests/ipc_registry.rs` off Windows — we deliberately do not
-//! import `tauri` here.
+//! `SetWindowDisplayAffinity` against a bare Win32 parent/child pair — no
+//! Tauri, so the linkage issue that gates `ipc_registry.rs` off Windows
+//! doesn't apply. The child case pins why `capture.rs` has no descendant walk.
 
 #![cfg(target_os = "windows")]
 
@@ -39,9 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WNDCLASS_STYLES, WS_CHILD, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
 
-/// Monotonic counter so each test gets a unique class name. Class
-/// registration is process-global; re-using a name across tests in the same
-/// run would fail the second `RegisterClassExW`.
+/// Unique class name per test — registration is process-global, so a reused
+/// name fails the second `RegisterClassExW`.
 static CLASS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -52,9 +27,8 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// RAII scaffolding for the test windows. `Drop` destroys them and
-/// unregisters the class so leftover state from a panicking test doesn't
-/// poison subsequent tests in the same binary.
+/// RAII for the test windows, so a panicking test can't poison the next one
+/// with a leftover class registration.
 struct Tree {
     parent: HWND,
     child: HWND,

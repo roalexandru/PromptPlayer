@@ -1,19 +1,8 @@
-//! Windows screen-capture exclusion helpers + foreground-target HWND classification.
+//! Two things: apply `WDA_EXCLUDEFROMCAPTURE` to the picker's top-level HWND
+//! (with a `WDA_MONITOR` fallback for the Win11 win32k bug), and classify a
+//! foreground HWND so the focus snapshot skips Zoom-share and our own helpers.
 //!
-//! Two responsibilities, both small:
-//!   1. Apply `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` to the
-//!      picker's top-level HWND, with structured detection of the Win11
-//!      win32k `ERROR_NOT_ENOUGH_MEMORY` bug and a `WDA_MONITOR` fallback.
-//!      The API only accepts top-level windows of the calling process —
-//!      child HWNDs (WebView2's included) are rejected, see
-//!      `apply_display_affinity` — so there is deliberately no descendant walk.
-//!   2. Classify a foreground HWND so the picker's focus-snapshot can skip
-//!      Zoom-share helper windows (which become transiently foreground during
-//!      a share session) and our own tray-menu helper window when picking the
-//!      real target app to restore focus to.
-//!
-//! `platform::windows` is cfg-gated off non-Windows builds (see
-//! `platform/mod.rs`), so this module's helpers compile only on Windows.
+//! No descendant walk — the affinity API is top-level only.
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
@@ -23,18 +12,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WDA_MONITOR, WINDOW_DISPLAY_AFFINITY,
 };
 
-// --------------------------------------------------------------------------
 // Pure helpers — `&str` matchers, unit-testable without any Win32 state.
-// --------------------------------------------------------------------------
 
-/// Class names of windows Zoom puts in the foreground transiently during a
-/// screen-share session. We never want the picker's focus snapshot to capture
-/// one of these as the "target" — the user's actual target app is the next
-/// thing in z-order below them.
-///
-/// List is empirically derived from Zoom 5.x–6.x on Windows. Adding more here
-/// is the right escape hatch if a future Zoom version introduces a new helper
-/// class (no behavior change for non-Zoom users).
+/// Zoom's transient share windows, skipped by the focus snapshot — the real
+/// target sits below them in z-order. Empirical from Zoom 5.x–6.x.
 pub fn is_known_share_helper(class: &str) -> bool {
     matches!(
         class,
@@ -47,27 +28,13 @@ pub fn is_known_share_helper(class: &str) -> bool {
     )
 }
 
-/// Our own helper window classes that must never be a focus-restore target.
-///
-/// Today that is only the native tray-menu owner, `"PromptPlayerMenuOwner"`
-/// (see `platform/windows/menu.rs::ensure_helper`): `TrackPopupMenuEx`
-/// requires the owner to be foreground, so when the user picks "Command
-/// palette…" from the tray the raw `GetForegroundWindow()` *is* that hidden
-/// helper, and restoring focus to it would type into the void.
-///
-/// Deliberately NOT listed: Tauri's default class `"Tauri Window"`. It is
-/// shared by every webview window we own — the picker, but also the library
-/// and About windows. The focus snapshot is taken in `summon_picker` *before*
-/// the picker is shown (and is skipped when it is already visible), so a
-/// foreground `"Tauri Window"` at capture time is the library / About window
-/// the user is typing in, which is exactly where the prompt should land.
+/// Our own windows that must never be a focus target — just the tray-menu
+/// owner. Tauri's shared class is absent: library/About are legitimate.
 pub fn is_own_window_class(class: &str) -> bool {
     matches!(class, "PromptPlayerMenuOwner")
 }
 
-// --------------------------------------------------------------------------
 // Win32 wrappers.
-// --------------------------------------------------------------------------
 
 /// Fetch the class name of `hwnd`. Returns `""` for the null HWND or when
 /// the OS call fails (destroyed window, invalid handle).
@@ -83,9 +50,8 @@ pub fn class_name_of(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..len as usize])
 }
 
-/// True if DWM reports the window as cloaked (per-monitor hidden, virtual-
-/// desktop hidden, or shell-cloaked). These windows are not real focus
-/// targets — typing into them types into a window the user can't see.
+/// DWM-cloaked windows aren't real focus targets — typing into one types
+/// somewhere the user can't see.
 fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked: u32 = 0;
     let res = unsafe {
@@ -99,34 +65,8 @@ fn is_cloaked(hwnd: HWND) -> bool {
     res.is_ok() && cloaked != 0
 }
 
-/// Apply `affinity` (typically `WDA_EXCLUDEFROMCAPTURE` or `WDA_NONE`) to
-/// the top-level window `hwnd`. Returns the affinity actually in effect
-/// afterwards — it differs from the request only when the win32k fallback
-/// below engaged.
-///
-/// **Why top-level only.** `SetWindowDisplayAffinity` is documented as taking
-/// "a handle to the top-level window" that "must belong to the current
-/// process", and as returning FALSE for non-top-level windows. An earlier
-/// revision of this helper also walked every `EnumChildWindows` descendant to
-/// reach WebView2's GPU swap-chain HWND; on a real Windows runner the OS
-/// rejected all three same-process `WS_CHILD` test windows
-/// (`applied=1 attempted=4`), and WebView2's children are additionally owned
-/// by `msedgewebview2.exe`. `tests/screen_capture_exclusion.rs` pins that
-/// rejection so the walk is not reintroduced. WebView2Feedback #4544 (child
-/// content not covered by the parent's affinity) therefore has no host-side
-/// workaround here.
-///
-/// **Known failure mode, surfaced via logging.** On Windows 11 the kernel
-/// function `win32kfull.sys::ChangeWindowTreeProtection` has a bug that makes
-/// `SetWindowDisplayAffinity` return `ERROR_NOT_ENOUGH_MEMORY` (HRESULT
-/// `0x80070008`) for "non-traditional Win32" apps including Chromium /
-/// WebView2 / Electron. Microsoft's official workaround is the
-/// `LegacyDisplayAffinity` Application Compatibility shim (see
-/// https://aka.ms/AppCompat). This function detects it, emits a structured
-/// error, and falls back to `WDA_MONITOR` — Chromium's own choice in
-/// `desktop_window_tree_host_win.cc` — which blanks the window in captures
-/// instead of hiding it: strictly better than leaving the picker visible in
-/// the share.
+/// Apply `affinity` to a top-level `hwnd`, returning what's actually in effect.
+/// Child windows are rejected; a Win11 win32k bug forces a `WDA_MONITOR` fallback.
 pub fn apply_display_affinity(
     hwnd: HWND,
     affinity: WINDOW_DISPLAY_AFFINITY,
@@ -149,11 +89,8 @@ pub fn apply_display_affinity(
         Err(e) => e,
     };
 
-    // HRESULT 0x80070008 = Win32 ERROR_NOT_ENOUGH_MEMORY. On Windows 11 this
-    // specific failure is the `ChangeWindowTreeProtection` kernel bug — not
-    // an actual memory exhaustion. Surface it as its own structured event so
-    // log-greppers can distinguish "the OS rejected us" from "the HWND was
-    // destroyed mid-call".
+    // 0x80070008 here is the `ChangeWindowTreeProtection` kernel bug, not real
+    // memory exhaustion — its own event so it greps apart from a dead HWND.
     let hr = err.code().0 as u32;
     if hr != 0x8007_0008 {
         tracing::warn!(
@@ -191,9 +128,8 @@ pub fn apply_display_affinity(
     }
 }
 
-/// Read the current display-affinity flag for a window. Returns `None` on
-/// failure — which, per the Win32 docs and the integration tests, includes
-/// every non-top-level window. Used by `tests/screen_capture_exclusion.rs`.
+/// Current display-affinity flag, or `None` on failure — which includes every
+/// non-top-level window.
 pub fn current_display_affinity(hwnd: HWND) -> Option<WINDOW_DISPLAY_AFFINITY> {
     // `GetWindowDisplayAffinity` is bound with a raw `*mut u32` out-param
     // (the newtype is only used on the `Set` side), so read into a `u32`.
@@ -220,19 +156,14 @@ pub fn window_title_of(hwnd: HWND) -> Option<String> {
     }
 }
 
-// --------------------------------------------------------------------------
-// CandidateWindow + select_target — pure z-order classifier used by
-// picker/focus.rs::capture_foreground. Splitting the policy from the OS
-// queries keeps F1–F5 testable without faking Win32.
-// --------------------------------------------------------------------------
+// Pure z-order classifier for `picker::focus`. Splitting policy from the OS
+// queries keeps it testable without faking Win32.
 
 /// Snapshot of one top-level window's classification state. Constructed
 /// from Win32 calls by `collect_z_order_candidates`, or by hand in tests.
 #[derive(Debug, Clone)]
 pub struct CandidateWindow {
-    /// HWND value as a u64 so the struct is `Send` and doesn't carry an
-    /// HWND through test data. Production code casts back via `HWND(_ as _)`
-    /// when it needs the real handle.
+    /// HWND as a u64 so the struct is `Send` and test data carries no handles.
     pub hwnd_raw: u64,
     pub class: String,
     pub title: Option<String>,
@@ -252,13 +183,8 @@ impl CandidateWindow {
     }
 }
 
-/// Pure selection over a precomputed candidate list. Picks the first
-/// acceptable entry, capped at 10. Logs the picked / rejected decisions at
-/// debug level so the L2 logging test can pin them.
-///
-/// Returns `None` only if no candidate within the cap is acceptable; the
-/// caller is expected to fall back to the raw foreground HWND rather than
-/// silently drop the snapshot.
+/// First acceptable candidate, capped at 10, logging each decision at debug.
+/// `None` means the caller should fall back to the raw foreground HWND.
 pub fn select_target(candidates: &[CandidateWindow]) -> Option<&CandidateWindow> {
     for (i, c) in candidates.iter().take(10).enumerate() {
         if c.is_acceptable_target() {
@@ -294,10 +220,8 @@ pub fn select_target(candidates: &[CandidateWindow]) -> Option<&CandidateWindow>
     None
 }
 
-/// Build a candidate snapshot by walking z-order from `start`, up to `cap`
-/// entries. Each entry's metadata is fetched once at collection time so the
-/// result is a coherent moment-snapshot (no torn state from candidate i's
-/// metadata being queried after candidate i+1's HWND moved).
+/// Walk z-order from `start`, up to `cap`. Metadata is read once per entry so
+/// the snapshot is coherent rather than torn across the walk.
 pub fn collect_z_order_candidates(start: HWND, cap: usize) -> Vec<CandidateWindow> {
     let mut out = Vec::with_capacity(cap);
     let mut cur = start;
@@ -325,9 +249,7 @@ fn snapshot_candidate(hwnd: HWND) -> CandidateWindow {
     }
 }
 
-// --------------------------------------------------------------------------
 // T1 — pure-function unit tests.
-// --------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -373,9 +295,8 @@ mod tests {
 
     #[test]
     fn tauri_window_class_is_a_valid_restore_target() {
-        // The library / About windows share Tauri's default class. Skipping it
-        // would redirect a prompt meant for the library into whatever app sits
-        // beneath it in z-order — see the doc comment on `is_own_window_class`.
+        // Skipping Tauri's shared class would redirect a prompt meant for the
+        // library into whatever sits beneath it in z-order.
         assert!(!is_own_window_class("Tauri Window"));
     }
 
@@ -416,9 +337,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // T3 — F1..F5: select_target classifier tests (pure, no Win32 state).
-    // ---------------------------------------------------------------------
+    // T3 — select_target classifier tests (pure, no Win32 state).
 
     fn cand(class: &str) -> CandidateWindow {
         CandidateWindow {
@@ -506,9 +425,7 @@ mod tests {
         assert_eq!(picked.class, "Notepad");
     }
 
-    // ---------------------------------------------------------------------
     // T4 / L2 — logging snapshot tests for select_target's decisions.
-    // ---------------------------------------------------------------------
 
     #[tracing_test::traced_test]
     #[test]

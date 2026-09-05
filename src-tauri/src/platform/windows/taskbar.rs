@@ -1,12 +1,8 @@
-//! Detect which screen edge the Windows taskbar lives on so the tray popup
-//! can anchor on the OPPOSITE side of its tray icon (mirroring native
-//! Windows tray-popup behavior — the Quick Settings / Wi-Fi flyouts grow
-//! upward on a bottom taskbar, leftward on a right taskbar, etc.).
+//! Which screen edge the taskbar is on, so the tray popup grows away from it
+//! like the native Quick Settings flyouts do.
 //!
-//! `SHAppBarMessage(ABM_GETTASKBARPOS)` is the canonical query; it works
-//! for the primary taskbar regardless of where the tray icon physically
-//! sits (on multi-monitor setups, Win11 mirrors the taskbar to other
-//! screens but the primary edge is what dictates icon orientation).
+//! `SHAppBarMessage(ABM_GETTASKBARPOS)` answers for the primary taskbar, whose
+//! edge dictates icon orientation even on mirrored multi-monitor setups.
 
 use std::mem;
 use windows::Win32::UI::Shell::{

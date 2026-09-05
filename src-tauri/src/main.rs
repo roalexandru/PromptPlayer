@@ -1,10 +1,5 @@
-// Prompt Player — entry point. All app wiring lives in `prompt_player::app::setup`.
-//
-// We use `#[tokio::main]` because the Tauri plugins we depend on
-// (notably `tauri-plugin-aptabase`) call `tokio::spawn` from their `setup()`
-// hook, which requires a Tokio runtime to already exist on the calling
-// thread. Tauri 2's default Builder doesn't install one, so we set it up
-// ourselves.
+// Prompt Player entry point; wiring lives in `prompt_player::app::setup`.
+// `#[tokio::main]` because plugins `tokio::spawn` from their setup hook.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -14,24 +9,8 @@ async fn main() {
     prompt_player::app::setup::run();
 }
 
-/// Wire `tracing` to multiple sinks so a runtime "trigger doesn't fire" report
-/// always has somewhere to look:
-///
-/// 1. **stderr (fmt)** — useful for `cargo run` / launching from Terminal.
-///    Release-mode .app bundles route stderr to /dev/null so this only helps devs.
-/// 2. **rolling log file** — cross-platform; written to a stable per-user
-///    location so users on Windows (no Console.app equivalent) and on Mac (who
-///    don't know about Console.app) can attach the file to a bug report.
-///    Mac:  `~/Library/Application Support/PromptPlayer/logs/prompt-player.log`
-///    Win:  `%LOCALAPPDATA%\PromptPlayer\logs\prompt-player.log`
-/// 3. **Apple Unified Logging (mac only)** — visible in Console.app filtered
-///    by subsystem `com.roalexandru.promptplayer`, and via
-///    `log stream --predicate 'subsystem == "com.roalexandru.promptplayer"'`.
-///
-/// The file appender's worker guard is leaked intentionally — we want it to
-/// outlive `init_tracing()` and live for the entire process. Dropping it would
-/// flush + close the file on shutdown, but for a long-running tray app the
-/// process exit is the trigger, so leaking is fine.
+/// Three `tracing` sinks — stderr, a rolling per-user file, and Apple Unified
+/// Logging. The appender guard is leaked so it outlives this function.
 fn init_tracing() {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;

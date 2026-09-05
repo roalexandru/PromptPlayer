@@ -1,18 +1,7 @@
-//! Windows-specific keystroke synthesis.
+//! Windows keystroke synthesis. `enigo 0.2`'s `text()` mis-synthesizes single
+//! ASCII chars, so `type_char` drives `SendInput` directly.
 //!
-//! `enigo 0.2`'s `text()` on Windows mis-synthesizes single-char ASCII calls
-//! (every char comes out as 'a' regardless of the input — symptom matches a
-//! known scan-code-aliasing regression). We bypass it for `type_char` and
-//! drive `SendInput` directly with `KEYEVENTF_UNICODE`, which is the same
-//! primitive enigo *should* use for arbitrary text. Backspace / Enter still
-//! go through enigo because those use `key()` with a virtual-key code, which
-//! is the unaffected code path.
-//!
-//! For chars outside the BMP (emoji etc.), UTF-16 returns a surrogate pair;
-//! we emit each code unit as its own `INPUT` so the OS reassembles them.
-//!
-//! `paste_via_clipboard` lives here too: it owns the OpenClipboard /
-//! GlobalAlloc / SetClipboardData dance and synthesizes Ctrl+V via SendInput.
+//! `paste_via_clipboard` owns the clipboard + Ctrl+V dance.
 
 use super::PasteError;
 use std::time::{Duration, Instant};
@@ -30,15 +19,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_V,
 };
 
-// `CF_UNICODETEXT` isn't re-exported by windows-rs 0.58 under any of the
-// feature flags we already pull in (it lived in `Win32_System_SystemServices`
-// in older releases and was moved out before 0.58). The value is stable by
-// definition — wParam=13 is the standard clipboard format identifier.
+// windows-rs 0.58 doesn't re-export `CF_UNICODETEXT` under our feature flags.
+// The value is fixed by definition: 13.
 const CF_UNICODETEXT: u32 = 13;
 
-/// Synthesize a single character into the focused window using `SendInput`
-/// with `KEYEVENTF_UNICODE`. Sends key-down + key-up per UTF-16 code unit
-/// (a surrogate pair for non-BMP chars produces two pairs of inputs).
+/// Type one char via `SendInput` + `KEYEVENTF_UNICODE`, as a down/up pair per
+/// UTF-16 code unit (so non-BMP chars send two pairs).
 pub(crate) fn type_char_unicode(c: char) {
     let mut buf = [0u16; 2];
     let units = c.encode_utf16(&mut buf);
@@ -106,12 +92,8 @@ pub(crate) fn read_clipboard_string() -> Option<String> {
 
 // --------------- clipboard paste -----------------
 
-/// Set the system clipboard to `body` (CF_UNICODETEXT), synthesize Ctrl+V on
-/// the foreground window, wait briefly for the paste to be consumed, and
-/// restore the previous clipboard contents. We snapshot every clipboard
-/// format backed by movable global memory. If the clipboard contains a format
-/// we cannot safely copy (for example a bitmap handle), this returns an error
-/// before touching the clipboard so the caller can fall back to typed playback.
+/// Set the clipboard, Ctrl+V, wait, restore. Formats we can't safely snapshot
+/// error out before anything is touched.
 pub(super) fn paste_via_clipboard(body: &str) -> Result<(), PasteError> {
     // 1. Snapshot the existing clipboard formats.
     let saved = save_clipboard().map_err(PasteError::Clipboard)?;
@@ -122,11 +104,8 @@ pub(super) fn paste_via_clipboard(body: &str) -> Result<(), PasteError> {
         return Err(PasteError::Clipboard(e));
     }
 
-    // 3. Synthesize Ctrl+V. Release any user-held modifiers (Alt from
-    //    the Alt+Enter shortcut path, stray Shift, etc.) first so we
-    //    don't synthesize Ctrl+Shift+V (which is "paste without
-    //    formatting" / a different binding in many apps) or fight a
-    //    still-held Alt that would turn V into a menu accelerator.
+    // 3. Ctrl+V, after releasing held modifiers — a stray Shift makes this
+    //    paste-without-formatting, and a held Alt makes V an accelerator.
     release_user_modifiers();
     if let Err(e) = synth_ctrl_v() {
         // Best-effort restore even on synth failure.
@@ -134,20 +113,11 @@ pub(super) fn paste_via_clipboard(body: &str) -> Result<(), PasteError> {
         return Err(PasteError::Injection(e));
     }
 
-    // 4. Give the target app time to consume the paste from the clipboard
-    //    BEFORE we restore. Apps read CF_UNICODETEXT on the WM_PASTE
-    //    handler synchronously after Ctrl+V, but the keystroke itself is
-    //    delivered asynchronously and the WM_KEYUP for Ctrl needs to drain
-    //    too. Under load, Electron/browser chat apps (the main target) can
-    //    read the clipboard well after 60ms — restoring too early makes them
-    //    paste the user's PREVIOUS clipboard (potentially private) mid-demo.
-    //    250ms is imperceptible (text is already on screen) and far safer;
-    //    with playbacks mutually exclusive nothing else needs this thread.
+    // 4. Let the app consume the paste before restoring. Restoring early makes
+    //    a loaded Electron app paste the user's previous (private) clipboard.
     std::thread::sleep(Duration::from_millis(250));
 
-    // 5. Restore the original clipboard.
-    //    On failure we log and move on — leaving our text on the clipboard
-    //    is the lesser evil compared to leaving the clipboard empty.
+    // 5. Restore. On failure, leaving our text behind beats an empty clipboard.
     if let Err(e) = restore_clipboard(&saved) {
         tracing::warn!("clipboard restore failed: {}", e);
     }
@@ -165,9 +135,8 @@ impl Drop for ClipboardGuard {
 }
 
 fn open_clipboard_retry() -> Result<ClipboardGuard, String> {
-    // The clipboard is a global single-owner mutex; another app
-    // (Spotify, browsers, password managers) can hold it briefly.
-    // Retry for up to ~250ms.
+    // The clipboard is a global single-owner mutex other apps hold briefly,
+    // so retry for ~250ms.
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         if unsafe { OpenClipboard(HWND::default()).is_ok() } {
@@ -251,9 +220,8 @@ fn set_unicode_clipboard(text: &str) -> Result<(), String> {
         let data = std::slice::from_raw_parts(wide.as_ptr() as *const u8, bytes);
         let hglobal = alloc_global_bytes(data)?;
 
-        // From this point until SetClipboardData succeeds, we still own
-        // hglobal — every error path below must call GlobalFree to avoid
-        // leaking a multi-KB block per failed paste attempt.
+        // We own hglobal until SetClipboardData succeeds, so every error path
+        // below must GlobalFree or leak a multi-KB block per attempt.
         let _guard = match open_clipboard_retry() {
             Ok(guard) => guard,
             Err(e) => {
@@ -329,11 +297,8 @@ fn vk_input(vk: VIRTUAL_KEY, keyup: bool) -> INPUT {
     }
 }
 
-/// Release any modifier keys the OS currently reports as pressed. This is
-/// defensive: the user's `Alt+Enter` (or `Enter` while still tapering off
-/// `Shift` from a prior word) can leave a modifier physically down at the
-/// moment we synthesize Ctrl+V. If we don't release it first, V becomes a
-/// menu accelerator / sticky-key combo and the paste silently dies.
+/// Release any modifiers the OS reports as down. A lingering Alt or Shift at
+/// the moment we synthesize Ctrl+V silently kills the paste.
 fn release_user_modifiers() {
     let candidates = [VK_MENU, VK_LMENU, VK_RMENU, VK_SHIFT, VK_LSHIFT, VK_RSHIFT];
     let mut inputs: Vec<INPUT> = Vec::with_capacity(candidates.len());

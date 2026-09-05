@@ -1,6 +1,5 @@
-//! Tauri builder configuration. This is the assembly point for plugins,
-//! managed state, IPC handlers, the tray icon, lifecycle hooks, and the
-//! global shortcut registration.
+//! Tauri builder configuration — the assembly point for plugins, managed
+//! state, IPC handlers, the tray icon, lifecycle hooks, and shortcuts.
 
 use crate::app::context::AppContext;
 use crate::app::{lifecycle, shortcuts, FireService};
@@ -23,7 +22,12 @@ use crate::platform::macos::OutsideClickMonitor;
 pub fn run() {
     crate::telemetry::init();
 
-    let ctx = AppContext::new();
+    // Settings load first: `AppContext` needs `restore_armed` to decide the
+    // initial armed state before `AppState` is constructed.
+    let ctx = AppContext::with_settings(crate::settings::SettingsStore::shared());
+    if ctx.armed_was_restored() {
+        tracing::info!("armed state restored from settings (opt-in)");
+    }
 
     // Phase 5: load prompts from the library directory (with hot reload).
     let library_root = library::default_library_root()
@@ -37,15 +41,8 @@ pub fn run() {
             tracing::warn!("prompt parse: {}", e);
         }
         if loaded.is_empty() {
-            // First run (empty library): COPY the bundled examples into the
-            // user's writable library root, then load from there. Loading them
-            // in place from the bundle was a bug — `source_path` pointed inside
-            // the signed .app / Program Files, so any edit/toggle/delete tried
-            // to write into the bundle (breaks code-signing on macOS, denied
-            // under Program Files on Windows) and the watcher (which watches
-            // library_root, not the bundle) never saw the changes; worse, the
-            // first user-created prompt triggered a load-all that dropped every
-            // bundled example from memory.
+            // First run: copy examples into the writable library root. Loading
+            // them in place made every edit try to write inside the bundle.
             let bundle = first_run_bundled_examples().or_else(|| {
                 let cwd = std::env::current_dir().ok()?.join("prompts-examples");
                 cwd.exists().then_some(cwd)
@@ -76,16 +73,12 @@ pub fn run() {
         rebuild_match_index(&ctx);
     }
 
-    // Spawn the keyboard hook BEFORE Tauri startup so it owns its own thread
-    // lifecycle. The hook calls into the FireService once the AppHandle is
-    // available — we plumb it through via a shared Arc<RwLock<Option<...>>>.
+    // Hook spawns before Tauri so it owns its thread lifecycle; it reaches
+    // FireService through a shared Arc<RwLock<Option<_>>> once one exists.
     let fire_holder: Arc<parking_lot::RwLock<Option<FireService>>> =
         Arc::new(parking_lot::RwLock::new(None));
-    // The AppHandle isn't constructed until inside Tauri's setup() callback,
-    // but we need to capture it from closures (telemetry callback, hot-reload
-    // watcher) that run earlier or on different threads. Same pattern as
-    // fire_holder. Declared up here so the on_commit_observed closure below
-    // can capture it before Tauri builds.
+    // Same pattern as fire_holder: the AppHandle doesn't exist until setup(),
+    // but earlier closures need it.
     let app_handle_holder: Arc<parking_lot::RwLock<Option<AppHandle>>> =
         Arc::new(parking_lot::RwLock::new(None));
 
@@ -107,25 +100,36 @@ pub fn run() {
         })
     };
 
-    let on_literal_commit = Arc::new(move |commit: char| {
-        thread::Builder::new()
-            .name("prompt-player-literal-commit".into())
-            .spawn(move || match crate::inject::EnigoInjector::new() {
-                Ok(mut inj) => {
-                    use crate::typer::Injector;
-                    inj.press_backspace();
-                    inj.type_char(commit);
-                }
-                Err(e) => tracing::error!("literal commit injector init failed: {:?}", e),
-            })
-            .expect("spawn literal commit injector");
-    });
+    let on_literal_commit = {
+        let h = app_handle_holder.clone();
+        Arc::new(move |commit: char| {
+            let h = h.clone();
+            thread::Builder::new()
+                .name("prompt-player-literal-commit".into())
+                .spawn(move || match crate::inject::EnigoInjector::new() {
+                    Ok(mut inj) => {
+                        use crate::typer::Injector;
+                        inj.press_backspace();
+                        inj.type_char(commit);
+                    }
+                    Err(e) => {
+                        tracing::error!("literal commit injector init failed: {:?}", e);
+                        if let Some(app) = h.read().clone() {
+                            telemetry::send(
+                                &app,
+                                TelemetryEvent::InjectionFailed {
+                                    stage: crate::telemetry::InjectionStage::LiteralCommit,
+                                },
+                            );
+                        }
+                    }
+                })
+                .expect("spawn literal commit injector");
+        })
+    };
 
-    // Telemetry callback for the commit-char path. Plumbs through
-    // app_handle_holder because the AppHandle isn't constructed yet at this
-    // point (Tauri builds it inside setup()). We do nothing if the AppHandle
-    // isn't ready; that only applies to events fired in the milliseconds
-    // before Tauri's setup() runs, which is well before the user can type.
+    // Via app_handle_holder: no AppHandle until setup(), which is well before
+    // the user can type, so the dropped first milliseconds don't matter.
     let on_commit_observed = {
         let h = app_handle_holder.clone();
         Arc::new(move |matched: bool, index_size: usize| {
@@ -134,61 +138,95 @@ pub fn run() {
                     &app,
                     TelemetryEvent::CommitObserved {
                         matched,
-                        index_size_bucket: crate::telemetry::IndexSizeBucket::classify(index_size),
+                        index_size_bucket: crate::telemetry::CountBucket::classify(index_size),
                     },
                 );
             }
         })
     };
 
+    // Aggregated by the tracker and flushed with the secure-input window, so
+    // a burst of blocked triggers doesn't become a burst of events.
+    let on_blocked_commit = {
+        let tracker = ctx.secure_input.clone();
+        Arc::new(move || tracker.note_blocked_commit())
+    };
+
+    let hook_callbacks = crate::hook::HookCallbacks {
+        on_fire: on_fire.clone(),
+        on_undo: on_undo.clone(),
+        on_literal_commit: on_literal_commit.clone(),
+        on_commit_observed: on_commit_observed.clone(),
+        on_blocked_commit: on_blocked_commit.clone(),
+    };
+
     let _hook = spawn_grabbing_hook(
         ctx.matcher.clone(),
         ctx.undo.clone(),
         ctx.state.clone(),
-        on_fire.clone(),
-        on_undo.clone(),
-        on_literal_commit.clone(),
-        on_commit_observed.clone(),
+        hook_callbacks.clone(),
     );
 
-    // §9.1 — Accessibility-status watcher (mac only). The first hook spawn
-    // fails silently if Accessibility wasn't pre-granted (common on a fresh
-    // DMG install at /Applications/Prompt Player.app — TCC keys approval by
-    // path+cdhash for unsigned apps and the new path has none). When the user
-    // finally toggles Accessibility on in System Settings, this poller detects
-    // the transition and respawns the hook without requiring an app restart.
-    //
-    // Kept narrow: 5s cadence, only does work on transitions, exits as soon
-    // as the hook reports alive (we re-arm only if it dies again).
+    // §9.1 — Accessibility watcher (mac). The first spawn fails silently when
+    // TCC hasn't approved this path+cdhash; this respawns without a restart.
     #[cfg(target_os = "macos")]
     {
         let matcher = ctx.matcher.clone();
         let undo = ctx.undo.clone();
         let app_state = ctx.state.clone();
-        let on_fire2 = on_fire.clone();
-        let on_undo2 = on_undo.clone();
-        let on_literal2 = on_literal_commit.clone();
-        let on_commit2 = on_commit_observed.clone();
+        let cb = hook_callbacks.clone();
+        let handle = app_handle_holder.clone();
+        let attention = ctx.attention.clone();
         thread::Builder::new()
             .name("prompt-player-ax-watch".into())
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                if app_state.hook_alive() {
-                    continue;
+            .spawn(move || {
+                let mut last_alive = app_state.hook_alive();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    let alive = app_state.hook_alive();
+                    // Both directions: boot-time-only reporting left a repair
+                    // invisible for the rest of a multi-week session.
+                    if alive != last_alive {
+                        last_alive = alive;
+                        if let Some(app) = handle.read().clone() {
+                            if attention.set_hook_dead(!alive) {
+                                crate::tray_icon::refresh(&app);
+                            }
+                            telemetry::send(
+                                &app,
+                                TelemetryEvent::HookStateChanged {
+                                    alive,
+                                    accessibility_trusted: crate::tcc::is_accessibility_trusted(),
+                                    reason: if alive {
+                                        crate::telemetry::HookChangeReason::Installed
+                                    } else {
+                                        crate::telemetry::HookChangeReason::Died
+                                    },
+                                },
+                            );
+                        }
+                    }
+                    if alive || !crate::tcc::is_accessibility_trusted() {
+                        continue;
+                    }
+                    tracing::info!("Accessibility granted — respawning keyboard hook");
+                    if let Some(app) = handle.read().clone() {
+                        telemetry::send(
+                            &app,
+                            TelemetryEvent::HookStateChanged {
+                                alive: false,
+                                accessibility_trusted: true,
+                                reason: crate::telemetry::HookChangeReason::Respawn,
+                            },
+                        );
+                    }
+                    crate::hook::respawn_macos(
+                        matcher.clone(),
+                        undo.clone(),
+                        app_state.clone(),
+                        cb.clone(),
+                    );
                 }
-                if !crate::tcc::is_accessibility_trusted() {
-                    continue;
-                }
-                tracing::info!("Accessibility granted — respawning keyboard hook");
-                crate::hook::respawn_macos(
-                    matcher.clone(),
-                    undo.clone(),
-                    app_state.clone(),
-                    on_fire2.clone(),
-                    on_undo2.clone(),
-                    on_literal2.clone(),
-                    on_commit2.clone(),
-                );
             })
             .expect("spawn ax watch thread");
     }
@@ -220,10 +258,8 @@ pub fn run() {
                 .expect("spawn watch thread");
         }
         Err(e) => {
-            // Don't fail silently: with no watcher, on-disk edits won't
-            // hot-reload. The IPC mutation commands still reindex directly
-            // (see `reindex_after_mutation`), so in-app CRUD stays correct —
-            // but external file edits won't be picked up until restart.
+            // In-app CRUD still reindexes via `reindex_after_mutation`; only
+            // external file edits stop hot-reloading.
             tracing::error!(
                 "library watcher failed to start ({}); external edits to {:?} \
                  won't hot-reload until restart",
@@ -234,6 +270,7 @@ pub fn run() {
     }
 
     let ctx_for_setup = ctx.clone();
+    let ctx_for_exit = ctx.clone();
     let fire_holder_for_setup = fire_holder.clone();
     let app_handle_holder_for_setup = app_handle_holder.clone();
 
@@ -247,28 +284,25 @@ pub fn run() {
     }
 
     let mut builder = tauri::Builder::default()
-        // Single-instance MUST be the first plugin so a duplicate launch is
-        // intercepted before any other plugin's setup hook runs — that's
-        // what prevents the second process from registering its own tray
-        // icon (the reported Windows bug: launching from Start menu while
-        // already running adds a duplicate tray icon and a duplicate hook
-        // listener). The callback fires in the FIRST process with the
-        // second launcher's argv/cwd; we use it to surface the picker so
-        // "launch the app" still feels like it did something.
+        // MUST be first: a duplicate launch has to be intercepted before any
+        // other plugin's setup registers a second tray icon and hook.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             tracing::info!("duplicate launch detected — surfacing picker");
-            // Route through the same `summon_picker` path as the shortcut/tray
-            // so the relaunch also captures focus, refreshes the search index,
-            // and positions on the cursor's screen — not a bare show() that
-            // skipped all three.
+            // Same path as the shortcut/tray so the relaunch also captures
+            // focus, refreshes the index, and positions on the cursor's screen.
             if let Some(ctx) = app.try_state::<AppContext>() {
                 let ctx = ctx.inner().clone();
                 let app2 = app.clone();
                 let _ = app.run_on_main_thread(move || {
-                    crate::commands::picker::summon_picker(&app2, &ctx);
+                    crate::commands::picker::summon_picker(
+                        &app2,
+                        &ctx,
+                        crate::telemetry::PickerSource::Relaunch,
+                        crate::commands::picker::FocusCapture::Take,
+                    );
                 });
             } else {
-                crate::commands::picker::show_picker_window(app);
+                crate::commands::picker::summon_picker_without_context(app);
             }
         }))
         .plugin(tauri_plugin_autostart::init(
@@ -282,11 +316,8 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_aptabase::Builder::new(crate::telemetry::APTABASE_KEY).build());
 
-    // Per-state managed handles. Each typed `tauri::State<'_, T>` IPC
-    // parameter needs its T registered here, otherwise Tauri panics with
-    // "state not managed for field". AppContext also references most of
-    // these via Arc, so we manage them independently for the commands
-    // that take a narrow handle (PromptStore, AppState).
+    // Per-state managed handles — every `tauri::State<'_, T>` parameter needs
+    // its T here or Tauri panics. Kept in sync with `manage_state` by a test.
     builder = builder
         .manage(ctx.state.clone())
         .manage(ctx.prompts.clone())
@@ -304,8 +335,17 @@ pub fn run() {
             commands::armed::is_playing,
             commands::armed::is_hook_alive,
             commands::armed::open_accessibility_settings,
+            commands::armed::reset_accessibility,
             commands::power::get_keep_awake,
             commands::power::toggle_keep_awake,
+            commands::power::set_keep_awake_duration,
+            commands::power::set_keep_awake_restore,
+            commands::diagnostics::get_diagnostics,
+            commands::diagnostics::run_self_test,
+            commands::diagnostics::self_test_type,
+            commands::diagnostics::open_diagnostics,
+            commands::diagnostics::get_settings,
+            commands::diagnostics::set_restore_armed,
             commands::prompts::list_prompts,
             commands::prompts::library_root,
             commands::prompts::save_prompt,
@@ -324,6 +364,8 @@ pub fn run() {
             commands::updater::updater_current_version,
             commands::updater::updater_check,
             commands::updater::updater_install,
+            commands::updater::updater_announced,
+            commands::updater::updater_dismiss,
             commands::library::capture_foreground_app,
             commands::library::expand_prompt_text,
             commands::library::import_prompt,
@@ -331,21 +373,8 @@ pub fn run() {
             commands::shell::open_external,
         ])
         .setup(move |app| {
-            // Tray icon — left-click toggles the WiFi-style stay-open popover.
-            // Embedded at compile-time: runtime path resolution is brittle
-            // (cargo/tauri-dev CWD differs from the packaged .app's resources
-            // dir, and the bundle doesn't ship icons/ as a resource). Bytes
-            // baked into the binary work in both contexts.
-            //
-            // Per-OS icon picking:
-            // - macOS: monochrome glyph + `icon_as_template(true)` lets AppKit
-            //   tint the icon to match the menubar (white on dark, black on
-            //   light) automatically. The shipped `tray-icon.png` is a black
-            //   luminance mask.
-            // - Windows: no template-image concept. We ship two pre-rendered
-            //   variants (light/dark) and pick the right one at startup based
-            //   on the current `SystemUsesLightTheme` registry value, then
-            //   spawn a watcher that swaps the icon on theme change.
+            // Bytes baked in — runtime paths differ between `cargo run` and the
+            // bundle. `tray_icon::refresh` owns every later redraw.
             #[cfg(not(target_os = "windows"))]
             const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../icons/tray-icon.png");
             #[cfg(target_os = "windows")]
@@ -354,17 +383,15 @@ pub fn run() {
             let tray_icon_bytes: &[u8] = TRAY_ICON_BYTES;
             let tray_image = tauri::image::Image::from_bytes(tray_icon_bytes)
                 .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
-            let _tray = TrayIconBuilder::with_id("main")
+            let _tray = TrayIconBuilder::with_id(crate::tray_icon::TRAY_ID)
                 .icon(tray_image)
                 // `icon_as_template(true)` is mac-only behavior; on Windows
                 // it's a no-op so leaving it unconditional is fine.
                 .icon_as_template(true)
                 .on_tray_icon_event(move |tray, event| {
                     use tauri::tray::{MouseButton, MouseButtonState};
-                    // Both left- and right-click open the popover. Native menu-bar
-                    // utilities (Things, Bartender, 1Password) all do this so the
-                    // user never has to remember "wrong button". macOS sends Right
-                    // for Control-click too, so this also covers that path.
+                    // Both buttons open it, like every native menu-bar utility.
+                    // macOS sends Right for Control-click, so that's covered too.
                     if let tauri::tray::TrayIconEvent::Click {
                         button: MouseButton::Left | MouseButton::Right,
                         button_state: MouseButtonState::Down,
@@ -378,9 +405,8 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Windows-only: poll the OS theme every 5s and swap the tray
-            // icon when the user toggles light/dark in Settings. macOS
-            // handles this for us via icon-as-template.
+            // Windows-only: poll the OS theme and swap the tray icon. macOS
+            // handles this via icon-as-template.
             #[cfg(target_os = "windows")]
             crate::platform::windows::install_tray_theme_watcher(app.handle().clone());
 
@@ -400,24 +426,19 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             crate::platform::macos::nsworkspace::set_accessory_activation_policy();
 
-            // §9.1 first-run permission check on macOS. Use the PROMPTING
-            // variant so this app gets registered in the Accessibility list
-            // (the system pane is empty for unsigned apps on first launch
-            // unless we explicitly prompt — that's how AppleScript editors,
-            // BetterTouchTool, etc. all bootstrap their entries). After the
-            // prompt, open Settings so the user lands on the right pane with
-            // a row that actually has a toggle.
+            // §9.1 first-run check. The PROMPTING variant registers us in the
+            // Accessibility list, so the pane has a row with a real toggle.
             #[cfg(target_os = "macos")]
             {
                 let trusted = crate::tcc::prompt_for_accessibility();
-                let hook_alive = ctx_for_setup.state.hook_alive();
+                // `hook::macos::spawn` flips `hook_alive` asynchronously, so an
+                // immediate read is a false negative while the tap installs.
+                let hook_alive = await_hook_settle(&ctx_for_setup, trusted);
                 let exe_path = std::env::current_exe()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| "<unknown>".into());
-                // Single-line state dump of the boot decision triangle:
-                // (a) Accessibility check, (b) hook install, (c) binary path.
-                // If a user reports "trigger doesn't fire" this line tells us
-                // immediately whether to chase TCC, the tap, or the bundle.
+                // If a user reports "trigger doesn't fire", this one line says
+                // whether to chase TCC, the tap, or the bundle.
                 tracing::info!(
                     "boot state: accessibility_trusted={} hook_alive={} exe={}",
                     trusted,
@@ -437,13 +458,18 @@ pub fn run() {
                     );
                     crate::tcc::open_accessibility_settings();
                 }
+                // Badge the tray so a dead hook is visible without opening
+                // anything, then show diagnostics on the first broken run.
+                ctx_for_setup.attention.set_hook_dead(!hook_alive);
+                crate::tray_icon::refresh(app.handle());
+                if !hook_alive && !ctx_for_setup.settings.get().setup_seen {
+                    ctx_for_setup.settings.update(|s| s.setup_seen = true);
+                    crate::commands::diagnostics::show(app.handle());
+                }
             }
 
-            // Windows doesn't gate keyboard hooks behind a permission like TCC —
-            // SetWindowsHookEx (via rdev::grab) just works for any user-mode
-            // process. We still emit a HookInstallResult so dashboards have
-            // parity across platforms; `accessibility_trusted` is hard-coded
-            // true since the concept doesn't apply.
+            // Windows has no TCC equivalent, so `accessibility_trusted` is a
+            // constant true; the event still fires for cross-platform parity.
             #[cfg(target_os = "windows")]
             {
                 let hook_alive = ctx_for_setup.state.hook_alive();
@@ -460,30 +486,33 @@ pub fn run() {
                 );
             }
 
-            // Secure-Input poller — 2s cadence (was 500ms; battery friendlier).
-            // Surfaces transitions only — no per-poll log spam.
+            // Secure-Input poller, 2s. One aggregated event per window instead
+            // of one per rising edge, which was 91% of all telemetry.
             #[cfg(target_os = "macos")]
             {
                 let app_for_secure = app.handle().clone();
+                let tracker = ctx_for_setup.secure_input.clone();
                 std::thread::Builder::new()
                     .name("prompt-player-secure-input".into())
                     .spawn(move || {
                         let mut last = false;
+                        let mut window_start = std::time::Instant::now();
                         loop {
                             let now_active = crate::secure_input::is_active();
+                            tracker.observe(now_active);
                             if now_active != last {
                                 if now_active {
                                     tracing::warn!(
                                         "macOS Secure Input is ACTIVE — keyboard hook is BLOCKED"
                                     );
-                                    telemetry::send(
-                                        &app_for_secure,
-                                        TelemetryEvent::SecureInputDetected,
-                                    );
                                 } else {
                                     tracing::info!("macOS Secure Input cleared");
                                 }
                                 last = now_active;
+                            }
+                            if window_start.elapsed() >= SECURE_INPUT_WINDOW {
+                                window_start = std::time::Instant::now();
+                                flush_secure_input(&app_for_secure, &tracker);
                             }
                             std::thread::sleep(std::time::Duration::from_secs(2));
                         }
@@ -491,54 +520,178 @@ pub fn run() {
                     .expect("spawn secure-input poll thread");
             }
 
-            // §13 — auto-update poller. Checks on startup and every 6h.
-            // Emits a `update-available` event with `{ version, notes }` when
-            // a new release is published; the frontend listens for it on the
-            // tray-popup window and surfaces an "Install update vX.Y.Z" entry.
-            // Manual checks (user clicks "Check for updates…") use the
-            // `updater_check` IPC command and do NOT go through this poller.
-            spawn_update_poller(app.handle().clone());
+            // Keep-awake auto-off. Cheap in-memory deadline check; the tray
+            // label shows the countdown so the release isn't a surprise.
+            {
+                let app_for_power = app.handle().clone();
+                let ctx_for_power = ctx_for_setup.clone();
+                std::thread::Builder::new()
+                    .name("prompt-player-keep-awake-expiry".into())
+                    .spawn(move || loop {
+                        std::thread::sleep(crate::power::EXPIRY_POLL_INTERVAL);
+                        if ctx_for_power.power.expire_if_due() {
+                            ctx_for_power.settings.update(|s| s.keep_awake = false);
+                            telemetry::send(&app_for_power, TelemetryEvent::KeepAwakeExpired);
+                            shortcuts::refresh_tray_popup(&app_for_power);
+                        }
+                    })
+                    .expect("spawn keep-awake expiry thread");
+            }
 
-            // App-started telemetry event — once per launch.
-            let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
+            // Independent of the hook on purpose: `CommitObserved` lives inside
+            // it, so a dead hook also silences the instrumentation.
+            {
+                let app_for_beat = app.handle().clone();
+                let ctx_for_beat = ctx_for_setup.clone();
+                std::thread::Builder::new()
+                    .name("prompt-player-heartbeat".into())
+                    .spawn(move || loop {
+                        std::thread::sleep(crate::telemetry::HEARTBEAT_INTERVAL);
+                        telemetry::send(
+                            &app_for_beat,
+                            TelemetryEvent::Heartbeat {
+                                hook_alive: ctx_for_beat.state.hook_alive(),
+                                accessibility_trusted: crate::tcc::is_accessibility_trusted(),
+                                armed: ctx_for_beat.state.is_armed(),
+                                keep_awake: ctx_for_beat.power.is_enabled(),
+                                prompts: crate::telemetry::CountBucket::classify(
+                                    ctx_for_beat.prompts.len(),
+                                ),
+                            },
+                        );
+                    })
+                    .expect("spawn heartbeat thread");
+            }
+
+            // Restore keep-awake only if the user opted in, always with a
+            // fresh deadline so a persisted "on" can't resurrect a long session.
+            {
+                let s = ctx_for_setup.settings.get();
+                if s.restore_keep_awake && s.keep_awake {
+                    ctx_for_setup.power.set_for(true, s.keep_awake_mins);
+                    tracing::info!("keep-awake restored for {} min", s.keep_awake_mins);
+                }
+            }
+
+            // §13 — update poller, startup + every 6h. Manual checks use the
+            // `updater_check` IPC and don't come through here.
+            spawn_update_poller(app.handle().clone(), ctx_for_setup.clone());
+
+            // Once per launch. Reports library shape rather than restating the
+            // os/locale/version columns Aptabase already sends.
+            let prompts = ctx_for_setup.prompts.snapshot();
+            let enabled: Vec<_> = prompts.iter().filter(|p| p.enabled).collect();
+            let trigger_count: usize = enabled.iter().map(|p| p.triggers.len()).sum();
             telemetry::send(
                 app.handle(),
                 TelemetryEvent::AppStarted {
-                    version: env!("CARGO_PKG_VERSION"),
-                    os: if cfg!(target_os = "macos") {
-                        "macos"
-                    } else if cfg!(target_os = "windows") {
-                        "windows"
-                    } else {
-                        "other"
-                    },
-                    locale,
-                    profile_in_use: "sales-engineer",
+                    prompts: crate::telemetry::CountBucket::classify(prompts.len()),
+                    triggers: crate::telemetry::CountBucket::classify(trigger_count),
+                    hotkeys: crate::telemetry::CountBucket::classify(
+                        ctx_for_setup.hotkeys.read().len(),
+                    ),
+                    autostart: autostart_enabled(app.handle()),
+                    armed_restored: ctx_for_setup.armed_was_restored(),
                 },
             );
 
-            tracing::info!("Prompt Player started — disarmed (per §10.1)");
+            tracing::info!(
+                "Prompt Player started — armed={}",
+                ctx_for_setup.state.is_armed()
+            );
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
-            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+        .run(move |app, event| match event {
+            tauri::RunEvent::ExitRequested { api, code, .. } => {
                 if code.is_none() {
                     api.prevent_exit();
                 }
             }
+            // Clean-shutdown marker. Its absence before the next `AppStarted`
+            // is the only crash-vs-quit signal we have.
+            tauri::RunEvent::Exit => {
+                #[cfg(target_os = "macos")]
+                flush_secure_input(app, &ctx_for_exit.secure_input);
+                telemetry::send(
+                    app,
+                    TelemetryEvent::AppExiting {
+                        uptime: crate::telemetry::DurationBucket::classify(
+                            ctx_for_exit.started_at.elapsed(),
+                        ),
+                        fires: crate::telemetry::CountBucket::classify(
+                            ctx_for_exit
+                                .fire_count
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                    },
+                );
+                // The plugin flushes on Exit too, but ordering between plugin
+                // handlers isn't guaranteed — make it explicit.
+                telemetry::flush(app);
+            }
+            _ => {}
         });
 }
 
-/// Poll the updater endpoint on startup and every 6h. Emits a frontend
-/// `update-available` event when a new release is found, so the tray popup
-/// can surface an "Install update vX.Y.Z" entry without blocking on its own
-/// check call. Errors are logged and swallowed — a transient network blip
-/// shouldn't kill the poller.
-fn spawn_update_poller(app: tauri::AppHandle) {
+/// How long a `SecureInputWindow` covers — six hours turns ~2,800 per-edge
+/// events into a couple of dozen without losing the shape.
+#[cfg(target_os = "macos")]
+const SECURE_INPUT_WINDOW: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Emit one aggregated secure-input window, if anything happened in it.
+#[cfg(target_os = "macos")]
+fn flush_secure_input(app: &AppHandle, tracker: &crate::secure_input::SecureInputTracker) {
+    let stats = tracker.drain();
+    if stats.is_empty() {
+        return;
+    }
+    telemetry::send(
+        app,
+        TelemetryEvent::SecureInputWindow {
+            activations: crate::telemetry::CountBucket::classify(stats.activations as usize),
+            active: crate::telemetry::DurationBucket::classify(stats.active),
+            blocked_commits: crate::telemetry::CountBucket::classify(
+                stats.blocked_commits as usize,
+            ),
+        },
+    );
+}
+
+/// Wait briefly for the async tap install to flip `hook_alive`, so the boot
+/// `success` flag isn't just a race with the tap thread.
+#[cfg(target_os = "macos")]
+fn await_hook_settle(ctx: &AppContext, trusted: bool) -> bool {
+    if !trusted {
+        return ctx.state.hook_alive();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(750);
+    while std::time::Instant::now() < deadline {
+        if ctx.state.hook_alive() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    ctx.state.hook_alive()
+}
+
+/// Whether launch-at-login is on. Reported on `AppStarted` because it's the
+/// difference between "opened the app once" and "runs it every day".
+fn autostart_enabled(app: &AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+/// Poll the updater on startup and every 6h, emitting `update-available` for
+/// the tray popup. Errors are reported but never kill the loop.
+fn spawn_update_poller(app: tauri::AppHandle, ctx: AppContext) {
     use tauri::Emitter;
     use tauri_plugin_updater::UpdaterExt;
+    /// At most one "nothing new" per day. The check stays 6-hourly; only the
+    /// reporting is throttled, since 200 of 220 said nothing new.
+    const NO_UPDATE_REPORT_INTERVAL: u64 = 24 * 60 * 60;
+
     tauri::async_runtime::spawn(async move {
         // Small initial delay so the poller doesn't race the rest of startup.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
@@ -551,31 +704,57 @@ fn spawn_update_poller(app: tauri::AppHandle) {
                             env!("CARGO_PKG_VERSION"),
                             update.version
                         );
-                        let payload = serde_json::json!({
-                            "version": update.version,
-                            "notes": update.body,
-                        });
-                        let _ = app.emit("update-available", payload);
+                        let dismissed =
+                            ctx.settings.get().dismissed_update.as_deref() == Some(&update.version);
+                        if !dismissed {
+                            let payload = serde_json::json!({
+                                "version": update.version,
+                                "notes": update.body,
+                            });
+                            let _ = app.emit("update-available", payload);
+                            // A row inside a popover nobody opens is why updates
+                            // sat unseen for days; badge the always-visible icon.
+                            if ctx.attention.set_update(true) {
+                                crate::tray_icon::refresh(&app);
+                            }
+                        }
                         crate::telemetry::send(
                             &app,
-                            crate::telemetry::TelemetryEvent::UpdateCheck {
-                                available: true,
-                                current_version: env!("CARGO_PKG_VERSION"),
-                            },
+                            crate::telemetry::TelemetryEvent::UpdateCheck { available: true },
                         );
                     }
                     Ok(None) => {
+                        let now = crate::settings::now_unix();
+                        let last = ctx.settings.get().last_no_update_report;
+                        if now.saturating_sub(last) >= NO_UPDATE_REPORT_INTERVAL {
+                            ctx.settings.update(|s| s.last_no_update_report = now);
+                            crate::telemetry::send(
+                                &app,
+                                crate::telemetry::TelemetryEvent::UpdateCheck { available: false },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Was log-and-drop, which made a broken updater
+                        // indistinguishable from an up-to-date machine.
+                        tracing::warn!("update check failed: {}", e);
                         crate::telemetry::send(
                             &app,
-                            crate::telemetry::TelemetryEvent::UpdateCheck {
-                                available: false,
-                                current_version: env!("CARGO_PKG_VERSION"),
+                            crate::telemetry::TelemetryEvent::UpdateCheckFailed {
+                                stage: crate::telemetry::UpdateFailStage::Check,
                             },
                         );
                     }
-                    Err(e) => tracing::warn!("update check failed: {}", e),
                 },
-                Err(e) => tracing::warn!("updater unavailable: {}", e),
+                Err(e) => {
+                    tracing::warn!("updater unavailable: {}", e);
+                    crate::telemetry::send(
+                        &app,
+                        crate::telemetry::TelemetryEvent::UpdateCheckFailed {
+                            stage: crate::telemetry::UpdateFailStage::Unavailable,
+                        },
+                    );
+                }
             }
             // Spec §13: every 6h.
             tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
@@ -583,9 +762,8 @@ fn spawn_update_poller(app: tauri::AppHandle) {
     });
 }
 
-/// Copy bundled `.pp.md` example files into the user's library root on first
-/// run. Skips any file that already exists (idempotent) and non-`.pp.md`
-/// files (e.g. the examples README). Returns the count copied.
+/// Copy bundled `.pp.md` examples into the library root on first run.
+/// Idempotent — skips existing files and non-`.pp.md`. Returns the count.
 fn copy_bundled_examples(src: &std::path::Path, dst: &std::path::Path) -> usize {
     let Ok(entries) = std::fs::read_dir(src) else {
         return 0;
@@ -614,24 +792,18 @@ fn copy_bundled_examples(src: &std::path::Path, dst: &std::path::Path) -> usize 
     count
 }
 
-/// Reload the matcher index, per-prompt hotkeys, and tray popup after an
-/// in-app library mutation (save/create/delete/enable/pin/import). The
-/// hot-reload watcher does this on external file edits, but in-app CRUD must
-/// not depend on the watcher (it may have failed to start, and a freshly
-/// deleted prompt must stop firing immediately rather than after the next
-/// filesystem event).
+/// Reindex after an in-app mutation. Can't wait for the file watcher: it may
+/// have failed to start, and a deleted prompt must stop firing immediately.
 pub(crate) fn reindex_after_mutation(app: &AppHandle, ctx: &AppContext) {
     rebuild_match_index(ctx);
     shortcuts::rebuild_prompt_hotkeys(app, ctx);
     shortcuts::refresh_tray_popup(app);
 }
 
-/// Look up the bundled `prompts-examples` directory in the .app's Resources
-/// folder. Returns None when running from `cargo run` (CWD-relative path is
-/// used as fallback) or in test contexts.
+/// The bundled `prompts-examples` dir inside the .app/.msi. None under
+/// `cargo run` or in tests, where the caller falls back to CWD.
 fn first_run_bundled_examples() -> Option<std::path::PathBuf> {
-    // The bundled resources directory in a .app/.msi is sibling to the
-    // executable. We avoid taking a Tauri AppHandle here because this runs
+    // Resources sit beside the executable. No AppHandle here — this runs
     // before the Tauri builder.
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -649,10 +821,8 @@ fn first_run_bundled_examples() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Emit `src/lib/ipc.gen.ts` from the Specta-annotated commands. Runs only
-/// in debug builds (so the produced file is in source control as a
-/// developer convenience but never blocks a release build if the path
-/// resolution differs).
+/// Emit `src/lib/ipc.gen.ts` from the Specta-annotated commands. Debug only,
+/// so path resolution can never block a release build.
 #[cfg(debug_assertions)]
 fn generate_typescript_bindings() -> Result<(), String> {
     use specta_typescript::Typescript;
@@ -665,8 +835,17 @@ fn generate_typescript_bindings() -> Result<(), String> {
         crate::commands::armed::is_playing,
         crate::commands::armed::is_hook_alive,
         crate::commands::armed::open_accessibility_settings,
+        crate::commands::armed::reset_accessibility,
         crate::commands::power::get_keep_awake,
         crate::commands::power::toggle_keep_awake,
+        crate::commands::power::set_keep_awake_duration,
+        crate::commands::power::set_keep_awake_restore,
+        crate::commands::diagnostics::get_diagnostics,
+        crate::commands::diagnostics::run_self_test,
+        crate::commands::diagnostics::self_test_type,
+        crate::commands::diagnostics::open_diagnostics,
+        crate::commands::diagnostics::get_settings,
+        crate::commands::diagnostics::set_restore_armed,
         crate::commands::prompts::list_prompts,
         crate::commands::prompts::library_root,
         crate::commands::prompts::save_prompt,
@@ -685,6 +864,8 @@ fn generate_typescript_bindings() -> Result<(), String> {
         crate::commands::updater::updater_current_version,
         crate::commands::updater::updater_check,
         crate::commands::updater::updater_install,
+        crate::commands::updater::updater_announced,
+        crate::commands::updater::updater_dismiss,
         crate::commands::library::capture_foreground_app,
         crate::commands::library::expand_prompt_text,
         crate::commands::library::import_prompt,
@@ -711,13 +892,34 @@ fn generate_typescript_bindings() -> Result<(), String> {
     Ok(())
 }
 
+// Off Windows like `tests/ipc_registry.rs`: touching `tauri::Wry` retains a
+// WebView2 import the runner can't resolve at load, killing the test binary.
+#[cfg(all(test, debug_assertions, not(target_os = "windows")))]
+mod bindings_tests {
+    /// Regenerate `ipc.gen.ts` and fail if the checked-in copy was stale.
+    /// The regenerated file is left in place, so the fix is to commit it.
+    #[test]
+    fn checked_in_bindings_match_the_generator() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("manifest parent")
+            .join("src/lib/ipc.gen.ts");
+        let before = std::fs::read_to_string(&path).unwrap_or_default();
+        super::generate_typescript_bindings().expect("specta export");
+        let after = std::fs::read_to_string(&path).expect("read regenerated bindings");
+        assert_eq!(
+            before, after,
+            "src/lib/ipc.gen.ts was stale and has been regenerated — commit it"
+        );
+    }
+}
+
 fn rebuild_match_index(ctx: &AppContext) {
     let prompts = ctx.prompts.read();
     let mut entries = Vec::new();
     for p in prompts.iter() {
-        // Skip disabled prompts: indexing them would suppress the user's
-        // commit char (and pop their trigger from the ring) even though
-        // nothing fires — eating the `>` mid-demo with no expansion.
+        // Indexing a disabled prompt would eat the user's `>` mid-demo and
+        // expand nothing.
         if !p.enabled {
             continue;
         }
@@ -735,9 +937,8 @@ fn rebuild_match_index(ctx: &AppContext) {
     if skipped > 0 {
         tracing::warn!("matcher rebuild skipped {} duplicate trigger(s)", skipped);
     }
-    // Single-line diagnostic so a Console.app filter on subsystem catches
-    // the actual trigger count without needing to grep across multiple lines.
-    // Empty index here = no triggers will ever match, regardless of hook state.
+    // One line so a Console.app subsystem filter catches the trigger count.
+    // Empty here = nothing can ever match, whatever the hook is doing.
     tracing::info!(
         "matcher index rebuilt: prompts={} triggers={}",
         prompts.len(),
@@ -783,11 +984,8 @@ fn apply_macos_chrome(label: &str, w: &tauri::WebviewWindow) {
             );
             configure_popover_window(w);
         }
-        // Library and About are plain NSWindow (not panels). Both need
-        // `CanJoinAllSpaces | FullScreenAuxiliary` so they surface on
-        // whatever Space is current when shown — without this, `.accessory`
-        // apps anchor regular windows to the launch Space and "About"
-        // clicked from the tray on a different Space looks invisible.
+        // Plain NSWindows need `CanJoinAllSpaces | FullScreenAuxiliary`, or an
+        // `.accessory` app anchors them to the launch Space and they look gone.
         "library" | "about" => {
             make_window_space_neutral(w);
         }
@@ -801,9 +999,7 @@ fn apply_windows_chrome(label: &str, w: &tauri::WebviewWindow) {
     use window_vibrancy::{apply_acrylic, apply_mica};
     match label {
         "picker" => {
-            // Try Mica first (Win11). Fall back to Acrylic on Win10 / older.
-            // Both produce a translucent vibrancy similar to NSVisualEffectView's
-            // HudWindow material; loss of either is purely cosmetic.
+            // Mica on Win11, Acrylic on Win10. Losing either is cosmetic only.
             if apply_mica(w, Some(true)).is_err() {
                 let _ = apply_acrylic(w, Some((18, 18, 22, 160)));
             }
@@ -821,14 +1017,8 @@ fn apply_windows_chrome(label: &str, w: &tauri::WebviewWindow) {
     }
 }
 
-/// Apply ALL `manage()` calls for the app. Generic over the Tauri runtime so
-/// the integration smoke test in `tests/ipc_registry.rs` can reuse it
-/// against `MockRuntime`.
-///
-/// Production `run()` calls this *and* the matching inline `.manage()` block
-/// is kept in sync via `tests/ipc_registry.rs::manage_state_inline_matches_helper`.
-/// Adding a managed type means: (a) edit this function, (b) edit the inline
-/// block in `run()`, (c) `cargo test` re-asserts they match.
+/// All `manage()` calls, generic over the runtime so the tests can reuse it.
+/// A new type goes here AND in `run()`'s inline block; a test asserts both.
 pub fn manage_state<R: tauri::Runtime>(
     builder: tauri::Builder<R>,
     ctx: AppContext,

@@ -1,15 +1,7 @@
-//! §5.5 — capture/restore foreground app for the picker.
+//! §5.5 — snapshot the foreground app on picker open; on select, hide,
+//! re-activate, confirm the transfer happened, then deliver.
 //!
-//! Strategy:
-//!  - On picker open: snapshot foreground app (Mac: `NSWorkspace.frontmostApplication`,
-//!    Win: `GetForegroundWindow`).
-//!  - On select: hide picker, re-activate previous app, confirm foreground
-//!    really transferred, then deliver the prompt.
-//!  - Win uses the `AttachThreadInput` workaround for focus-stealing prevention,
-//!    then polls `GetForegroundWindow` until it matches the captured hwnd (or
-//!    a hard cap fires). That replaces the previous blind ~150ms sleep: we
-//!    return as soon as focus is actually restored, and fall back to the cap
-//!    only if the OS refuses (e.g., the target window was closed mid-flight).
+//! Windows needs `AttachThreadInput` to get past focus-stealing prevention.
 
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -46,9 +38,8 @@ impl FocusStore {
         self.snap.lock().clone()
     }
 
-    /// Restore focus to the previously-captured app.
-    /// Returns true if the activation call succeeded; the caller still must
-    /// wait `RESTORATION_DELAY` before delivering keystrokes.
+    /// Restore focus to the captured app. True if activation succeeded — the
+    /// caller must still wait `RESTORATION_DELAY` before typing.
     pub fn restore(&self) -> bool {
         let snap = self.snapshot();
         if let Some(handle) = snap.handle {
@@ -58,37 +49,26 @@ impl FocusStore {
         }
     }
 
-    /// Restore focus and block (briefly) until the OS reports the captured
-    /// window as foreground. Returns true if the verification succeeded
-    /// within `timeout`, false on timeout / no snapshot / refused activation.
-    ///
-    /// Use this in front of paste-style delivery, where the next keystroke
-    /// (Ctrl/Cmd+V) goes to whichever window is foreground *right now* —
-    /// guessing with a fixed sleep is exactly what produced the prior
-    /// "first chars land in the wrong window" symptom.
+    /// Restore focus and block until the OS confirms the transfer, or `timeout`.
+    /// Required before paste: Ctrl/Cmd+V goes to whatever is foreground *now*.
     pub fn restore_and_wait(&self, timeout: Duration) -> bool {
         let snap = self.snapshot();
         let Some(handle) = snap.handle else {
             return false;
         };
-        // Fire the activation regardless of its bool return — even when
-        // the kernel reports failure (SetForegroundWindow returns FALSE
-        // under focus-stealing prevention), the transition sometimes
-        // completes a few ms later. The poll below is the actual gate.
+        // Activate regardless of the return: SetForegroundWindow reports FALSE
+        // under focus-stealing prevention yet often lands anyway. The poll gates.
         let _ = restore_to(handle);
         wait_until_foreground(handle, timeout)
     }
 }
 
-/// Fallback delay between focus restoration and first keystroke. Used only
-/// when the verification path is not available (non-Win/Mac builds, or as a
-/// last-ditch nap if confirmation polling fails). The original code path
-/// hardcoded this as a blind sleep on every fire.
+/// Blind fallback delay, used only where verification isn't available or the
+/// confirmation poll times out.
 pub const RESTORATION_DELAY: Duration = Duration::from_millis(150);
 
-/// Upper bound for `restore_and_wait`. Generous because focus transitions
-/// against a hot-loaded target (Slack, Teams, Edge) can take >100ms; we
-/// still return as soon as the foreground transfer is observed.
+/// Upper bound for `restore_and_wait` — generous because a loaded target can
+/// take >100ms, though we return as soon as the transfer is observed.
 pub const RESTORATION_TIMEOUT: Duration = Duration::from_millis(400);
 
 #[cfg(target_os = "macos")]
@@ -119,17 +99,14 @@ fn capture_foreground() -> ForegroundSnapshot {
     }
     let fg_class = class_name_of(fg);
 
-    // Walk z-order from the foreground HWND collecting candidate metadata,
-    // then let the pure `select_target` policy pick the first one that's a
-    // plausible focus-restore target (skipping Zoom share helpers, our own
-    // windows, cloaked / minimized / hidden windows).
+    // Collect z-order candidates, then let the pure `select_target` policy
+    // pick the first plausible focus-restore target.
     let candidates = collect_z_order_candidates(fg, 10);
     let (handle_raw, window_title) = match select_target(&candidates) {
         Some(c) => (c.hwnd_raw, c.title.clone()),
         None => {
-            // Nothing in the z-order window passed the filter — fall back to
-            // the raw foreground HWND. Better to type at the wrong window
-            // than silently drop the snapshot.
+            // Nothing passed the filter — fall back to the raw foreground
+            // HWND rather than silently dropping the snapshot.
             tracing::warn!(
                 target: "prompt_player::capture",
                 fg_hwnd = fg.0 as usize,
@@ -173,17 +150,13 @@ fn restore_to(hwnd: u64) -> bool {
         if IsIconic(target).as_bool() {
             let _ = ShowWindow(target, SW_RESTORE);
         }
-        // Vanilla path first — when our process is still the foreground
-        // (we just hid the picker), focus-stealing prevention doesn't
-        // block us and this returns true immediately.
+        // We just hid the picker, so we're usually still foreground and
+        // focus-stealing prevention doesn't apply.
         if SetForegroundWindow(target).as_bool() {
             return true;
         }
-        // Fallback: attach our input queue to the current foreground
-        // thread's queue, which inherits its "input event" status for the
-        // duration. With that, SetForegroundWindow no longer hits focus-
-        // stealing prevention. This is the workaround referenced in the
-        // module header.
+        // Attaching to the foreground thread's input queue inherits its
+        // "input event" status, which gets SetForegroundWindow through.
         let fg = GetForegroundWindow();
         if fg.0.is_null() {
             return false;

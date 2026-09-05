@@ -1,11 +1,6 @@
-//! Window lifecycle hooks: close-to-hide, focus-loss for the picker and
-//! tray-popup.
-//!
-//! Picker dismiss-on-focus-loss intentionally does NOT call
-//! `focus.restore()` here — that's handled in `commands::picker::dismiss`.
-//! Calling it from both ends produces a double-activate of the previously-
-//! focused app, which on slow machines or apps with activation animations
-//! is visible.
+//! Window lifecycle: close-to-hide, and focus-loss for the picker and tray
+//! popup. Focus restore lives in `commands::picker::dismiss` only — doing it
+//! from both ends double-activates the previous app, visibly.
 
 use tauri::{AppHandle, Manager, WebviewWindow, WindowEvent};
 
@@ -13,9 +8,8 @@ use tauri::{AppHandle, Manager, WebviewWindow, WindowEvent};
 use crate::platform::macos::OutsideClickMonitor;
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
-// Windows uses a native `TrackPopupMenuEx` HMENU for the tray popup — the
-// `tray-popup` webview is never shown on Windows, so the focus-loss handler
-// below is mac-only.
+// Windows uses a native HMENU, so the `tray-popup` webview never shows there
+// and this handler is mac-only.
 
 pub fn install(app: &tauri::App) {
     for label in ["library", "picker", "tray-popup", "about"] {
@@ -41,13 +35,8 @@ fn install_window_handlers(app: AppHandle, label: &str, window: WebviewWindow) {
             }
         }
         WindowEvent::Focused(false) if label_owned == "picker" => {
-            // Hide ONLY — never restore focus here. The explicit Esc/select
-            // IPC paths (`picker_dismiss` / `picker_select`) own restoration;
-            // restoring here too double-activated the previous app on every
-            // dismiss. And when the picker loses focus because the user
-            // clicked into a *different* app, the OS already moved focus
-            // there — restoring would yank it back to the stale snapshot,
-            // stealing focus from the app the user just chose.
+            // Hide only. The Esc/select IPC paths own restoration, and doing it
+            // here would yank focus back from whatever app the user just clicked.
             let _ = w_clone.hide();
         }
         _ => {}

@@ -1,12 +1,8 @@
-//! §9.3 Architecture B — Windows-side guest helper daemon.
+//! §9.3 Architecture B — a daemon inside a Windows VM that replays schedules
+//! sent over local TCP via `enigo`, which beats host-side typing for
+//! high-latency RDP, complex Unicode and IME-heavy languages.
 //!
-//! Runs inside a Windows VM. Listens on `127.0.0.1:9847` (configurable).
-//! The Mac app sends `{prompt_text, schedule}` over TCP; the daemon replays the
-//! schedule via local `enigo` injection. More reliable for high-latency RDP
-//! sessions, complex Unicode, IME-heavy languages.
-//!
-//! Auth: shared secret in `%APPDATA%\PromptPlayer-GuestHelper\secret`.
-//! Off by default in the Mac app; surfaced when host-side typing fails.
+//! Authenticated by a shared secret under `%APPDATA%`. Off by default.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -23,9 +19,8 @@ struct ClientMessage {
     schedule: Vec<ScheduledKeyWire>,
 }
 
-// Wire types are deserialized from JSON and consumed by the typing pipeline
-// outside this binary; clippy can't see the cross-binary use, so we silence
-// the dead-code lint locally rather than refactor.
+// Wire types are consumed outside this binary, which clippy can't see, so the
+// dead-code lint is silenced locally.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", content = "value")]

@@ -1,10 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// HotkeyRecorder.svelte's reserved-shortcut map and modifier rendering are
-// platform-conditional. We test the underlying platform.ts helpers as a
-// proxy — rendering the full Svelte component would require @testing-library
-// /svelte at runtime which is fine but more setup. Coverage here focuses on
-// the platform-specific token mapping.
+// The component's reserved-shortcut map is platform-conditional, so we test
+// the `platform.ts` helpers it derives from rather than mounting it.
 
 describe("modifier rendering per platform", () => {
   beforeEach(() => {
