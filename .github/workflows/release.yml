@@ -129,31 +129,49 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # Notes come from `docs/release-notes/<tag>.md` when it exists, so the
+      # highlights are written and reviewed with the version bump instead of
+      # being whatever the commit subjects happened to say. Without that file
+      # the release ships install steps plus the generated changelog.
       - name: Create draft release (idempotent)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
+          set -euo pipefail
           tag="${{ github.ref_name }}"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release $tag already exists — skipping create"
             exit 0
           fi
+
+          body_file=$(mktemp)
+          highlights="docs/release-notes/${tag}.md"
+          if [ -f "$highlights" ]; then
+            echo "using hand-written notes from $highlights"
+            cat "$highlights" >> "$body_file"
+            printf '\n' >> "$body_file"
+          else
+            echo "::warning::no $highlights — shipping install steps and the generated changelog only"
+          fi
+
+          cat >> "$body_file" <<'EOF'
+
+          ### macOS install
+
+          The DMG is built for Apple Silicon (arm64). First launch: right-click → **Open**
+          (the build is unsigned).
+
+          ### Windows install
+
+          Run the MSI. SmartScreen may warn for unsigned builds — click
+          **More info → Run anyway**.
+          EOF
+
           gh release create "$tag" \
             --draft \
             --title "Prompt Player $tag" \
-            --notes "$(cat <<'EOF'
-          ## What's new
-
-          Auto-generated changelog will be appended once both platform builds finish.
-
-          ### macOS install
-          DMG is built for Apple Silicon (arm64). First launch: right-click → **Open** (unsigned build).
-
-          ### Windows install
-          Run the MSI. SmartScreen may warn for unsigned builds — click **More info → Run anyway**.
-          EOF
-          )"
+            --notes-file "$body_file"
 
   # ONE rust-tests job on macOS, parallel to the slow Mac/Win builds. Covers
   # all platform-agnostic tests (typer, prompts, store, matcher, undo, scopes,

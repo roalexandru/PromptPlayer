@@ -262,6 +262,12 @@ checks at startup +15s then every 6h and emits an `update-available`
 - **Signing secrets:** `TAURI_SIGNING_PRIVATE_KEY` / `…_PASSWORD` (updater
   minisign). Builds are currently **unsigned** re: Apple Developer ID / Windows
   EV cert (first-launch right-click→Open on mac; SmartScreen "Run anyway" on win).
+- **Release notes** come from `docs/release-notes/v<x.y.z>.md`, written with the
+  version bump. `create-release` prepends that file, appends the install steps,
+  and `populate-changelog` adds the generated commit list underneath. Without
+  the file the release ships install steps and the commit list only, and the
+  job logs a warning. Write it for a user: what they can do now that they
+  could not before, not which PRs landed.
 - **Version must match** across `package.json`, `src-tauri/tauri.conf.json`, and
   root `Cargo.toml` (`version.workspace = true`) — both workflows fail otherwise,
   and release also checks the tag equals `package.json` version. **Bump all three
