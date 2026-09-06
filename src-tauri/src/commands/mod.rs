@@ -106,6 +106,69 @@ mod registry_tests {
     }
 
     #[test]
+    fn every_configured_window_has_a_capability() {
+        // A window absent from every capability gets zero permissions, so its
+        // `core:window:*` calls are denied at runtime — silently, when the
+        // caller swallows the rejection. Diagnostics shipped that way: its own
+        // Close button and Esc were no-ops.
+        const CONF: &str = include_str!("../../tauri.conf.json");
+        const CAPS: [&str; 4] = [
+            include_str!("../../capabilities/default.json"),
+            include_str!("../../capabilities/library.json"),
+            include_str!("../../capabilities/picker.json"),
+            include_str!("../../capabilities/tray-popup.json"),
+        ];
+        let mut covered: Vec<String> = Vec::new();
+        for cap in CAPS {
+            let v: serde_json::Value = serde_json::from_str(cap).expect("capability json");
+            if let Some(ws) = v["windows"].as_array() {
+                covered.extend(ws.iter().filter_map(|w| w.as_str().map(str::to_string)));
+            }
+        }
+        for label in window_labels(CONF) {
+            assert!(
+                covered.contains(&label),
+                "window '{label}' is in tauri.conf.json but in no capabilities/*.json \
+                 `windows` list — it will be denied every core:window permission"
+            );
+        }
+    }
+
+    #[test]
+    fn every_configured_window_gets_lifecycle_and_chrome() {
+        // Missing from `lifecycle::install`, a window is destroyed on close
+        // instead of hidden, and `get_webview_window` returns None forever
+        // after — the tray item that opens it becomes a one-shot.
+        const CONF: &str = include_str!("../../tauri.conf.json");
+        const LIFECYCLE_RS: &str = include_str!("../app/lifecycle.rs");
+        for label in window_labels(CONF) {
+            let quoted = format!("\"{label}\"");
+            assert!(
+                LIFECYCLE_RS.contains(&quoted),
+                "window '{label}' has no handler in lifecycle::install — closing it \
+                 destroys it instead of hiding it"
+            );
+            assert!(
+                SETUP_RS.contains(&quoted),
+                "window '{label}' never passes through apply_window_chrome"
+            );
+        }
+    }
+
+    /// Window labels declared in `tauri.conf.json`.
+    fn window_labels(conf: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(conf).expect("tauri.conf.json");
+        let labels: Vec<String> = v["app"]["windows"]
+            .as_array()
+            .expect("app.windows")
+            .iter()
+            .filter_map(|w| w["label"].as_str().map(str::to_string))
+            .collect();
+        assert!(!labels.is_empty(), "no windows found in tauri.conf.json");
+        labels
+    }
+
+    #[test]
     fn generate_handler_list_matches_command_names() {
         let registered = extract_macro_paths(SETUP_RS, "tauri::generate_handler");
         let expected: Vec<String> = COMMAND_NAMES.iter().map(|s| s.to_string()).collect();

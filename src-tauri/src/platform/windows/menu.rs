@@ -13,9 +13,9 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, PostMessageW,
-    RegisterClassW, SetForegroundWindow, TrackPopupMenuEx, HMENU, MF_CHECKED, MF_SEPARATOR,
-    MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
-    WM_NULL, WNDCLASSW, WS_OVERLAPPED,
+    RegisterClassW, SetForegroundWindow, TrackPopupMenuEx, HMENU, MF_CHECKED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WINDOW_EX_STYLE, WM_NULL, WNDCLASSW, WS_OVERLAPPED,
 };
 
 /// Command IDs from `TrackPopupMenuEx`. Static items use the 100-band; pinned
@@ -31,6 +31,12 @@ const ID_HOOK_WARNING: u32 = 107;
 const ID_NEXT_CUE: u32 = 108;
 const ID_PAUSE_PLAYBACK: u32 = 109;
 const ID_RESET_SETLIST: u32 = 110;
+const ID_KILL: u32 = 111;
+const ID_UPDATE_INSTALL: u32 = 112;
+const ID_UPDATE_SKIP: u32 = 113;
+const ID_CAPTURE_WARNING: u32 = 114;
+/// Keep Awake duration choices, indexed into `settings::KEEP_AWAKE_CHOICES`.
+const ID_KEEP_AWAKE_DURATION_BASE: u32 = 200;
 const ID_PINNED_BASE: u32 = 1000;
 
 /// Cached helper HWND as an isize: `HWND` isn't `Send`, the raw pointer is,
@@ -142,6 +148,28 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     }
 
+    // 0b. §5.4 exclusion is not fully in effect, so whatever is being shared
+    // may include the picker. A log line is not a warning a presenter sees.
+    if ctx.attention.capture_degraded() {
+        let warn = wstr("⚠ Picker may be visible on screen share");
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            ID_CAPTURE_WARNING as usize,
+            PCWSTR(warn.as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    }
+
+    // 0c. Stop typing — only while something is in flight. The macOS popover
+    // has had this since day one; on Windows the abort was hotkey-only, which
+    // is a poor thing to discover mid-demo.
+    if playing {
+        let stop = wstr("Stop Typing\tCtrl+Alt+Shift+K");
+        let _ = AppendMenuW(menu, MF_STRING, ID_KILL as usize, PCWSTR(stop.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    }
+
     // 1. Armed toggle (with checkmark when on).
     let toggle_label = wstr("Prompt Player");
     let toggle_flags = if armed {
@@ -238,7 +266,52 @@ unsafe fn run_menu(app: &AppHandle, rect: tauri::Rect) -> Option<(u32, Vec<Strin
     };
     let _ = AppendMenuW(menu, ka_flags, ID_KEEP_AWAKE as usize, PCWSTR(ka.as_ptr()));
 
-    // 5. Diagnostics + About + Quit.
+    // Duration submenu, so the auto-off is settable here as it is in the macOS
+    // popover — `set_keep_awake_duration` had no Windows entry point at all.
+    // The submenu HMENU becomes owned by `menu`, so `DestroyMenu` frees both.
+    let default_mins = ctx.settings.get().keep_awake_mins;
+    if let Ok(sub) = CreatePopupMenu() {
+        for (i, mins) in crate::settings::KEEP_AWAKE_CHOICES.iter().enumerate() {
+            let label = wstr(&keep_awake_choice_label(*mins));
+            let flags = if *mins == default_mins {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let _ = AppendMenuW(
+                sub,
+                flags,
+                (ID_KEEP_AWAKE_DURATION_BASE + i as u32) as usize,
+                PCWSTR(label.as_ptr()),
+            );
+        }
+        let sub_label = wstr("Keep Awake for…");
+        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(sub_label.as_ptr()));
+    }
+
+    // 5. Update, when one is waiting. The macOS popover surfaced this from the
+    // start; on Windows the tray said nothing and only About knew, which made
+    // `UpdateAvailableShown` a macOS-only metric.
+    let pending = ctx.pending_update.read().clone();
+    if let Some(version) = &pending {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let install = wstr(&format!("Install Update v{version}"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            ID_UPDATE_INSTALL as usize,
+            PCWSTR(install.as_ptr()),
+        );
+        let skip = wstr("Skip This Version");
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            ID_UPDATE_SKIP as usize,
+            PCWSTR(skip.as_ptr()),
+        );
+    }
+
+    // 6. Diagnostics + About + Quit.
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let diag = wstr("Diagnostics…");
     let _ = AppendMenuW(
@@ -303,6 +376,15 @@ fn keep_awake_label(ctx: &AppContext) -> String {
     }
 }
 
+/// Label for one `KEEP_AWAKE_CHOICES` entry. `0` is the indefinite option.
+fn keep_awake_choice_label(mins: u16) -> String {
+    match mins {
+        0 => "Until I Turn It Off".to_string(),
+        m if m >= 60 && m % 60 == 0 => format!("{} hours", m / 60),
+        m => format!("{m} minutes"),
+    }
+}
+
 fn dispatch(app: &AppHandle, cmd_id: u32, pinned_ids: &[String]) {
     match cmd_id {
         ID_TOGGLE_ARMED => {
@@ -327,6 +409,51 @@ fn dispatch(app: &AppHandle, cmd_id: u32, pinned_ids: &[String]) {
             }
         }
         ID_ABOUT => show_window(app, "about"),
+        ID_KILL => {
+            if let Some(ctx) = app.try_state::<AppContext>() {
+                let was_playing = ctx.state.is_playing();
+                ctx.state
+                    .cancel_playback_with(crate::telemetry::CancelReason::Kill);
+                crate::telemetry::send(
+                    app,
+                    crate::telemetry::TelemetryEvent::PromptKilled { was_playing },
+                );
+            }
+        }
+        ID_UPDATE_INSTALL => {
+            // `install_now` is async and does network work; dispatch runs on
+            // the UI thread.
+            let app_owned = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = crate::commands::updater::install_now(&app_owned).await {
+                    tracing::warn!("tray update install failed: {:?}", e);
+                }
+            });
+        }
+        ID_UPDATE_SKIP => {
+            if let Some(ctx) = app.try_state::<AppContext>() {
+                let pending = ctx.pending_update.read().clone();
+                if let Some(version) = pending {
+                    crate::commands::updater::dismiss_version(app, &ctx, version);
+                }
+            }
+        }
+        ID_CAPTURE_WARNING => show_window(app, "diagnostics"),
+        id if (ID_KEEP_AWAKE_DURATION_BASE
+            ..ID_KEEP_AWAKE_DURATION_BASE + crate::settings::KEEP_AWAKE_CHOICES.len() as u32)
+            .contains(&id) =>
+        {
+            if let Some(ctx) = app.try_state::<AppContext>() {
+                let idx = (id - ID_KEEP_AWAKE_DURATION_BASE) as usize;
+                let mins = crate::settings::KEEP_AWAKE_CHOICES[idx];
+                ctx.settings.update(|s| s.keep_awake_mins = mins);
+                // Re-arm a running session so picking "30 minutes" while
+                // already on takes effect now, matching the macOS popover.
+                if ctx.power.is_enabled() {
+                    ctx.power.set_for(true, mins);
+                }
+            }
+        }
         ID_DIAGNOSTICS | ID_HOOK_WARNING => {
             if let Some(ctx) = app.try_state::<AppContext>() {
                 ctx.settings.update(|s| s.setup_seen = true);

@@ -169,7 +169,10 @@ impl SettingsStore {
         }
         match serde_json::to_string_pretty(s) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                // Atomic: a truncated settings.json is silently replaced
+                // with defaults on next launch, so a crash mid-write costs the
+                // user's preferences without ever saying so.
+                if let Err(e) = crate::fsutil::write_atomic_str(path, &json) {
                     tracing::warn!("could not write {:?}: {}", path, e);
                 }
             }

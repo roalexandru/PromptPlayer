@@ -238,16 +238,25 @@ pub fn register(
                     }
                     refresh_tray_popup(&app_handle);
                 } else {
-                    // Per-prompt hotkey lookup.
-                    let map = ctx_for_handler.hotkeys.read();
-                    for (hk_str, prompt_id) in map.iter() {
-                        if let Ok(s) = Shortcut::from_str(&hotkey::normalize(hk_str)) {
-                            if &s == shortcut {
-                                tracing::info!("prompt hotkey {} fired → {}", hk_str, prompt_id);
-                                fire_for_handler.fire_from_hotkey(prompt_id);
-                                break;
-                            }
-                        }
+                    // Per-prompt hotkey lookup. Compare on the parsed chord:
+                    // re-parsing every registered string on each keypress meant
+                    // a library with many hotkeys paid for all of them on the
+                    // one that fired.
+                    let hit = ctx_for_handler
+                        .hotkeys
+                        .read()
+                        .iter()
+                        .find(|(hk_str, _)| {
+                            Shortcut::from_str(&hotkey::normalize(hk_str))
+                                .is_ok_and(|s| &s == shortcut)
+                        })
+                        .map(|(hk, id)| (hk.clone(), id.clone()));
+                    if let Some((hk_str, prompt_id)) = hit {
+                        tracing::info!("prompt hotkey {} fired → {}", hk_str, prompt_id);
+                        // Fire outside the lock: `fire_from_hotkey` spawns, but
+                        // holding a read lock across it is a habit worth not
+                        // forming on the hook's own path.
+                        fire_for_handler.fire_from_hotkey(&prompt_id);
                     }
                 }
             })
@@ -329,6 +338,12 @@ pub fn set_armed_and_report(app: &AppHandle, ctx: &AppContext, armed: bool) {
     ctx.state.set_armed(armed);
     ctx.settings.update(|s| s.armed = armed);
     refresh_tray_popup(app);
+    crate::app::lifecycle::emit_to_window(
+        app,
+        "library",
+        crate::app::lifecycle::ARMED_CHANGED,
+        armed,
+    );
     telemetry::send(
         app,
         TelemetryEvent::ArmToggled {
@@ -338,25 +353,47 @@ pub fn set_armed_and_report(app: &AppHandle, ctx: &AppContext, armed: bool) {
     );
 }
 
-/// Re-register all prompt hotkeys after a library hot-reload or save.
+/// Re-register prompt hotkeys after a library hot-reload or save.
+///
+/// Diffed, not rebuilt. Unregistering everything and re-registering it ran on
+/// every save, toggle and hot-reload — so editing one prompt's description
+/// briefly dropped every working hotkey and re-emitted `HotkeyRegisterFailed`
+/// for any that still conflicted, turning one real conflict into a stream of
+/// events. Only what actually changed is touched now.
 pub fn rebuild_prompt_hotkeys(app: &AppHandle, ctx: &AppContext) {
     let prompts = ctx.prompts.snapshot();
     let gs = app.global_shortcut();
-    {
-        let old = ctx.hotkeys.read();
-        for hk_str in old.keys() {
-            if let Ok(s) = Shortcut::from_str(&hotkey::normalize(hk_str)) {
-                let _ = gs.unregister(s);
-            }
-        }
-    }
-    let mut new_map = std::collections::HashMap::new();
-    for p in &prompts {
-        if !p.enabled {
+
+    // What the library asks for, in registration order.
+    let wanted: Vec<(String, String)> = prompts
+        .iter()
+        .filter(|p| p.enabled)
+        .filter_map(|p| {
+            let hk = p.hotkey.as_ref()?;
+            (!hk.trim().is_empty()).then(|| (hk.clone(), p.id.clone()))
+        })
+        .collect();
+
+    let previous = ctx.hotkeys.read().clone();
+    // Drop only the chords that are gone, or that now point somewhere else.
+    for (hk_str, prompt_id) in previous.iter() {
+        let still_wanted = wanted
+            .iter()
+            .any(|(hk, id)| hk == hk_str && id == prompt_id);
+        if still_wanted {
             continue;
         }
-        let Some(hk) = &p.hotkey else { continue };
-        if hk.trim().is_empty() {
+        if let Ok(s) = Shortcut::from_str(&hotkey::normalize(hk_str)) {
+            let _ = gs.unregister(s);
+        }
+    }
+
+    let mut new_map = std::collections::HashMap::new();
+    for (hk, prompt_id) in &wanted {
+        // Already registered to this same prompt — leave the OS registration
+        // alone rather than cycling it.
+        if previous.get(hk).is_some_and(|id| id == prompt_id) {
+            new_map.insert(hk.clone(), prompt_id.clone());
             continue;
         }
         let normalized = hotkey::normalize(hk);
@@ -365,8 +402,8 @@ pub fn rebuild_prompt_hotkeys(app: &AppHandle, ctx: &AppContext) {
         match Shortcut::from_str(&normalized) {
             Ok(s) => match gs.register(s) {
                 Ok(()) => {
-                    tracing::info!("registered hotkey {} → {}", hk, p.id);
-                    new_map.insert(hk.clone(), p.id.clone());
+                    tracing::info!("registered hotkey {} → {}", hk, prompt_id);
+                    new_map.insert(hk.clone(), prompt_id.clone());
                 }
                 Err(e) => {
                     tracing::warn!("hotkey {} register failed: {}", hk, e);

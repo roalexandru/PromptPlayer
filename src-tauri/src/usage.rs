@@ -134,7 +134,7 @@ impl UsageStore {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = std::fs::write(&path, json) {
+        if let Err(e) = crate::fsutil::write_atomic_str(&path, &json) {
             tracing::warn!("could not write {:?}: {}", path, e);
         }
     }

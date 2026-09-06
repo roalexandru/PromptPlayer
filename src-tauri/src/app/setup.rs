@@ -814,6 +814,10 @@ fn spawn_update_poller(app: tauri::AppHandle, ctx: AppContext) {
                         );
                         let dismissed =
                             ctx.settings.get().dismissed_update.as_deref() == Some(&update.version);
+                        // Parked for the Windows native menu, which is built
+                        // on demand and can't receive the event below.
+                        *ctx.pending_update.write() =
+                            (!dismissed).then(|| update.version.to_string());
                         if !dismissed {
                             let payload = serde_json::json!({
                                 "version": update.version,
@@ -984,6 +988,12 @@ fn spawn_auto_disarm(app: AppHandle, ctx: AppContext) {
 /// `LowLevelHooksTimeout`, and the app has no notification when it happens —
 /// it just stops matching triggers while still showing as armed. macOS had a
 /// respawn watcher for its own failure mode; this closes the same gap here.
+/// How often to check the hook is still in the chain. Long enough that a
+/// mouse-only stretch rarely trips it, short enough that a detached hook is
+/// repaired inside one demo.
+#[cfg(target_os = "windows")]
+const HOOK_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[cfg(target_os = "windows")]
 fn spawn_hook_watchdog(
     matcher: Arc<crate::matcher::MatcherState>,
@@ -993,18 +1003,45 @@ fn spawn_hook_watchdog(
 ) {
     thread::Builder::new()
         .name("prompt-player-hook-watchdog".into())
-        .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            if app_state.hook_alive() {
-                continue;
+        .spawn(move || {
+            let mut last_events = crate::hook::windows::events_seen();
+            loop {
+                std::thread::sleep(HOOK_HEALTH_INTERVAL);
+
+                // A silent `LowLevelHooksTimeout` detach writes nothing: the
+                // pump thread stays in `GetMessageW` and `hook_alive` stays
+                // true. Watching the flag alone can never see it, so compare
+                // events seen against whether the user was active at all.
+                let events = crate::hook::windows::events_seen();
+                let saw_events = events != last_events;
+                last_events = events;
+                let user_active = crate::hook::windows::idle_millis()
+                    .is_some_and(|ms| u64::from(ms) < HOOK_HEALTH_INTERVAL.as_millis() as u64);
+
+                if app_state.hook_alive() && (saw_events || !user_active) {
+                    continue;
+                }
+                // Mouse-only activity trips this too. A reinstall is one
+                // syscall pair and the hook holds no state, so the false
+                // positive is much cheaper than missing a real detach.
+                tracing::warn!(
+                    alive = app_state.hook_alive(),
+                    saw_events,
+                    user_active,
+                    "keyboard hook may have been detached — reinstalling"
+                );
+                // Goes through the pump thread: a low-level hook belongs to the
+                // thread that installed it, so it cannot be replaced from here.
+                if !crate::hook::windows::request_reinstall() {
+                    // No pump thread yet (or it died) — start one.
+                    crate::hook::spawn_grabbing_hook(
+                        matcher.clone(),
+                        undo.clone(),
+                        app_state.clone(),
+                        cb.clone(),
+                    );
+                }
             }
-            tracing::warn!("keyboard hook is not alive — reinstalling");
-            crate::hook::spawn_grabbing_hook(
-                matcher.clone(),
-                undo.clone(),
-                app_state.clone(),
-                cb.clone(),
-            );
         })
         .expect("spawn hook watchdog thread");
 }
@@ -1015,6 +1052,9 @@ pub(crate) fn reindex_after_mutation(app: &AppHandle, ctx: &AppContext) {
     rebuild_match_index(ctx);
     shortcuts::rebuild_prompt_hotkeys(app, ctx);
     shortcuts::refresh_tray_popup(app);
+    // Tell the library window instead of making it ask twice a second for the
+    // lifetime of the process.
+    lifecycle::emit_to_window(app, "library", lifecycle::LIBRARY_CHANGED, ());
 }
 
 /// The bundled `prompts-examples` dir inside the .app/.msi. None under
@@ -1185,7 +1225,7 @@ fn rebuild_match_index(ctx: &AppContext) {
 }
 
 fn apply_window_chrome(app: &tauri::App) {
-    for label in ["library", "picker", "tray-popup", "about"] {
+    for label in ["library", "picker", "tray-popup", "about", "diagnostics"] {
         if let Some(w) = app.get_webview_window(label) {
             #[cfg(target_os = "macos")]
             apply_macos_chrome(label, &w);
@@ -1224,7 +1264,7 @@ fn apply_macos_chrome(label: &str, w: &tauri::WebviewWindow) {
         }
         // Plain NSWindows need `CanJoinAllSpaces | FullScreenAuxiliary`, or an
         // `.accessory` app anchors them to the launch Space and they look gone.
-        "library" | "about" => {
+        "library" | "about" | "diagnostics" => {
             make_window_space_neutral(w);
         }
         _ => {}

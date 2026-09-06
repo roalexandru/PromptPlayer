@@ -621,7 +621,12 @@ hookAlive: boolean;
 /**
  * macOS Secure Input is engaged right now, so triggers are gated off.
  */
-secureInputActive: boolean; armed: boolean; keepAwake: boolean; prompts: number; enabledPrompts: number; triggers: number; hotkeys: number; libraryRoot: string; logDir: string; 
+secureInputActive: boolean; 
+/**
+ * §5.4 exclusion is not fully in effect — the picker may show up in a
+ * screen share. Sticky until the next successful show.
+ */
+captureDegraded: boolean; armed: boolean; keepAwake: boolean; prompts: number; enabledPrompts: number; triggers: number; hotkeys: number; libraryRoot: string; logDir: string; 
 /**
  * True when the hook cannot work and the user must act.
  */

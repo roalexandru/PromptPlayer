@@ -21,6 +21,9 @@ pub struct Attention {
     hook_dead: AtomicBool,
     /// An undismissed update is available.
     update: AtomicBool,
+    /// §5.4 exclusion is not fully in effect, so the picker may show up in a
+    /// screen share. The one state a presenter must not learn from a log file.
+    capture_degraded: AtomicBool,
 }
 
 impl Attention {
@@ -35,6 +38,14 @@ impl Attention {
 
     pub fn set_update(&self, available: bool) -> bool {
         self.update.swap(available, Ordering::Relaxed) != available
+    }
+
+    pub fn set_capture_degraded(&self, degraded: bool) -> bool {
+        self.capture_degraded.swap(degraded, Ordering::Relaxed) != degraded
+    }
+
+    pub fn capture_degraded(&self) -> bool {
+        self.capture_degraded.load(Ordering::Relaxed)
     }
 
     pub fn needs_badge(&self) -> bool {

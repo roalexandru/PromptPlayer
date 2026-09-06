@@ -163,6 +163,37 @@ pub fn summon_picker_without_context(app: &AppHandle) {
     );
 }
 
+/// Apply the capture exclusion and make anything short of full exclusion
+/// visible. A `WDA_MONITOR` fallback still hides the content, but the audience
+/// sees a black rectangle where the picker sits — and a presenter who believes
+/// they are invisible needs telling. A log line mid-demo is not telling them.
+fn report_capture_exclusion(app: &AppHandle, w: &tauri::WebviewWindow) {
+    use crate::picker::window::CaptureExclusion;
+    let degraded = match crate::picker::window::apply_screen_capture_exclusion(w, true) {
+        Ok(CaptureExclusion::Full) => None,
+        Ok(other) => {
+            tracing::error!(
+                "picker screen-capture exclusion is only partly in effect ({other:?}) — \
+                 the picker may be visible to a screen share"
+            );
+            Some(crate::telemetry::CaptureDegradeReason::MonitorFallback)
+        }
+        Err(e) => {
+            tracing::error!("picker capture-exclusion failed: {e}");
+            Some(crate::telemetry::CaptureDegradeReason::Failed)
+        }
+    };
+    let Some(ctx) = app.try_state::<AppContext>() else {
+        return;
+    };
+    if ctx.attention.set_capture_degraded(degraded.is_some()) {
+        crate::tray_icon::refresh(app);
+    }
+    if let Some(reason) = degraded {
+        telemetry::send(app, TelemetryEvent::CaptureExclusionDegraded { reason });
+    }
+}
+
 /// Bring the picker window forward. Private on purpose: every caller must go
 /// through a `summon_*` wrapper, so a new entry point cannot skip reporting.
 fn show_picker_window(app: &AppHandle) {
@@ -175,9 +206,7 @@ fn show_picker_window(app: &AppHandle) {
         // the Windows path was restored first and macOS
         // (`NSWindow.sharingType = .none`) was still dormant. One idempotent
         // syscall, run before `show()` so the first frame is already excluded.
-        if let Err(e) = crate::picker::window::apply_screen_capture_exclusion(&w, true) {
-            tracing::warn!("picker capture-exclusion failed: {e}");
-        }
+        report_capture_exclusion(app, &w);
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();

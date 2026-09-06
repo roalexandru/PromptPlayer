@@ -20,6 +20,9 @@ pub struct Diagnostics {
     pub hook_alive: bool,
     /// macOS Secure Input is engaged right now, so triggers are gated off.
     pub secure_input_active: bool,
+    /// §5.4 exclusion is not fully in effect — the picker may show up in a
+    /// screen share. Sticky until the next successful show.
+    pub capture_degraded: bool,
     pub armed: bool,
     pub keep_awake: bool,
     pub prompts: u32,
@@ -50,6 +53,7 @@ pub fn collect(ctx: &AppContext) -> Diagnostics {
         accessibility_trusted,
         hook_alive,
         secure_input_active: crate::secure_input::is_active(),
+        capture_degraded: ctx.attention.capture_degraded(),
         armed: ctx.state.is_armed(),
         keep_awake: ctx.power.is_enabled(),
         prompts: prompts.len() as u32,
@@ -220,6 +224,8 @@ pub fn show(app: &AppHandle) {
         let _ = w.set_focus();
         #[cfg(target_os = "macos")]
         crate::platform::macos::activate_app();
+        // The status poll only runs while this window is on screen.
+        crate::app::lifecycle::notify_shown(app, "diagnostics");
     }
 }
 

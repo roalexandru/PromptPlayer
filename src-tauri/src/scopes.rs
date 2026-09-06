@@ -1,6 +1,8 @@
 //! §4 — per-app scopes. Phase 7 fully implements; Phase 4 stubs the type.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// One scope filter from §4.2: app(s), window-title regex, url regex, time-of-day.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
@@ -161,6 +163,34 @@ pub fn pick_best(prompts: &[crate::prompts::Prompt], ctx: &ForegroundContext) ->
     best.map(|p| p.id.clone())
 }
 
+/// Compiled scope regexes, keyed on the pattern.
+///
+/// `Regex::new` ran once per pattern per candidate prompt on every fire —
+/// inside the window between the user typing `trigger>` and the first
+/// synthesized character, which is the one interval a demo audience notices.
+/// Patterns come from prompt frontmatter, so the set is small and bounded by
+/// the library; a failed compile is cached as `None` so a broken pattern
+/// isn't recompiled on every keystroke either.
+static REGEX_CACHE: parking_lot::Mutex<Option<HashMap<String, Option<Arc<regex::Regex>>>>> =
+    parking_lot::Mutex::new(None);
+
+fn compiled_regex(pattern: &str) -> Option<Arc<regex::Regex>> {
+    let mut guard = REGEX_CACHE.lock();
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some(hit) = cache.get(pattern) {
+        return hit.clone();
+    }
+    let compiled = match regex::Regex::new(pattern) {
+        Ok(r) => Some(Arc::new(r)),
+        Err(e) => {
+            tracing::warn!("scope regex {pattern:?} does not compile: {e}");
+            None
+        }
+    };
+    cache.insert(pattern.to_string(), compiled.clone());
+    compiled
+}
+
 impl ScopeFilter {
     /// Returns true if `ctx` matches this scope. Empty scope matches everything.
     pub fn matches(&self, ctx: &ForegroundContext) -> bool {
@@ -184,24 +214,24 @@ impl ScopeFilter {
         }
         if let Some(re) = &self.window_title_regex {
             let title = ctx.window_title.as_deref().unwrap_or("");
-            match regex::Regex::new(re) {
-                Ok(r) => {
+            match compiled_regex(re) {
+                Some(r) => {
                     if !r.is_match(title) {
                         return false;
                     }
                 }
-                Err(_) => return false,
+                None => return false,
             }
         }
         if let Some(re) = &self.url_regex {
             let url = ctx.url.as_deref().unwrap_or("");
-            match regex::Regex::new(re) {
-                Ok(r) => {
+            match compiled_regex(re) {
+                Some(r) => {
                     if !r.is_match(url) {
                         return false;
                     }
                 }
-                Err(_) => return false,
+                None => return false,
             }
         }
         if let Some(spec) = &self.time_of_day {

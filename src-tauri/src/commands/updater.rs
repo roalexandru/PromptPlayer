@@ -100,16 +100,32 @@ pub fn updater_announced(app: AppHandle, version: String, ctx: tauri::State<'_, 
 #[tauri::command]
 #[specta::specta]
 pub fn updater_dismiss(app: AppHandle, version: String, ctx: tauri::State<'_, AppContext>) {
+    dismiss_version(&app, &ctx, version);
+}
+
+/// The one dismiss sequence — parked version, settings, badge, telemetry.
+/// Shared so the Windows native menu can't reimplement three of the four.
+pub fn dismiss_version(app: &AppHandle, ctx: &AppContext, version: String) {
+    if ctx.pending_update.read().as_deref() == Some(version.as_str()) {
+        *ctx.pending_update.write() = None;
+    }
     ctx.settings.update(|s| s.dismissed_update = Some(version));
     if ctx.attention.set_update(false) {
-        crate::tray_icon::refresh(&app);
+        crate::tray_icon::refresh(app);
     }
-    telemetry::send(&app, TelemetryEvent::UpdateDismissed);
+    telemetry::send(app, TelemetryEvent::UpdateDismissed);
 }
 
 #[tauri::command]
 #[specta::specta]
 pub async fn updater_install(app: AppHandle) -> IpcResult<()> {
+    install_now(&app).await
+}
+
+/// The one install sequence — check, flush, download, restart. Shared so the
+/// Windows native tray menu goes through the same reporting as the popover.
+pub async fn install_now(app: &AppHandle) -> IpcResult<()> {
+    let app = app.clone();
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {

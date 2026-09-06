@@ -8,7 +8,7 @@ use core_foundation::runloop::{
     kCFRunLoopCommonModes, CFRunLoop, CFRunLoopRun, CFRunLoopSourceRef,
 };
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -82,6 +82,23 @@ pub struct NativeKeyEvent {
 
 const KEY_CODE_DELETE: u16 = 51; // backspace on US layout
 
+/// A tap thread exists. `hook_alive` cannot stand in for this: the tap
+/// callback drops it to false while re-enabling after a system auto-disable,
+/// and the Accessibility watcher polling inside that window would otherwise
+/// install a second tap. Two taps both dispatch, so every keystroke reaches
+/// the matcher twice — the ring fills with `bbuuiilldd` and no trigger ever
+/// matches again, with nothing in the log to say why.
+static TAP_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Clears the install claim on every exit path of the tap thread.
+struct TapClaim;
+
+impl Drop for TapClaim {
+    fn drop(&mut self) {
+        TAP_INSTALLED.store(false, Ordering::Release);
+    }
+}
+
 /// Spawn the CGEventTap on its own thread and CFRunLoop. `status` tracks
 /// liveness; the return value says whether the install itself succeeded.
 pub fn spawn(handler: EventHandler, status: std::sync::Arc<crate::state::AppState>) -> bool {
@@ -92,17 +109,28 @@ pub fn spawn(handler: EventHandler, status: std::sync::Arc<crate::state::AppStat
         status.set_hook_alive(false);
         return false;
     }
+    if TAP_INSTALLED.swap(true, Ordering::AcqRel) {
+        tracing::debug!("CGEventTap already installed — ignoring duplicate spawn");
+        return false;
+    }
     let status_for_thread = status.clone();
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("prompt-player-cgevent-tap".into())
         .spawn(move || run_tap_thread(handler, status_for_thread))
-        .expect("spawn cgevent tap thread");
+    {
+        // Release the claim, or no later respawn can ever succeed.
+        TAP_INSTALLED.store(false, Ordering::Release);
+        tracing::error!("could not spawn cgevent tap thread: {e}");
+        status.set_hook_alive(false);
+        return false;
+    }
     // Install is async on the spawned thread, so the spawn itself counts as
     // success; the watcher respawns if `hook_alive` never flips.
     true
 }
 
 fn run_tap_thread(handler: EventHandler, status: std::sync::Arc<crate::state::AppState>) {
+    let _claim = TapClaim;
     // Box the callback context to a stable address; pass to C via user_info.
     let ctx_ptr = Box::into_raw(Box::new(TapContext {
         handler,

@@ -53,6 +53,11 @@ pub struct AppContext {
     pub picker_search: Arc<SearchSession>,
     /// What the tray icon's attention badge is currently reporting.
     pub attention: Arc<crate::tray_icon::Attention>,
+    /// Version of an available, undismissed update. The macOS popover learns
+    /// this from the `update-available` event, but the Windows native menu is
+    /// built on demand and has nowhere to receive events — so the poller parks
+    /// it here and both tray implementations read the same value.
+    pub pending_update: Arc<RwLock<Option<String>>>,
     /// Process start, for the uptime on `AppExiting`.
     pub started_at: Instant,
     /// Successful fires this run, also reported on `AppExiting`.
@@ -86,6 +91,7 @@ impl AppContext {
             secure_input: SecureInputTracker::shared(),
             picker_search: Arc::new(SearchSession::default()),
             attention: crate::tray_icon::Attention::shared(),
+            pending_update: Arc::new(RwLock::new(None)),
             started_at: Instant::now(),
             fire_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }

@@ -225,7 +225,7 @@ impl PromptStore {
             .clone()
             .ok_or_else(|| AppError::NoSourcePath { id: id.to_string() })?;
         let body = parser::serialize(&snapshot)?;
-        std::fs::write(&path, body).map_err(|e| AppError::Io {
+        crate::fsutil::write_atomic_str(&path, &body).map_err(|e| AppError::Io {
             path: path.clone(),
             source: e,
         })?;
@@ -242,7 +242,7 @@ impl PromptStore {
             .clone()
             .ok_or_else(|| AppError::NoSourcePath { id: id.to_string() })?;
         let body = parser::serialize(&snapshot)?;
-        std::fs::write(&path, body).map_err(|e| AppError::Io {
+        crate::fsutil::write_atomic_str(&path, &body).map_err(|e| AppError::Io {
             path: path.clone(),
             source: e,
         })?;
@@ -270,15 +270,28 @@ impl PromptStore {
         // Provenance is ours to decide, not the caller's: anything written to
         // the local library root is by definition a local prompt.
         snapshot.origin = PromptOrigin::Local;
+        // `source_path` arrives verbatim in the `save_prompt` IPC payload, so
+        // an absolute path outside the library would make this an arbitrary
+        // file write. A local prompt has no reason to live anywhere else.
+        if let Some(p) = &snapshot.source_path {
+            if !is_within(&root, p) {
+                tracing::warn!(
+                    "save: ignoring out-of-library source_path {:?} for prompt {}",
+                    p,
+                    snapshot.id
+                );
+                snapshot.source_path = None;
+            }
+        }
         if snapshot.source_path.is_none() {
-            snapshot.source_path = existing_path;
+            snapshot.source_path = existing_path.filter(|p| is_within(&root, p));
         }
         let path = match &snapshot.source_path {
             Some(p) => p.clone(),
             None => root.join(format!("{}.pp.md", parser::slugify(&snapshot.id))),
         };
         let serialized = parser::serialize(&snapshot)?;
-        std::fs::write(&path, serialized).map_err(|e| AppError::Io {
+        crate::fsutil::write_atomic_str(&path, &serialized).map_err(|e| AppError::Io {
             path: path.clone(),
             source: e,
         })?;
@@ -323,6 +336,54 @@ impl PromptStore {
         self.find(id)
             .ok_or_else(|| AppError::PromptNotFound(id.to_string()))
     }
+}
+
+/// Is `path` inside `root`? Lexical after normalizing `.` / `..`, because the
+/// file usually doesn't exist yet and `canonicalize` would fail on it. The
+/// parent directory is canonicalized when it exists, so a symlinked library
+/// root still compares correctly.
+pub(crate) fn is_within(root: &std::path::Path, path: &std::path::Path) -> bool {
+    use std::path::Component;
+    fn normalize(p: &std::path::Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    }
+    /// Canonicalize the deepest ancestor that exists, then re-append the rest.
+    /// `canonicalize` fails on a path that isn't there yet, and on macOS the
+    /// library root is usually reached through a symlink (`/var` →
+    /// `/private/var`), so comparing raw paths gives false negatives.
+    fn resolve(p: &std::path::Path) -> PathBuf {
+        let normalized = normalize(p);
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut cur = normalized.as_path();
+        loop {
+            if let Ok(real) = std::fs::canonicalize(cur) {
+                let mut out = real;
+                for part in tail.iter().rev() {
+                    out.push(part);
+                }
+                return out;
+            }
+            match (cur.file_name(), cur.parent()) {
+                (Some(name), Some(parent)) => {
+                    tail.push(name.to_os_string());
+                    cur = parent;
+                }
+                _ => return normalized,
+            }
+        }
+    }
+
+    resolve(path).starts_with(resolve(root))
 }
 
 #[cfg(test)]
@@ -631,6 +692,49 @@ mod tests {
         let s = PromptStore::new();
         s.replace_all(vec![make_prompt("mine")]);
         assert_eq!(s.fork_to_local("mine").unwrap_err().kind(), "invalid-arg");
+    }
+
+    #[test]
+    fn save_refuses_a_source_path_outside_the_library() {
+        // `source_path` comes straight off the IPC payload — an absolute path
+        // outside the library would turn `save_prompt` into arbitrary write.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let escape = outside.path().join("escaped.pp.md");
+        let mut payload = make_prompt("evil");
+        payload.source_path = Some(escape.clone());
+
+        let s = PromptStore::with_root(dir.path().to_path_buf());
+        let written = s.save(&payload).unwrap();
+
+        assert!(!escape.exists(), "wrote outside the library root");
+        assert_eq!(written, dir.path().join("evil.pp.md"));
+    }
+
+    #[test]
+    fn save_refuses_a_traversal_out_of_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut payload = make_prompt("dots");
+        payload.source_path = Some(dir.path().join("..").join("escaped.pp.md"));
+
+        let s = PromptStore::with_root(dir.path().to_path_buf());
+        let written = s.save(&payload).unwrap();
+
+        assert_eq!(written, dir.path().join("dots.pp.md"));
+    }
+
+    #[test]
+    fn is_within_accepts_paths_under_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_within(dir.path(), &dir.path().join("a.pp.md")));
+        assert!(is_within(
+            dir.path(),
+            &dir.path().join("sub").join("a.pp.md")
+        ));
+        assert!(!is_within(
+            dir.path(),
+            &dir.path().join("..").join("a.pp.md")
+        ));
     }
 
     #[test]

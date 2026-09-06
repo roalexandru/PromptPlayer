@@ -78,20 +78,98 @@ fn parse_git_args(raw: &str) -> Result<Vec<String>, String> {
     {
         return Err(format!("git() argument {bad:?} contains a shell character"));
     }
-    // `-c key=value` can change git's behaviour arbitrarily (including
-    // `core.pager`, which runs a command), and `--upload-pack`/`--exec` style
-    // flags run helpers. Neither belongs in a read-only helper.
-    // Prefix matches, not equality: git accepts both `--config-env x` and
-    // `--config-env=x`, and an exact-match check let the latter straight
-    // through (which is how the test for this caught my own allowlist).
-    const DENIED_FLAG_PREFIXES: &[&str] =
-        &["--exec", "--upload-pack", "--receive-pack", "--config-env"];
-    if let Some(bad) = args.iter().find(|a| {
-        *a == "-c" || a.starts_with("-c=") || DENIED_FLAG_PREFIXES.iter().any(|p| a.starts_with(p))
-    }) {
+    // Flags are allowlisted, not denylisted. A denylist here was wrong twice:
+    // `-c key=value` reaches `core.pager` (which runs a command), and
+    // `git diff --output=FILE` / `git show --output=FILE` write an arbitrary
+    // file — an arbitrary-write primitive inside a helper whose whole contract
+    // is "read-only". Enumerating every such flag across seven subcommands is
+    // not a game worth playing, so anything that isn't known-safe is refused.
+    if let Some(bad) = args.iter().skip(1).find(|a| !is_allowed_git_flag(a)) {
         return Err(format!("git() argument {bad:?} is not allowed"));
     }
     Ok(args)
+}
+
+/// Read-only flags `git()` accepts. Anything else beginning with `-` is
+/// refused; non-flag operands (revisions, paths, formats) pass through.
+const GIT_ALLOWED_FLAGS: &[&str] = &[
+    "--short",
+    "--abbrev-ref",
+    "--show-toplevel",
+    "--git-dir",
+    "--is-inside-work-tree",
+    "--verify",
+    "--quiet",
+    "--oneline",
+    "--stat",
+    "--shortstat",
+    "--numstat",
+    "--name-only",
+    "--name-status",
+    "--cached",
+    "--staged",
+    "--porcelain",
+    "--branch",
+    "--show-current",
+    "--all",
+    "--tags",
+    "--no-color",
+    "--no-patch",
+    "--no-pager",
+    "--date",
+    "--pretty",
+    "--format",
+    "--max-count",
+    "--skip",
+    "--since",
+    "--until",
+    "--author",
+    "--grep",
+    "--reverse",
+    "--first-parent",
+    "--decorate",
+    "--contains",
+    "--merged",
+    "--no-merged",
+    "--sort",
+    "--list",
+    "--verbose",
+    "-v",
+    "-n",
+    "-s",
+    "--tags-only",
+    "--dirty",
+    "--always",
+];
+
+/// True for a plain operand, or for an allowlisted flag in either `--flag` or
+/// `--flag=value` form. `-n5`-style bundled short flags are allowed only for
+/// the short flags in the list.
+fn is_allowed_git_flag(arg: &str) -> bool {
+    if !arg.starts_with('-') {
+        // An operand. It cannot start a new flag, so it can't smuggle one in.
+        return true;
+    }
+    let name = arg.split('=').next().unwrap_or(arg);
+    if GIT_ALLOWED_FLAGS.contains(&name) {
+        return true;
+    }
+    if let Some(rest) = arg.strip_prefix('-') {
+        // `git log -1` — a bare commit-count limiter, read-only by nature.
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+        // `-n5`, `-v2` — allowed only when the short flag itself is allowlisted.
+        if !rest.starts_with('-') && rest.len() > 1 {
+            let short = format!("-{}", &rest[..1]);
+            if GIT_ALLOWED_FLAGS.contains(&short.as_str())
+                && rest[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Run an allowlisted `git` command in `repo_root` and return its stdout.
@@ -113,11 +191,32 @@ fn run_git(repo_root: &str, raw: &str) -> Result<String, String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let start = Instant::now();
-    let out = cmd.output().map_err(|e| format!("git: {e}"))?;
-    if start.elapsed() > Duration::from_secs(GIT_TIMEOUT_SECS) {
-        return Err("git took too long".into());
+    // `output()` waits forever, so the old post-hoc elapsed check reported a
+    // timeout that had already blocked the fire path for as long as git took.
+    // Spawn, poll, and kill: a repo on a spun-down or network volume can hang
+    // for minutes, and this runs before a single character is typed.
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(GIT_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("git took too long".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("git: {e}"));
+            }
+        }
     }
+    let out = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("git {}: {}", args.join(" "), err.trim()));
@@ -185,35 +284,50 @@ struct Builtins {
 }
 
 /// Evaluate one `${{ expr }}` block. The braces should already be stripped.
+///
+/// Convenience wrapper for a single block; a body with several goes through
+/// [`Evaluator`] so the engine and prelude are built once.
 pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
-    let runtime = Runtime::new().map_err(|e| ExprError::Runtime(e.to_string()))?;
-    runtime.set_memory_limit(MEMORY_LIMIT_BYTES);
-    runtime.set_max_stack_size(STACK_LIMIT_BYTES);
+    Evaluator::new(ctx)?.eval_block(source)
+}
 
-    let context = Context::full(&runtime).map_err(|e| ExprError::Runtime(e.to_string()))?;
+/// One QuickJS engine with the prelude already installed.
+///
+/// Building a `Runtime`, a `Context` and re-evaluating a 40-line prelude for
+/// every `${{ ... }}` block put that cost on the fire path once per block — in
+/// the window between the commit char and the first typed character.
+pub struct Evaluator {
+    runtime: Runtime,
+    context: Context,
+}
 
-    let now = Local::now();
-    let builtins = Builtins {
-        now_iso: now.to_rfc3339(),
-        today: now.format("%Y-%m-%d").to_string(),
-        clipboard: ctx.clipboard.clone().unwrap_or_default(),
-        selection: ctx.selection.clone().unwrap_or_default(),
-        app_name: ctx.app_name.clone().unwrap_or_default(),
-        git_branch: ctx.git_branch.clone().unwrap_or_default(),
-        repo_name: ctx.repo_name.clone().unwrap_or_default(),
-        repo_root: ctx.repo_root.clone().unwrap_or_default(),
-        app_bundle: ctx.app_bundle.clone().unwrap_or_default(),
-        window_title: ctx.window_title.clone().unwrap_or_default(),
-    };
-    let builtins_json =
-        serde_json::to_string(&builtins).map_err(|e| ExprError::Runtime(e.to_string()))?;
-    let source_json =
-        serde_json::to_string(source).map_err(|e| ExprError::Runtime(e.to_string()))?;
+impl Evaluator {
+    pub fn new(ctx: &ExprContext) -> Result<Self, ExprError> {
+        let runtime = Runtime::new().map_err(|e| ExprError::Runtime(e.to_string()))?;
+        runtime.set_memory_limit(MEMORY_LIMIT_BYTES);
+        runtime.set_max_stack_size(STACK_LIMIT_BYTES);
 
-    // Compose a small prelude that exposes the documented surface.
-    // We deliberately freeze names to avoid scripts shadowing them.
-    let prelude = format!(
-        r#"
+        let context = Context::full(&runtime).map_err(|e| ExprError::Runtime(e.to_string()))?;
+
+        let now = Local::now();
+        let builtins = Builtins {
+            now_iso: now.to_rfc3339(),
+            today: now.format("%Y-%m-%d").to_string(),
+            clipboard: ctx.clipboard.clone().unwrap_or_default(),
+            selection: ctx.selection.clone().unwrap_or_default(),
+            app_name: ctx.app_name.clone().unwrap_or_default(),
+            git_branch: ctx.git_branch.clone().unwrap_or_default(),
+            repo_name: ctx.repo_name.clone().unwrap_or_default(),
+            repo_root: ctx.repo_root.clone().unwrap_or_default(),
+            app_bundle: ctx.app_bundle.clone().unwrap_or_default(),
+            window_title: ctx.window_title.clone().unwrap_or_default(),
+        };
+        let builtins_json =
+            serde_json::to_string(&builtins).map_err(|e| ExprError::Runtime(e.to_string()))?;
+        // Compose a small prelude that exposes the documented surface.
+        // We deliberately freeze names to avoid scripts shadowing them.
+        let prelude = format!(
+            r#"
         const __pp = {builtins_json};
         const now = {{
             toISOString: () => __pp.nowIso,
@@ -264,28 +378,52 @@ pub fn eval(source: &str, ctx: &ExprContext) -> Result<String, ExprError> {
         }}
         Object.freeze(app);
     "#
-    );
-    let eval_script = format!(
-        r#"
-        const __pp_result = (0, eval)({source_json});
-        (__pp_result === undefined || __pp_result === null) ? "" : String(__pp_result);
-    "#
-    );
+        );
+        // Prelude and the helper binding are installed once, not per block. The
+        // clock starts after the engine exists: counting cold-start made the first
+        // eval time out spuriously on loaded CI.
+        let deadline = Instant::now() + EVAL_BUDGET;
+        runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+        let started = Instant::now();
+        let git_root = ctx.allow_git.then(|| ctx.repo_root.clone()).flatten();
+        context.with(|js| {
+            install_git_helper(&js, git_root)
+                .map_err(|e| map_quickjs_error(&js, e, started, deadline))?;
+            js.eval::<(), _>(prelude)
+                .map_err(|e| map_quickjs_error(&js, e, started, deadline))
+        })?;
 
-    // Clock starts after the runtime and context exist: counting engine
-    // cold-start made the first eval time out spuriously on loaded CI.
-    let deadline = Instant::now() + EVAL_BUDGET;
-    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
-    let started = Instant::now();
-    let git_root = ctx.allow_git.then(|| ctx.repo_root.clone()).flatten();
-    context.with(|js| {
-        install_git_helper(&js, git_root)
-            .map_err(|e| map_quickjs_error(&js, e, started, deadline))?;
-        js.eval::<(), _>(prelude)
-            .map_err(|e| map_quickjs_error(&js, e, started, deadline))?;
-        js.eval::<String, _>(eval_script)
-            .map_err(|e| map_quickjs_error(&js, e, started, deadline))
-    })
+        Ok(Self { runtime, context })
+    }
+
+    /// Evaluate one block against the shared engine. Each block gets its own
+    /// budget, so one slow expression cannot spend the whole body's.
+    pub fn eval_block(&self, source: &str) -> Result<String, ExprError> {
+        let source_json =
+            serde_json::to_string(source).map_err(|e| ExprError::Runtime(e.to_string()))?;
+        // Block-scoped, because the engine is now shared across every block
+        // in a body: a top-level `const` would be a redeclaration on the
+        // second one. `(0, eval)` stays indirect, so the expression still runs
+        // against the prelude's globals exactly as before.
+        let eval_script = format!(
+            r#"
+        (() => {{
+            const __pp_result = (0, eval)({source_json});
+            return (__pp_result === undefined || __pp_result === null)
+                ? ""
+                : String(__pp_result);
+        }})();
+    "#
+        );
+        let deadline = Instant::now() + EVAL_BUDGET;
+        self.runtime
+            .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+        let started = Instant::now();
+        self.context.with(|js| {
+            js.eval::<String, _>(eval_script)
+                .map_err(|e| map_quickjs_error(&js, e, started, deadline))
+        })
+    }
 }
 
 /// Bind `git(args)` into the sandbox.
@@ -381,6 +519,10 @@ pub fn expand_expressions_reporting(body: &str, ctx: &ExprContext) -> Expansion 
     let mut errors = Vec::new();
     let mut had_expressions = false;
     let mut out = String::with_capacity(body.len());
+    // Built lazily and shared across every block in this body: a prompt with
+    // no expressions must not pay for an engine it never uses, and one with
+    // several must not pay for a fresh engine per block.
+    let mut engine: Option<Result<Evaluator, ExprError>> = None;
     let bytes: Vec<char> = body.chars().collect();
     let mut i = 0;
     while i < bytes.len() {
@@ -412,7 +554,14 @@ pub fn expand_expressions_reporting(body: &str, ctx: &ExprContext) -> Expansion 
             }
             had_expressions = true;
             let expr: String = bytes[i + 3..j].iter().collect();
-            match eval(expr.trim(), ctx) {
+            let engine = engine.get_or_insert_with(|| Evaluator::new(ctx));
+            let result = match engine {
+                Ok(ev) => ev.eval_block(expr.trim()),
+                // The engine itself would not start; report it per block so a
+                // body does not silently expand to nothing.
+                Err(e) => Err(ExprError::Runtime(e.to_string())),
+            };
+            match result {
                 Ok(s) => out.push_str(&s),
                 Err(e) => {
                     out.push_str(&format!("[expr error: {}]", e));
@@ -554,6 +703,80 @@ mod tests {
     }
 
     #[test]
+    fn git_refuses_flags_that_write_a_file() {
+        // `git diff --output=FILE` and `git show --output=FILE` write wherever
+        // they're pointed — an arbitrary-write primitive inside a helper
+        // documented as read-only. Verified against real git: exit 0, file
+        // created. The flag allowlist is what closes it.
+        for call in [
+            "diff --output=/tmp/pp-should-not-exist",
+            "diff --output /tmp/pp-should-not-exist",
+            "show --output=/tmp/pp-should-not-exist",
+            "log -o/tmp/pp-should-not-exist",
+        ] {
+            let err = parse_git_args(call).unwrap_err();
+            assert!(
+                err.contains("not allowed"),
+                "{call:?} must be refused, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_refuses_flags_that_run_a_helper() {
+        for call in [
+            "log -c core.pager=sh",
+            "log -c=core.pager=sh",
+            "diff --ext-diff",
+            "log --config-env=x",
+            "show --textconv",
+            "status --exec=sh",
+        ] {
+            assert!(parse_git_args(call).is_err(), "{call:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn git_still_accepts_the_read_only_calls_it_is_for() {
+        for call in [
+            "rev-parse --abbrev-ref HEAD",
+            "rev-parse --short HEAD",
+            "log --oneline -n 5",
+            "log --oneline -n5",
+            "status --porcelain",
+            "describe --tags --always",
+            "branch --show-current",
+            "diff --stat HEAD~1",
+            "remote get-url origin",
+        ] {
+            assert!(
+                parse_git_args(call).is_ok(),
+                "{call:?} must still work: {:?}",
+                parse_git_args(call)
+            );
+        }
+    }
+
+    #[test]
+    fn git_timeout_kills_the_child_instead_of_reporting_after_the_fact() {
+        // The old code called `output()` (waits forever) and then compared
+        // elapsed time, so a hung git blocked the fire path for its full
+        // duration and only *reported* a timeout afterwards.
+        const SRC: &str = include_str!("expressions.rs");
+        let start = SRC.find("fn run_git").expect("run_git");
+        let body = &SRC[start..];
+        let body = &body[..body.find("\n}").expect("fn end")];
+        assert!(
+            !body.contains("cmd.output()"),
+            "run_git must not block on `output()` — it cannot be interrupted"
+        );
+        assert!(
+            body.contains("child.kill()"),
+            "the timeout must actually kill the child"
+        );
+    }
+
+    #[test]
     fn evals_simple_arithmetic() {
         let s = eval("1 + 2", &ExprContext::default()).unwrap();
         assert_eq!(s, "3");
@@ -588,6 +811,34 @@ mod tests {
         let out = expand_expressions(body, &ExprContext::default());
         assert!(out.starts_with("today: 20"));
         assert!(out.contains("sum: 4"));
+    }
+
+    #[test]
+    fn many_blocks_share_one_engine_without_colliding() {
+        // The engine is built once per body now. Blocks must stay independent:
+        // a top-level `const` in the per-block script was a redeclaration on
+        // the second block, which silently turned it into an error string.
+        let body = "${{ 1 }}${{ 2 }}${{ 3 }}${{ 'a' + 'b' }}";
+        let out = expand_expressions(body, &ExprContext::default());
+        assert_eq!(out, "123ab", "{out}");
+    }
+
+    #[test]
+    fn one_bad_block_does_not_poison_the_rest_of_the_body() {
+        let body = "ok ${{ 1 + 1 }} bad ${{ 1 + }} after ${{ 3 }}";
+        let out = expand_expressions(body, &ExprContext::default());
+        assert!(out.starts_with("ok 2 bad [expr error:"), "{out}");
+        assert!(out.ends_with("after 3"), "{out}");
+    }
+
+    #[test]
+    fn a_body_with_no_blocks_builds_no_engine() {
+        // Asserted indirectly: no expressions means no errors and untouched
+        // text, which only holds if nothing was evaluated.
+        let out = expand_expressions_reporting("plain body, no blocks", &ExprContext::default());
+        assert_eq!(out.text, "plain body, no blocks");
+        assert!(!out.had_expressions);
+        assert!(out.errors.is_empty());
     }
 
     #[test]

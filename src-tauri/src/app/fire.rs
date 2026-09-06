@@ -255,6 +255,11 @@ impl FireService {
                     // A playback is already running — don't stomp it.
                     return;
                 };
+                // Same RAII guard the fire path uses. Three hand-written
+                // `end_playback()` calls were correct, but one early return
+                // away from leaving `playing` true forever — which silently
+                // disables every trigger for the rest of the session.
+                let _playback_guard = PlaybackEndGuard::new(app_state.clone());
                 let mut inj = match EnigoInjector::new() {
                     Ok(i) => i,
                     Err(e) => {
@@ -265,20 +270,18 @@ impl FireService {
                                 stage: InjectionStage::Undo,
                             },
                         );
-                        app_state.end_playback();
                         return;
                     }
                 };
                 for _ in 0..entry.body_chars_typed {
                     if control.is_cancelled() {
                         inj.release_all_modifiers();
-                        app_state.end_playback();
                         return;
                     }
                     inj.press_backspace();
                     thread::sleep(std::time::Duration::from_millis(15));
                 }
-                app_state.end_playback();
+                drop(_playback_guard);
                 // Re-sync the ring with the screen: the trigger is still visible
                 // but was popped at fire time.
                 let now = std::time::Instant::now();
@@ -340,7 +343,10 @@ fn run_fire_pipeline(app: AppHandle, ctx: AppContext, req: FireRequest, control:
     // something real (a clipboard read, an Accessibility round-trip, a
     // filesystem walk), so an unrelated prompt must not pay for it.
     let body_src = prompt.body.as_str();
-    let clipboard = if body_src.contains("CLIPBOARD") || body_src.contains("clipboard") {
+    // Match the tokens, not the bare word: `contains("clipboard")` meant a
+    // prompt whose prose merely mentions the clipboard read the user's
+    // clipboard on every fire.
+    let clipboard = if references_clipboard(body_src) {
         crate::inject::read_clipboard_text()
     } else {
         None
@@ -701,6 +707,31 @@ fn run_fire_pipeline(app: AppHandle, ctx: AppContext, req: FireRequest, control:
 /// actually proceed. Every early return on the trigger path therefore has to
 /// put the character back on screen and re-observe the trigger, or the user
 /// loses a keystroke and the matcher's shadow of the screen goes stale.
+/// Does this body actually reference the clipboard, as opposed to mentioning
+/// the word? Reading the clipboard is a privacy-relevant act, so it happens
+/// only for the placeholder (`$CLIPBOARD`, `${CLIPBOARD}`) or the expression
+/// builtin (`clipboard` inside a `${{ … }}` block).
+fn references_clipboard(body: &str) -> bool {
+    if body.contains("$CLIPBOARD") || body.contains("${CLIPBOARD}") {
+        return true;
+    }
+    // Expression blocks only — prose outside them can say anything it likes.
+    let mut rest = body;
+    while let Some(open) = rest.find("${{") {
+        let after = &rest[open + 3..];
+        let end = after.find("}}").unwrap_or(after.len());
+        if after[..end].contains("clipboard") {
+            return true;
+        }
+        rest = &after[end..];
+        if rest.len() < 2 {
+            break;
+        }
+        rest = &rest[2..];
+    }
+    false
+}
+
 fn restore_suppressed_commit(ctx: &AppContext, typed_form: &str, commit: char) {
     if let Ok(mut inj) = EnigoInjector::new() {
         inj.type_char(commit);
@@ -878,6 +909,43 @@ const BROWSER_EXES: &[&str] = &[
 /// nothing in 67 days of field data on a tool whose whole job is web demos.
 fn is_browser(bundle: &str, exe: &str) -> bool {
     BROWSER_BUNDLES.iter().any(|b| bundle.contains(b)) || BROWSER_EXES.contains(&exe)
+}
+
+#[cfg(test)]
+mod clipboard_gate_tests {
+    use super::references_clipboard;
+
+    #[test]
+    fn reads_only_when_the_body_actually_references_it() {
+        for body in [
+            "paste this: $CLIPBOARD",
+            "wrapped ${CLIPBOARD} form",
+            "expression ${{ clipboard.trim() }}",
+            "${{ clipboard }}",
+        ] {
+            assert!(references_clipboard(body), "{body:?} must read");
+        }
+    }
+
+    #[test]
+    fn prose_mentioning_the_clipboard_does_not_read_it() {
+        // Reading the clipboard is a privacy-relevant act; a prompt that only
+        // talks about clipboards must not trigger one on every fire.
+        for body in [
+            "Copy the result to your clipboard when done.",
+            "CLIPBOARD handling is out of scope for this review.",
+            "Explain how the clipboard works in Wayland.",
+            "${{ now.toISOString() }} — then paste from the clipboard",
+        ] {
+            assert!(!references_clipboard(body), "{body:?} must not read");
+        }
+    }
+
+    #[test]
+    fn handles_an_unterminated_expression_block() {
+        assert!(references_clipboard("${{ clipboard"));
+        assert!(!references_clipboard("${{ now"));
+    }
 }
 
 #[cfg(test)]

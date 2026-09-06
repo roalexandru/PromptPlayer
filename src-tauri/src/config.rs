@@ -281,7 +281,7 @@ pub fn save_at(path: &std::path::Path, cfg: &AppConfig) -> Result<PathBuf, Strin
         "# Prompt Player configuration (§7.2). Edit freely — the app reloads\n\
          # this file on save from the library window and on restart.\n{yaml}"
     );
-    std::fs::write(&path, body).map_err(|e| format!("write {path:?}: {e}"))?;
+    crate::fsutil::write_atomic_str(&path, &body).map_err(|e| format!("write {path:?}: {e}"))?;
     Ok(path)
 }
 

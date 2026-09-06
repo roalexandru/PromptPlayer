@@ -93,13 +93,16 @@ pub fn parse_str(raw: &str, path: &Path) -> Result<Prompt, ParseError> {
         source: e,
     })?;
 
-    let id = fm.id.unwrap_or_else(|| {
+    // Sanitized, because the id becomes a filename: `import_prompt` writes
+    // `<library>/<id>.pp.md`, and an id of `../../x` or `/etc/x` out of an
+    // imported file's frontmatter would land the write outside the library.
+    let id = sanitize_id(&fm.id.unwrap_or_else(|| {
         path.file_stem()
             .and_then(|s| s.to_str())
             .map(|s| s.trim_end_matches(".pp"))
             .unwrap_or("unnamed")
             .to_string()
-    });
+    }));
     let commit = fm
         .commit_char
         .as_deref()
@@ -208,6 +211,34 @@ pub fn serialize(prompt: &Prompt) -> Result<String, serde_yaml::Error> {
 }
 
 /// Slugify a string to be used as a filesystem name / prompt id.
+/// Make an id safe to use as a single filename component.
+///
+/// The id arrives from a `.pp.md` frontmatter block, which for an imported or
+/// downloaded file is attacker-controlled. Keeps the readable characters an id
+/// legitimately uses and replaces everything else — path separators included —
+/// so it can never traverse or absolutize. Remote prompts are namespaced with
+/// `<source>/<id>` *after* parsing, so stripping `/` here costs nothing.
+pub fn sanitize_id(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+            out.push(c);
+        } else if c == '.' && !out.ends_with('.') {
+            // A single dot is fine inside an id; a run of them is `..`.
+            out.push('.');
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    // A leading dot hides the file and, with a following slash, traverses.
+    let trimmed = out.trim_matches(|c| c == '.' || c == '-');
+    if trimmed.is_empty() {
+        "untitled".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_dash = false;
@@ -227,6 +258,45 @@ pub fn slugify(s: &str) -> String {
         out.push_str("untitled");
     }
     out
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_id;
+
+    #[test]
+    fn strips_path_traversal_from_an_imported_id() {
+        // `import_prompt` writes `<library>/<id>.pp.md`, so an id out of a
+        // hostile file's frontmatter is a write-anywhere primitive.
+        for raw in [
+            "../../../../etc/evil",
+            "/etc/evil",
+            "..\\..\\windows\\system32\\evil",
+            "....//....//evil",
+            "../.ssh/authorized_keys",
+        ] {
+            let safe = sanitize_id(raw);
+            assert!(!safe.contains('/'), "{raw:?} -> {safe:?}");
+            assert!(!safe.contains('\\'), "{raw:?} -> {safe:?}");
+            assert!(!safe.contains(".."), "{raw:?} -> {safe:?}");
+            assert!(!safe.starts_with('.'), "{raw:?} -> {safe:?}");
+            assert!(!safe.is_empty(), "{raw:?} -> {safe:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_ordinary_ids_intact() {
+        for raw in ["refactor", "code-review", "agent_prompt", "v1.2", "a-b_c.d"] {
+            assert_eq!(sanitize_id(raw), raw, "{raw:?} must be left alone");
+        }
+    }
+
+    #[test]
+    fn never_returns_an_empty_id() {
+        for raw in ["", "...", "///", "..", "-", "."] {
+            assert_eq!(sanitize_id(raw), "untitled", "{raw:?}");
+        }
+    }
 }
 
 #[cfg(test)]

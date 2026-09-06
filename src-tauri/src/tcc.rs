@@ -77,9 +77,15 @@ pub fn reset_accessibility(_bundle_id: &str) -> bool {
 /// Open the System Settings → Privacy & Security → Accessibility pane.
 #[cfg(target_os = "macos")]
 pub fn open_accessibility_settings() {
-    let _ = std::process::Command::new("open")
+    // `spawn`, not `status`: this is called from a synchronous Tauri command,
+    // which runs on the main thread, and waiting on `open` froze the UI for as
+    // long as System Settings took to come up.
+    if let Err(e) = std::process::Command::new("open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-        .status();
+        .spawn()
+    {
+        tracing::warn!("could not open the Accessibility pane: {e}");
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

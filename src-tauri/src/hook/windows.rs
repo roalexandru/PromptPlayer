@@ -8,22 +8,29 @@ use crate::hook::{process_event, HookCallbacks, HookDecision, HookDeps, KeyEvent
 use crate::matcher::MatcherState;
 use crate::state::AppState;
 use crate::undo::UndoLog;
-use std::sync::{Arc, OnceLock};
+use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use windows::Win32::Foundation::{HMODULE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, ToUnicodeEx, HKL, VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL,
     VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN,
     VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, SetWindowsHookExW,
-    UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, PostThreadMessageW,
+    SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
+    WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
-/// Per-process hook context. Set once on `spawn`; the extern hook proc reads
-/// it via this `OnceLock` because it can't capture closures.
+/// Per-process hook context. The extern hook proc reads it through this static
+/// because it can't capture closures. `RwLock<Option<_>>` rather than a
+/// `OnceLock` so a reinstall can rebind it — with a `OnceLock`, the second
+/// `spawn` returned early and every watchdog repair was a silent no-op.
 struct HookContext {
     matcher: Arc<MatcherState>,
     undo: Arc<UndoLog>,
@@ -31,7 +38,55 @@ struct HookContext {
     cb: HookCallbacks,
 }
 
-static GLOBAL_CTX: OnceLock<HookContext> = OnceLock::new();
+static GLOBAL_CTX: RwLock<Option<Arc<HookContext>>> = RwLock::new(None);
+
+/// Raw key events the hook proc has seen. Windows silently detaches a
+/// low-level hook whose proc overruns `LowLevelHooksTimeout` — no callback, no
+/// error, it just stops being called, and `hook_alive` stays `true` forever.
+/// This counter is the only evidence that the hook is still in the chain.
+static EVENTS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Thread id of the message pump that owns the hook. A low-level hook belongs
+/// to the installing thread's queue, so a reinstall has to happen there.
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Posted to the pump thread to ask for an unhook-and-reinstall.
+const WM_PP_REINSTALL: u32 = WM_APP + 1;
+
+/// Raw key events observed since process start. The watchdog uses it to tell
+/// "the hook is dead" from "nobody is typing".
+pub fn events_seen() -> u64 {
+    EVENTS_SEEN.load(Ordering::Relaxed)
+}
+
+/// Milliseconds since the last system-wide input event of any kind (keyboard
+/// or mouse). `None` when the OS won't say.
+pub fn idle_millis() -> Option<u32> {
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    // SAFETY: `info` is a correctly sized, initialized out-parameter.
+    if unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        // Both are `GetTickCount` values, so wrapping subtraction is correct
+        // across the 49.7-day rollover.
+        Some(unsafe { GetTickCount() }.wrapping_sub(info.dwTime))
+    } else {
+        None
+    }
+}
+
+/// Ask the pump thread to reinstall the hook. Cheap and idempotent: the hook
+/// holds no state, so a needless reinstall costs one syscall pair.
+pub fn request_reinstall() -> bool {
+    let tid = HOOK_THREAD_ID.load(Ordering::Acquire);
+    if tid == 0 {
+        return false;
+    }
+    // SAFETY: posting a thread message is safe for any thread id; a stale id
+    // makes the call fail rather than misbehave.
+    unsafe { PostThreadMessageW(tid, WM_PP_REINSTALL, WPARAM(0), LPARAM(0)) }.is_ok()
+}
 
 pub fn spawn(
     matcher: Arc<MatcherState>,
@@ -39,15 +94,22 @@ pub fn spawn(
     app_state: Arc<AppState>,
     cb: HookCallbacks,
 ) {
-    let ctx = HookContext {
+    let ctx = Arc::new(HookContext {
         matcher,
         undo,
         app_state: app_state.clone(),
         cb,
-    };
-    if GLOBAL_CTX.set(ctx).is_err() {
-        tracing::warn!("hook::windows::spawn called twice — ignoring duplicate");
-        return;
+    });
+    {
+        let mut guard = GLOBAL_CTX.write();
+        if guard.is_some() {
+            // The pump thread is already running; a reinstall goes through it.
+            tracing::debug!("hook already spawned — requesting a reinstall instead");
+            drop(guard);
+            request_reinstall();
+            return;
+        }
+        *guard = Some(ctx);
     }
 
     let app_state_for_thread = app_state;
@@ -57,23 +119,29 @@ pub fn spawn(
         .expect("spawn hook thread");
 }
 
-fn run_hook_thread(app_state: Arc<AppState>) {
-    tracing::info!("hook thread starting (native WH_KEYBOARD_LL)");
-    // Optimistic; flipped back on install failure, and the setup.rs watcher
-    // picks up anything else on its next tick.
-    app_state.set_hook_alive(true);
-
-    let hook = unsafe {
+/// Install `WH_KEYBOARD_LL` on the calling thread.
+fn install_hook() -> Result<HHOOK, windows::core::Error> {
+    // SAFETY: `hook_proc` has the required signature and lives for the process;
+    // a null HMODULE is correct for a hook proc inside this process.
+    unsafe {
         SetWindowsHookExW(
             WH_KEYBOARD_LL,
             Some(hook_proc),
             HMODULE(std::ptr::null_mut()),
             0,
         )
-    };
-    let hook = match hook {
+    }
+}
+
+fn run_hook_thread(app_state: Arc<AppState>) {
+    tracing::info!("hook thread starting (native WH_KEYBOARD_LL)");
+    // SAFETY: no preconditions.
+    HOOK_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+
+    let mut hook = match install_hook() {
         Ok(h) => {
             tracing::info!(hhook = h.0 as usize, "WH_KEYBOARD_LL installed");
+            app_state.set_hook_alive(true);
             h
         }
         Err(e) => {
@@ -83,13 +151,32 @@ fn run_hook_thread(app_state: Arc<AppState>) {
         }
     };
 
-    // The OS dispatches to `hook_proc` itself; the pump just keeps this thread
-    // alive so the hook stays installed.
+    // The OS dispatches to `hook_proc` itself; the pump keeps this thread alive
+    // so the hook stays installed, and carries reinstall requests from the
+    // watchdog. No TranslateMessage / DispatchMessage — this thread has no
+    // window of its own, only the hook.
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            // No TranslateMessage / DispatchMessage — this thread has no
-            // window of its own, only the hook.
+            if msg.message != WM_PP_REINSTALL {
+                continue;
+            }
+            let _ = UnhookWindowsHookEx(hook);
+            match install_hook() {
+                Ok(h) => {
+                    hook = h;
+                    app_state.set_hook_alive(true);
+                    tracing::warn!(
+                        hhook = h.0 as usize,
+                        "WH_KEYBOARD_LL reinstalled after a silent detach"
+                    );
+                }
+                Err(e) => {
+                    app_state.set_hook_alive(false);
+                    tracing::error!("WH_KEYBOARD_LL reinstall failed: {}", e);
+                    // Keep pumping: the watchdog will ask again.
+                }
+            }
         }
         let _ = UnhookWindowsHookEx(hook);
     }
@@ -107,6 +194,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     if event != WM_KEYDOWN && event != WM_SYSKEYDOWN {
         return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
     }
+
+    // Bumped before any filtering: this is a liveness signal, not a metric.
+    // If it stops advancing while the user is typing, the OS detached us.
+    EVENTS_SEEN.fetch_add(1, Ordering::Relaxed);
 
     let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
 
@@ -127,7 +218,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
     }
 
-    let Some(ctx) = GLOBAL_CTX.get() else {
+    // Clone the Arc and drop the guard immediately: this proc runs under
+    // `LowLevelHooksTimeout` (~300ms) and holding a lock across `process_event`
+    // is exactly how a hook gets silently detached.
+    let Some(ctx) = GLOBAL_CTX.read().clone() else {
         return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
     };
 

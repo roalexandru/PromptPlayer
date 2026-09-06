@@ -67,13 +67,26 @@ pub fn open_accessibility_settings() {
 /// fix for the "approved but not working" state an unsigned update leaves.
 #[tauri::command]
 #[specta::specta]
-pub fn reset_accessibility(app: AppHandle) -> bool {
+pub async fn reset_accessibility(app: AppHandle) -> bool {
     telemetry::send(&app, TelemetryEvent::AccessibilityReset);
-    if !crate::tcc::reset_accessibility(crate::tcc::BUNDLE_ID) {
-        return false;
+    // `async`, because a synchronous Tauri command runs on the main thread and
+    // this waits on `tccutil` — which froze the whole UI, including the
+    // diagnostics window whose button started it.
+    let reset = tauri::async_runtime::spawn_blocking(|| {
+        let ok = crate::tcc::reset_accessibility(crate::tcc::BUNDLE_ID);
+        if ok {
+            // Re-register in the list, then send the user to the toggle.
+            let _ = crate::tcc::prompt_for_accessibility();
+            crate::tcc::open_accessibility_settings();
+        }
+        ok
+    })
+    .await;
+    match reset {
+        Ok(ok) => ok,
+        Err(e) => {
+            tracing::error!("reset_accessibility task failed: {e}");
+            false
+        }
     }
-    // Re-register in the list, then send the user to the toggle.
-    let _ = crate::tcc::prompt_for_accessibility();
-    crate::tcc::open_accessibility_settings();
-    true
 }
