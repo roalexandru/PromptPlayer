@@ -91,9 +91,18 @@ pub fn refresh(app: &AppHandle) {
         tracing::warn!("tray set_icon failed: {}", e);
         return;
     }
-    // Not a template while badged, or AppKit flattens the dot into the glyph.
-    // After the icon, so it lands on the image we just set.
-    if let Err(e) = tray.set_icon_as_template(!badge) {
+    // Always a template. `tray-icon.png` is a pure-black glyph carried entirely
+    // by its alpha channel, so rendering it literally — which is what turning
+    // the template flag off does — paints black on a dark menu bar and the icon
+    // vanishes, leaving only the badge dot floating there. Template mode is the
+    // whole reason a menu-bar glyph is authored black-on-transparent: AppKit
+    // recolours it to whatever the bar needs, in either appearance.
+    //
+    // The cost is that the badge loses its amber on macOS, because a template
+    // keeps only alpha. `with_badge` punches a transparent ring around the dot
+    // so it still reads as a separate dot once flattened to one colour. Windows
+    // ignores the flag, so the badge stays amber there.
+    if let Err(e) = tray.set_icon_as_template(true) {
         tracing::warn!("tray set_icon_as_template failed: {}", e);
     }
 }
@@ -102,29 +111,72 @@ pub fn refresh(app: &AppHandle) {
 /// blend against whatever the glyph already has in that corner.
 const BADGE_RGBA: [u8; 4] = [255, 159, 10, 255];
 
+/// Dot radius as a fraction of the shorter edge. The menu bar draws this glyph
+/// at roughly 18pt, so it is sized proportionally rather than in pixels. A
+/// quarter — the first attempt — came out half the icon's height and read as
+/// part of the logo rather than a badge, which matters more in template mode
+/// where colour cannot distinguish the two.
+const BADGE_RADIUS_FRACTION: f32 = 0.16;
+/// Transparent ring around the dot, as a fraction of its radius.
+const BADGE_MOAT_FRACTION: f32 = 0.22;
+
+/// Where the badge sits on a `w` x `h` canvas.
+struct Badge {
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    moat: f32,
+}
+
+/// Shared by the painter and its tests, so neither re-derives the constants.
+fn badge_geometry(w: u32, h: u32) -> Badge {
+    let radius = ((w.min(h) as f32) * BADGE_RADIUS_FRACTION).round().max(2.0);
+    Badge {
+        cx: w as f32 - radius - 1.0,
+        cy: radius + 1.0,
+        radius,
+        moat: (radius * BADGE_MOAT_FRACTION).round().max(1.0),
+    }
+}
+
 /// Paint a filled circle into the top-right corner of an RGBA buffer, or return
 /// it unchanged if the dimensions don't match — a decoder surprise can't panic.
+///
+/// The dot is ringed by a band of fully transparent pixels. macOS renders the
+/// tray icon as a template, keeping only alpha, so without that gap a dot that
+/// touched the glyph would merge into it and read as part of the artwork rather
+/// than as a badge.
 pub fn with_badge(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     let mut out = rgba.to_vec();
     let expected = (w as usize) * (h as usize) * 4;
     if w == 0 || h == 0 || out.len() != expected {
         return out;
     }
-    // Quarter of the shorter edge, floored at 2px so tiny icons still show it.
-    let radius = ((w.min(h) as f32) * 0.25).round().max(2.0);
-    let cx = w as f32 - radius - 1.0;
-    let cy = radius + 1.0;
+    let Badge {
+        cx,
+        cy,
+        radius,
+        moat,
+    } = badge_geometry(w, h);
     let r2 = radius * radius;
+    let outer = radius + moat;
+    let outer2 = outer * outer;
 
     for y in 0..h {
         for x in 0..w {
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
-            if dx * dx + dy * dy > r2 {
+            let d2 = dx * dx + dy * dy;
+            if d2 > outer2 {
                 continue;
             }
             let i = ((y as usize) * (w as usize) + (x as usize)) * 4;
-            out[i..i + 4].copy_from_slice(&BADGE_RGBA);
+            if d2 <= r2 {
+                out[i..i + 4].copy_from_slice(&BADGE_RGBA);
+            } else {
+                // Clear the glyph out of the ring, badge colour included.
+                out[i..i + 4].copy_from_slice(&[0, 0, 0, 0]);
+            }
         }
     }
     out
@@ -151,9 +203,8 @@ mod tests {
         // Corner opposite the badge is untouched.
         assert_eq!(px(&out, w, 0, h - 1), [0, 0, 0, 0]);
         // A pixel at the badge centre is opaque amber.
-        let r = ((w.min(h) as f32) * 0.25).round();
-        let (cx, cy) = ((w as f32 - r - 1.0) as u32, (r + 1.0) as u32);
-        assert_eq!(px(&out, w, cx, cy), BADGE_RGBA);
+        let g = badge_geometry(w, h);
+        assert_eq!(px(&out, w, g.cx as u32, g.cy as u32), BADGE_RGBA);
     }
 
     #[test]
@@ -175,6 +226,76 @@ mod tests {
         // Big enough to notice in a menu bar, small enough to leave the glyph.
         assert!(painted > total / 100, "badge too small: {painted}/{total}");
         assert!(painted < total / 4, "badge too large: {painted}/{total}");
+    }
+
+    #[test]
+    fn the_badge_never_turns_the_template_flag_off() {
+        // `tray-icon.png` is a pure-black glyph carried by its alpha channel.
+        // Rendered non-template it paints black on a dark menu bar and the icon
+        // disappears, leaving a bare dot — which is exactly what shipped.
+        const SRC: &str = include_str!("tray_icon.rs");
+        let start = SRC.find("pub fn refresh(").expect("refresh");
+        let body = &SRC[start..];
+        let body = &body[..body.find("\n}").expect("fn end")];
+        assert!(
+            body.contains("set_icon_as_template(true)"),
+            "the tray icon must stay a template; a black glyph rendered \
+             literally is invisible on a dark menu bar"
+        );
+        assert!(
+            !body.contains("set_icon_as_template(!"),
+            "the template flag must not depend on the badge"
+        );
+    }
+
+    #[test]
+    fn the_base_glyph_is_black_and_needs_template_rendering() {
+        // The premise of the test above, asserted against the real asset: if
+        // the artwork is ever redrawn with its own colours, this fails and the
+        // template decision deserves revisiting.
+        let img = tauri::image::Image::from_bytes(base_bytes()).expect("decode tray icon");
+        let opaque: Vec<&[u8]> = img.rgba().chunks_exact(4).filter(|p| p[3] > 10).collect();
+        assert!(!opaque.is_empty(), "tray icon has no visible pixels");
+        assert!(
+            opaque.iter().all(|p| p[0] < 40 && p[1] < 40 && p[2] < 40),
+            "tray glyph is no longer black — it may no longer need template mode"
+        );
+    }
+
+    #[test]
+    fn a_transparent_ring_separates_the_badge_from_the_glyph() {
+        // Template rendering keeps only alpha, so a dot touching the glyph
+        // merges into it. Fill the canvas and check the ring is punched clear.
+        let (w, h) = (88u32, 88u32);
+        let solid = vec![255u8; (w * h * 4) as usize];
+        let out = with_badge(&solid, w, h);
+
+        let Badge {
+            cx,
+            cy,
+            radius: r,
+            moat,
+        } = badge_geometry(w, h);
+
+        // Probe the inner edges — the dot sits flush against the top-right
+        // corner, so those two sides have no canvas left for a moat, and the
+        // gap that matters is the one facing the glyph anyway.
+        let left = (cx - r - moat / 2.0) as u32;
+        assert_eq!(
+            px(&out, w, left, cy as u32)[3],
+            0,
+            "no transparent gap to the left of the badge"
+        );
+        let below = (cy + r + moat / 2.0) as u32;
+        assert_eq!(
+            px(&out, w, cx as u32, below)[3],
+            0,
+            "no transparent gap below the badge"
+        );
+        // The dot itself is still opaque.
+        assert_eq!(px(&out, w, cx as u32, cy as u32)[3], 255);
+        // And the far corner is untouched.
+        assert_eq!(px(&out, w, 0, h - 1), [255, 255, 255, 255]);
     }
 
     #[test]

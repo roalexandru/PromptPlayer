@@ -52,13 +52,18 @@
   type CtxMenu = { x: number; y: number; prompt: Prompt };
   let ctxMenu = $state<CtxMenu | null>(null);
 
+  // Last height actually applied, so the ResizeObserver below can't ping-pong
+  // with the window it is resizing.
+  let lastFitH = 0;
+
   async function fitWindow() {
     if (!rootEl) return;
     await tick();
-    // Read scrollHeight to capture content even when CSS height: auto.
+    // Read offsetHeight to capture content even when CSS height: auto.
     // setSize accepts logical pixels — match it to body's content height.
     const h = rootEl.offsetHeight;
-    if (h > 0) {
+    if (h > 0 && h !== lastFitH) {
+      lastFitH = h;
       try {
         await getCurrentWindow().setSize(new LogicalSize(280, h));
       } catch {}
@@ -478,12 +483,19 @@
     document.removeEventListener("contextmenu", blockBrowserContextMenu);
   });
 
+  // Refit on any content change, rather than on a hand-listed set of state.
+  // The list was `prompts`, `armed`, `ctxMenu`, `playing` — it did not include
+  // `showAwakeMenu`, so opening "Keep Awake for…" added five rows to a window
+  // that never grew and the choices below the fold were simply cut off. The
+  // update row and the warning rows had the same latent bug. An observer on the
+  // element cannot drift as rows are added.
   $effect(() => {
-    void prompts;
-    void armed;
-    void ctxMenu;
-    void playing;
-    fitWindow();
+    if (!rootEl) return;
+    const ro = new ResizeObserver(() => {
+      void fitWindow();
+    });
+    ro.observe(rootEl);
+    return () => ro.disconnect();
   });
 
   // §2 — tray shows ONLY pinned prompts (Apple Shortcuts model). Unpinned

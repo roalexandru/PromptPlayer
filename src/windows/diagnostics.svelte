@@ -115,7 +115,7 @@
 <svelte:window on:keydown={onKey} />
 
 <div class="root">
-  <h1>Diagnostics</h1>
+  <header class="titlebar"><h1>Diagnostics</h1></header>
 
   {#if diag}
     {#if diag.needsAttention}
@@ -287,13 +287,25 @@
     overflow-y: auto;
   }
   .root {
-    padding: 22px 24px 28px 24px;
+    padding: 0 24px 28px 24px;
     box-sizing: border-box;
+  }
+  /* `titleBarStyle: "Overlay"` draws the traffic lights over the webview, and
+     this window scrolls its whole body — so without an opaque bar pinned to the
+     top, rows slide underneath them and collide. The top padding clears the
+     lights; the background matches the page so content vanishes behind it. */
+  .titlebar {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    margin: 0 -24px;
+    padding: 30px 24px 12px 24px;
+    background: #1c1c1e;
   }
   h1 {
     font-size: 17px;
     font-weight: 600;
-    margin: 0 0 16px 0;
+    margin: 0;
   }
   h2 {
     font-size: 11px;
@@ -374,9 +386,9 @@
     opacity: 0.5;
   }
   .btn.accent {
-    background: rgba(48, 209, 88, 0.85);
-    border-color: rgba(48, 209, 88, 1);
-    color: #0a1f10;
+    background: var(--pp-accent, #4fc3f7);
+    border-color: var(--pp-accent-strong, #29b6f6);
+    color: #06242e;
     font-weight: 600;
   }
   .probe {
