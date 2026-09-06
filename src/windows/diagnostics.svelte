@@ -26,6 +26,13 @@
   }
 
   onMount(async () => {
+    // Load once, unconditionally. The polling below only starts on a
+    // `window-shown` event or a successful visibility probe, and neither is
+    // guaranteed: the first-run auto-open calls `show()` from app setup, well
+    // before this webview has mounted its listener, so the event is emitted
+    // into nothing and the window would sit on "Loading…" forever — on exactly
+    // the broken-hook path it exists to explain.
+    refresh();
     // The whole point is watching status change while the user fixes it in
     // System Settings, so poll — but only while this window is on screen.
     // Tauri creates it at launch even though it starts hidden.
